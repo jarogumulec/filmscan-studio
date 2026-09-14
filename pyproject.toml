@@ -1,0 +1,33 @@
+[project]
+name = "filmscan-studio"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "jarogumulec", email = "29793471+jarogumulec@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cffi>=2.1.1",
+    "exifread>=3.5.1",
+    "gphoto2>=2.6.4",
+    "numpy>=2.5.3",
+    "opencv-python>=5.0.0.93",
+    "pydantic>=2.13.5",
+    "pyside6>=6.11.2",
+    "rawpy>=0.27.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-qt>=4.5.0",
+]
+
+[project.scripts]
+filmscan-studio = "filmscan_studio.__main__:main"
+filmscan-develop = "filmscan_studio.developer.__main__:main"
