@@ -1,7 +1,15 @@
 # Virtual environments
 .venv/
+.venv-x86/
 venv/
 env/
+
+# SDK probe output + natively-compiled test trampolines
+sdk_probe_results.json
+lv_all.jpg
+lv_100pct.jpg
+probe_capture.NEF
+tests/.tmp_tramp/
 
 # Python bytecode and caches
 __pycache__/
@@ -28,3 +36,5 @@ coverage.xml
 # macOS and editor metadata
 .DS_Store
 .idea/
+
+Nikon_SDK

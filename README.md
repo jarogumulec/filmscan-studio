@@ -66,10 +66,17 @@ re-generated bit-identically).
 ## Status
 
 - **v1 (this code):** Capture GUI complete against MockCamera; Developer CLI
-  complete against a real NEF; 130 tests.
+  complete against a real NEF; 152 tests.
 - Live D750: connect, settings, metering and 38 fps Live View verified
   end-to-end through the app's own backend. *Still capture* pending on the
   camera's absent/unformatted memory card (software path proven previously).
+- **Nikon SDK track:** MAID3 bindings (`capture/nikon_sdk.py`) + hardware
+  probe (`capture/sdk_probe.py`) ready. The SDK is x86_64-only (Rosetta
+  helper venv) and officially supports macOS ≤ 14 — this machine is 15.5, so
+  the probe decides whether it is viable *before* anything moves off
+  gphoto2. Setup: `scripts/install_helper.sh`, `scripts/install_sdk.sh`
+  (sudo once), then `scripts/probe.sh` (add `--capture` for the NEF path).
+  Results land in `sdk_probe_results.json`.
 - Planned: Developer GUI (share `gui/widgets.py` + pipeline), film profiles
   (`{name, toe, gamma, shoulder}` JSON, loaded by `FilmicProfile.from_dict`),
   Linux packaging, Windows.
