@@ -11,6 +11,7 @@ callbacks from Python exactly as the Nikon module's worker threads would.
 from __future__ import annotations
 
 import ctypes
+import json
 from pathlib import Path
 
 import pytest
@@ -218,3 +219,132 @@ class TestProbeCli:
         with pytest.raises(SystemExit) as exc:
             m.main(["bogus-module"])
         assert exc.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# Backend (arm64 side) — parsers and RPC framing against a fake helper.
+# ---------------------------------------------------------------------------
+
+class TestBackendParsers:
+    def test_shutter_fractions_and_wholes(self):
+        from filmscan_studio.capture.nikon_backend import parse_shutter
+        assert parse_shutter("1/60") == pytest.approx(1 / 60)
+        assert parse_shutter("2.5") == pytest.approx(2.5)
+        assert parse_shutter("30") == pytest.approx(30)
+        assert parse_shutter("1/1.3") == pytest.approx(1 / 1.3)
+        assert parse_shutter("Bulb") is None
+        assert parse_shutter("Time") is None
+
+    def test_iso_numeric_only(self):
+        """LO-/Hi- extended values are deliberately None — they leave the
+        auto-exposure controller's sane range."""
+        from filmscan_studio.capture.nikon_backend import parse_iso
+        assert parse_iso("100") == 100
+        assert parse_iso("12800") == 12800
+        assert parse_iso("LO-1") is None
+        assert parse_iso("Hi-2.0") is None
+
+
+class TestBackendRpc:
+    @pytest.fixture()
+    def backend(self, monkeypatch):
+        import subprocess
+        from filmscan_studio.capture import nikon_backend as nb
+
+        state = {"replies": {}, "requests": [],
+                 "default": {"ok": True}}
+        CONNECT_REPLY = {"ok": True,
+                         "model": "D750", "camera_type": 59, "battery": 80,
+                         "shutter": {"current_index": 1,
+                                     "strings": ["30", "1/60", "1/125"]},
+                         "iso": {"current_index": 0, "strings": ["100", "200"]},
+                         "has_live_view": True,
+                         "shutter_settable": True, "iso_settable": True}
+
+        class FakePopen:
+            class WritePipe:
+                def __init__(self, owner): self.owner = owner
+                def write(self, s): self.owner._pending = s
+                def flush(self): pass
+
+            class ReadPipe:
+                def __init__(self, owner): self.owner = owner
+                def readline(self):
+                    import json as _json
+                    req = _json.loads(self.owner._pending)
+                    state["requests"].append(req)
+                    reply = state["replies"].pop(req["method"],
+                                                 state["default"])
+                    return _json.dumps(reply) + "\n"
+
+            def __init__(self, *a, **k):
+                self._pending = None
+                self.stdin = FakePopen.WritePipe(self)
+                self.stdout = FakePopen.ReadPipe(self)
+
+            def poll(self): return None
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        # connect() stat-checks the installed module bundle; offline there is
+        # none — pretend the install scripts have run.
+        monkeypatch.setattr(Path, "is_dir", lambda self: True)
+        b = nb.NikonSdkBackend(helper_python=Path("/fake/python"))
+        state["default"] = CONNECT_REPLY
+        return b, state
+
+    def test_connect_parses_choices(self, backend):
+        b, state = backend
+        info = b.connect()
+        assert info.model == "D750"
+        assert info.battery_percent == 80
+        assert info.shutter_choices == (30.0, 1 / 60, 1 / 125)
+        assert info.iso_choices == (100, 200)
+        assert state["requests"][0]["method"] == "connect"
+
+    def test_set_shutter_sends_picked_index(self, backend):
+        b, state = backend
+        b.connect()
+        state["replies"]["set_enum"] = {"ok": True, "index": 2,
+                                        "string": "1/125"}
+        state["default"] = {"ok": True, "index": 2, "string": "1/125"}
+        got = b.set_shutter(1 / 125)
+        assert got == pytest.approx(1 / 125)
+        req = state["requests"][-1]
+        assert req["method"] == "set_enum" and req["which"] == "shutter"
+        assert req["index"] == 2
+
+    def test_next_live_frame_decodes_base64(self, backend):
+        import base64
+        b, state = backend
+        b.connect()
+        jpeg = b"\xff\xd8\xff" + b"x" * 100
+        state["replies"]["lv_frame"] = {
+            "ok": True, "jpeg_b64": base64.b64encode(jpeg).decode()}
+        frame = b.next_live_frame()
+        assert frame.jpeg == jpeg
+        assert state["requests"][-1]["method"] == "lv_frame"
+
+    def test_error_reply_becomes_camera_error(self, backend):
+        from filmscan_studio.capture.camera import CameraError
+        b, state = backend
+        b.connect()
+        state["replies"]["exposure_ev"] = {"ok": False, "error": "boom"}
+        with pytest.raises(CameraError, match="boom"):
+            b.exposure_ev()
+
+    def test_not_connected_raises(self):
+        from filmscan_studio.capture.camera import NotConnectedError
+        from filmscan_studio.capture.nikon_backend import NikonSdkBackend
+        b = NikonSdkBackend()
+        with pytest.raises(NotConnectedError):
+            b.next_live_frame()
+
+    def test_missing_helper_reports_install_hint(self, monkeypatch):
+        from filmscan_studio.capture.camera import CameraError
+        from filmscan_studio.capture import nikon_backend as nb
+        monkeypatch.setattr(nb, "_helper_python", lambda: None)
+        b = nb.NikonSdkBackend()
+        with pytest.raises(CameraError, match="install_helper"):
+            b.connect()

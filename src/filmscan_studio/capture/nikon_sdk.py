@@ -139,6 +139,7 @@ DT_NULL = 0
 DT_BOOLEAN = 1
 DT_INTEGER = 2
 DT_UNSIGNED = 3
+DT_INTEGER_PTR = 5
 DT_UNSIGNED_PTR = 6
 DT_FLOAT_PTR = 7
 DT_POINT_PTR = 8
@@ -688,6 +689,15 @@ class MaidModule:
             raise MaidError(f"CapGet 0x{cap_id:x}", r)
         return int(out[0])
 
+    def get_integer(self, obj, cap_id: int) -> int:
+        """Signed 32-bit CapGet (IntegerPtr, eNkMAIDDataType 5) — BatteryLevel
+        etc. (UnsignedPtr answers -126 for these)."""
+        out = ffi.new("int32_t *")
+        r = self.command(obj, CMD_CAP_GET, cap_id, DT_INTEGER_PTR, self._ptr(out))
+        if r != R_OK:
+            raise MaidError(f"CapGet int 0x{cap_id:x}", r)
+        return int(out[0])
+
     def set_unsigned(self, obj, cap_id: int, value: int,
                      retries: int = 0, retry_wait: float = 1.0) -> None:
         for attempt in range(retries + 1):
@@ -777,6 +787,32 @@ class MaidModule:
             raise MaidError(f"CapGet range 0x{cap_id:x}", r)
         return {"value": st.lfValue, "default": st.lfDefault,
                 "lower": st.lfLower, "upper": st.lfUpper, "steps": st.ulSteps}
+
+    def set_range(self, obj, cap_id: int, value: float) -> float:
+        """Set a Range cap (sample SetRangeCapability): re-read the struct,
+        write either lfValue (ulSteps == 0) or the index it maps onto, send
+        back via RangePtr. Returns the value the body now reports."""
+        st = ffi.new("NkMAIDRange *")
+        r = self.command(obj, CMD_CAP_GET, cap_id, DT_RANGE_PTR, self._ptr(st))
+        if r != R_OK:
+            raise MaidError(f"CapGet range(set) 0x{cap_id:x}", r)
+        if st.ulSteps == 0:
+            st.lfValue = value
+        else:
+            idx = round((value - st.lfLower) * (st.ulSteps - 1)
+                        / (st.lfUpper - st.lfLower))
+            st.ulValueIndex = min(max(idx, 0), int(st.ulSteps) - 1)
+        r = self.command(obj, CMD_CAP_SET, cap_id, DT_RANGE_PTR, self._ptr(st))
+        if r != R_OK:
+            raise MaidError(f"CapSet range 0x{cap_id:x}={value}", r)
+        out = ffi.new("NkMAIDRange *")
+        r = self.command(obj, CMD_CAP_GET, cap_id, DT_RANGE_PTR, self._ptr(out))
+        if r != R_OK:
+            raise MaidError(f"CapGet range(verify) 0x{cap_id:x}", r)
+        if out.ulSteps == 0:
+            return float(out.lfValue)
+        return float(out.lfLower + int(out.ulValueIndex)
+                     * (out.lfUpper - out.lfLower) / (out.ulSteps - 1))
 
     def get_array(self, obj, cap_id: int) -> bytes:
         """Array cap via CapGet(size) + CapGetArray(into caller buffer)."""

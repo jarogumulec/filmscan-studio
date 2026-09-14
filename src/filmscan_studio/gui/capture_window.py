@@ -57,9 +57,10 @@ from filmscan_studio.capture.autoexposure import (
     AutoExposureController,
     LiveMeter,
 )
-from filmscan_studio.capture.camera import CameraBackend, CameraInfo
+from filmscan_studio.capture.camera import CameraBackend, CameraError, CameraInfo
 from filmscan_studio.capture.gphoto2 import GPhoto2Backend
 from filmscan_studio.capture.mock import MockCamera
+from filmscan_studio.capture.nikon_backend import NikonSdkBackend
 from filmscan_studio.capture.session import CaptureSession, SessionPaths
 from filmscan_studio.core.exposure import (
     DEFAULT_HEADROOM_EV,
@@ -349,15 +350,23 @@ class CaptureWindow(QMainWindow):
         box.setWindowTitle("Připojit fotoaparát")
         box.setText("Vyber zdroj:")
         box.setInformativeText(
-            "Mock Kamera simuluje D750 bez připojeného fotoaparátu — "
-            "vhodné pro vyzkoušení workflow."
+            "Nikon SDK je preferovaný kanál (Live View zoom na straně těla); "
+            "vyžaduje scripts/install_helper.sh + install_sdk.sh. gphoto2 "
+            "zůstává záloha. Mock simuluje D750 bez fotoaparátu."
         )
+        sdk_btn = box.addButton("Nikon D750 (Nikon SDK)", QMessageBox.ButtonRole.AcceptRole)
+        sdk_btn.setDefault(True)
         mock = box.addButton("Mock kamera", QMessageBox.ButtonRole.AcceptRole)
         real = box.addButton("Nikon D750 (gphoto2)", QMessageBox.ButtonRole.AcceptRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
         box.exec()
         chosen = box.clickedButton()
-        if chosen is real:
+        if chosen is sdk_btn:
+            self._connecting = True
+            self.act_connect.setEnabled(False)
+            self.statusBar().showMessage("Připojuji přes Nikon SDK (spouštím x86_64 helper)…")
+            self._start_worker(_connect_sdk, self._on_connected, on_failed=self._on_connect_failed)
+        elif chosen is real:
             self._connecting = True
             self.act_connect.setEnabled(False)
             # Persistent status (no timeout): connecting retries against
@@ -694,6 +703,22 @@ def _connect_gphoto2() -> GPhoto2Backend:
     backend = GPhoto2Backend()
     backend.connect()
     return backend
+
+
+def _connect_sdk() -> NikonSdkBackend:
+    """Prefer the Nikon SDK, fall back to gphoto2 when its helper is missing.
+
+    The SDK path needs a one-time x86_64 venv plus the sudo install of the
+    camera module; on a fresh clone neither exists, so silently degrading to
+    the backend that works keeps the app usable.
+    """
+    try:
+        backend = NikonSdkBackend()
+        backend.connect()
+        return backend
+    except CameraError as exc:
+        log.warning("Nikon SDK unavailable (%s); falling back to gphoto2", exc)
+        return _connect_gphoto2()
 
 
 #: Base level for Live View previews: the JPEG is already tone-curve-compressed,
