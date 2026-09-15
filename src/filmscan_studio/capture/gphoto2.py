@@ -183,6 +183,29 @@ class GPhoto2Backend(CameraBackend):
         self._set("iso", best)
         return parse_iso(str(self._value("iso"))) or iso
 
+    def set_exposure_ev(self, ev: float) -> float:
+        """Body EV compensation via the 'exposurecomp' widget, if it exists.
+
+        Choices are localised signed strings ('+0.3', '-1'); the closest to the
+        request is applied and what the body reports back is returned.
+        """
+        parsed = [(c, self._parse_ev(c)) for c in self._choices("exposurecomp")]
+        usable = [(c, v) for c, v in parsed if v is not None]
+        if not usable:
+            raise CameraError("expoziční korekce není přes gphoto2 dostupná")
+        best, _ = min(usable, key=lambda cv: abs(cv[1] - ev))
+        self._set("exposurecomp", best)
+        got = self._parse_ev(str(self._value("exposurecomp")))
+        return got if got is not None else ev
+
+    @staticmethod
+    def _parse_ev(text: str) -> float | None:
+        m = re.fullmatch(r"\s*([+-]?)(\d+(?:[.,]\d+)?)\s*", text)
+        if not m:
+            return None
+        sign = -1.0 if m.group(1) == "-" else 1.0
+        return sign * float(m.group(2).replace(",", "."))
+
     # ----------------------------------------------------------------- live view
 
     def start_live_view(self) -> None:

@@ -1,9 +1,20 @@
 """The Capture window.
 
-Layout is the brief's: Live View with zoom 100/200/400%, a linear histogram,
-ISO/shutter/aperture readouts, and the four action buttons. Everything that
-talks to the camera runs in :class:`~filmscan_studio.gui.liveview.LiveViewWorker`
-or a one-shot worker object, never on the UI thread.
+Layout: the Live View fills most of the window; every control (histogram,
+settings, actions) lives in a narrow column on the right, because the one thing
+that must be big while digitising film is the picture. The zoom ladder is
+labelled in sensor pixels — 100% is one screen pixel per pixel of the 6016x4016
+NEF — and asks the body for a zoomed Live View crop when more real detail is
+wanted (see :mod:`filmscan_studio.core.zoom`).
+
+Everything that talks to the camera runs in
+:class:`~filmscan_studio.gui.liveview.LiveViewWorker` or a one-shot worker
+object, never on the UI thread. Two UI controls break that rule deliberately:
+the shutter/ISO editors and the body EV-compensation spin call the camera
+directly, because they are one small enum/range write per interaction and a
+queue would fight rapid stepping. Against a blocking backend they would freeze
+the UI — acceptable for the SDK helper's enum writes (milliseconds); if a slow
+path ever appears, route them through ``_camera_queue``.
 
 The two preview modes are the heart of the design and are enforced here rather
 than left to the operator:
@@ -38,16 +49,17 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSpinBox,
     QSplitter,
     QStatusBar,
-    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -58,7 +70,7 @@ from filmscan_studio.capture.autoexposure import (
     LiveMeter,
 )
 from filmscan_studio.capture.camera import CameraBackend, CameraError, CameraInfo
-from filmscan_studio.capture.gphoto2 import GPhoto2Backend
+from filmscan_studio.capture.gphoto2 import GPhoto2Backend, parse_shutter
 from filmscan_studio.capture.mock import MockCamera
 from filmscan_studio.capture.nikon_backend import NikonSdkBackend
 from filmscan_studio.capture.session import CaptureSession, SessionPaths
@@ -68,15 +80,25 @@ from filmscan_studio.core.exposure import (
     MeterReading,
 )
 from filmscan_studio.core.filmic import FilmicProfile
-from filmscan_studio.core.histogram import Histogram, compute
+from filmscan_studio.core.histogram import compute
 from filmscan_studio.core.models import FilmMetadata
 from filmscan_studio.core.positive import PositiveParams
-from filmscan_studio.gui.filmdialog import FilmDialog
-from filmscan_studio.gui.imageutil import preview, to_qimage
-from filmscan_studio.gui.liveview import LiveViewWorker, luminance
-from filmscan_studio.gui.widgets import (
+from filmscan_studio.core.zoom import (
+    FIT,
+    ZOOM_ALL,
     ZOOM_LABELS,
     ZOOM_LEVELS,
+    SensorSize,
+    StreamDetail,
+    choose_body_rate,
+    detail_for,
+    display_scale,
+)
+from filmscan_studio.gui.filmdialog import FilmDialog
+from filmscan_studio.gui.imageutil import preview
+from filmscan_studio.gui.liveview import LiveViewWorker, luminance
+from filmscan_studio.gui.widgets import (
+    CollapsibleBox,
     FilmicPanel,
     HistogramWidget,
     ZoomView,
@@ -192,6 +214,16 @@ class CaptureWindow(QMainWindow):
         self._camera_queue.start()
         self._last_reading: MeterReading | None = None
         self._last_linear: np.ndarray | None = None
+        #: Body-side Live View zoom rate currently applied (core.zoom ZOOM_*).
+        self._body_zoom = ZOOM_ALL
+        #: Honest account of the delivered stream, refreshed per frame.
+        self._stream_detail: StreamDetail | None = None
+        #: AE metering rectangle in source pixels, from the view's red drag.
+        self._ae_rect: tuple[int, int, int, int] | None = None  # x0, y0, x1, y1
+        #: Echo suppression: refresh writes must not re-trigger apply handlers.
+        self._echo = False
+        #: Last film record — prefills the rig group of the next dialog.
+        self._last_film: FilmMetadata | None = None
 
         self._build_ui()
         self._set_mode(raw_view=True)
@@ -212,52 +244,100 @@ class CaptureWindow(QMainWindow):
         self.act_export = top.addAction("Exportovat projekt", self._export_project)
         self.act_export.setEnabled(False)
 
-        central = QWidget()
-        root = QHBoxLayout(central)
-
-        left = QVBoxLayout()
-        root.addLayout(left, stretch=3)
-
-        self.view = ZoomView()
+        # The picture owns the window: the Live View is the central widget and
+        # everything else — histogram, metering, camera controls, actions —
+        # lives in one narrow column to its right. Focusing and checking
+        # exposure both want the largest possible view of real pixels.
+        self.view = ZoomView(sensor=self._sensor_size())
         self.view.centerChanged.connect(
-            lambda x, y: self.statusBar().showMessage(f"střed {x},{y}", 2000)
-        )
-        left.addWidget(self.view, stretch=3)
-        self.view.set_zoom(ZOOM_LEVELS[0])
-
-        bottom_row = QHBoxLayout()
-        left.addLayout(bottom_row, stretch=2)
-
-        hist_box = QWidget()
-        hist_layout = QVBoxLayout(hist_box)
-        hist_layout.setContentsMargins(0, 0, 0, 0)
-        self.histogram = HistogramWidget()
-        hist_layout.addWidget(self.histogram)
-        self.histogram_label = QLabel("histogram: lineární data senzoru")
-        hist_layout.addWidget(self.histogram_label)
-        bottom_row.addWidget(hist_box, stretch=2)
-
-        controls = QWidget()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-
-        zoom_row = QHBoxLayout()
-        zoom_row.addWidget(QLabel("Zoom"))
-        self.zoom_select = QComboBox()
-        for level in ZOOM_LEVELS:
-            self.zoom_select.addItem(ZOOM_LABELS[str(level)], level)
-        self.zoom_select.currentIndexChanged.connect(
-            lambda _: self.view.set_zoom(self.zoom_select.currentData())
-        )
-        self.view.zoomChanged.connect(
-            lambda z: self.zoom_select.setCurrentIndex(
-                self.zoom_select.findData(z)
+            lambda x, y: self.statusBar().showMessage(
+                f"střed {x}×{y} px senzoru", 2000
             )
         )
-        zoom_row.addWidget(self.zoom_select)
-        zoom_row.addStretch()
-        controls_layout.addLayout(zoom_row)
+        self.view.aeRectChanged.connect(self._on_ae_rect)
 
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+
+        self.histogram = HistogramWidget()
+        right_layout.addWidget(self.histogram)
+        self.histogram_label = QLabel("histogram: lineární data senzoru")
+        self.histogram_label.setWordWrap(True)
+        right_layout.addWidget(self.histogram_label)
+        self.clip_label = QLabel("clip: —")
+        self.clip_label.setStyleSheet("font-family: Menlo, monospace;")
+        self.clip_label.setWordWrap(True)
+        right_layout.addWidget(self.clip_label)
+
+        # ------------------------------------------------ camera exposure layer
+        exposure_box = CollapsibleBox("Expozice fotoaparátu (ovlivňuje focení)",
+                                      expanded=True)
+        exposure_form = QFormLayout()
+        exposure_box.body_layout().addLayout(exposure_form)
+
+        self.shutter_edit = QComboBox()
+        self.shutter_edit.setEditable(True)
+        self.shutter_edit.setToolTip(
+            "Zadej čas (1/60, 2.5…) — tělo Snapne na nejbližší dostupný. "
+            "Vyžaduje režim M/S na těle."
+        )
+        self.shutter_edit.activated.connect(self._apply_shutter_edit)
+        # editingFinished lives on the editable combo's line edit, not the combo.
+        self.shutter_edit.lineEdit().editingFinished.connect(self._apply_shutter_edit)
+        exposure_form.addRow("Čas", self.shutter_edit)
+
+        self.iso_select = QComboBox()
+        self.iso_select.setToolTip(
+            "ISO nabízené tělem. Pro digitalizaci platí: nejnižší = nejlepší "
+            "odstup signálu od šumu."
+        )
+        self.iso_select.currentIndexChanged.connect(self._apply_iso_select)
+        exposure_form.addRow("ISO", self.iso_select)
+
+        iso_row = QHBoxLayout()
+        self.btn_iso_low = QPushButton("ISO na minimum (kvalita)")
+        self.btn_iso_low.clicked.connect(self._iso_to_base)
+        iso_row.addWidget(self.btn_iso_low)
+        iso_row.addStretch()
+        exposure_form.addRow(iso_row)
+
+        self.ev_spin = QDoubleSpinBox()
+        self.ev_spin.setRange(-5.0, 5.0)
+        self.ev_spin.setSingleStep(1 / 3)
+        self.ev_spin.setDecimals(2)
+        self.ev_spin.setSuffix(" EV")
+        self.ev_spin.setToolTip(
+            "Expoziční korekce těla (ExposureComp). Pozor: náhledová expozice "
+            "v Working Positive je jiná vrstva — viz Náhled výše."
+        )
+        self.ev_spin.editingFinished.connect(self._apply_ev_comp)
+        exposure_form.addRow("Korekce expozice", self.ev_spin)
+
+        self.btn_autoexposure = QPushButton("Auto Exposure")
+        self.btn_autoexposure.clicked.connect(self._auto_exposure)
+        self.ae_hint = QLabel(
+            "AE červení myší do náhledu: měří jen uvnitř rámečku "
+            "(pravé tlačítko = zrušit)."
+        )
+        self.ae_hint.setWordWrap(True)
+        self.ae_hint.setStyleSheet("color: #9a9;")
+        exposure_box.body_layout().addWidget(self.btn_autoexposure)
+        exposure_box.body_layout().addWidget(self.ae_hint)
+        right_layout.addWidget(exposure_box)
+
+        self.settings_label = QLabel("ISO —   čas —   clona —")
+        self.settings_label.setStyleSheet("font-family: Menlo, monospace; font-size: 13px;")
+        right_layout.addWidget(self.settings_label)
+
+        self.meter_label = QLabel("—")
+        self.meter_label.setStyleSheet("font-family: Menlo, monospace;")
+        self.meter_label.setWordWrap(True)
+        right_layout.addWidget(self.meter_label)
+
+        # ------------------------------------------------------- preview layer
+        self.preview_box = CollapsibleBox(
+            "Náhled — expozice & křivka (NEOVlivňuje focení)", expanded=False
+        )
         mode_row = QHBoxLayout()
         self.mode_raw = QCheckBox("RAW View")
         self.mode_raw.setChecked(True)
@@ -267,44 +347,47 @@ class CaptureWindow(QMainWindow):
         self.mode_positive.toggled.connect(lambda on: self._set_mode(raw_view=not on))
         mode_row.addWidget(self.mode_positive)
         mode_row.addStretch()
-        controls_layout.addLayout(mode_row)
+        self.preview_box.body_layout().addLayout(mode_row)
+        self.filmic = FilmicPanel()
+        self.filmic.paramsChanged.connect(self._on_filmic_changed)
+        self.filmic.setEnabled(False)
+        self.preview_box.body_layout().addWidget(self.filmic)
+        right_layout.addWidget(self.preview_box)
 
-        self.settings_label = QLabel("ISO —   čas —   clona —")
-        self.settings_label.setStyleSheet("font-family: Menlo, monospace; font-size: 13px;")
-        controls_layout.addWidget(self.settings_label)
+        # ---------------------------------------------------------------- zoom
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom"))
+        self.zoom_select = QComboBox()
+        for level in ZOOM_LEVELS:
+            self.zoom_select.addItem(ZOOM_LABELS[level], level)
+        self.zoom_select.currentIndexChanged.connect(self._on_zoom_selected)
+        self.view.zoomChanged.connect(
+            lambda z: self.zoom_select.setCurrentIndex(
+                self.zoom_select.findData(z)
+            )
+        )
+        zoom_row.addWidget(self.zoom_select)
+        zoom_row.addStretch()
+        right_layout.addLayout(zoom_row)
+        self.zoom_note = QLabel()
+        self.zoom_note.setWordWrap(True)
+        self.zoom_note.setStyleSheet("color: #fc9; font-size: 11px;")
+        right_layout.addWidget(self.zoom_note)
 
-        self.meter_label = QLabel("—")
-        self.meter_label.setStyleSheet("font-family: Menlo, monospace;")
-        controls_layout.addWidget(self.meter_label)
-
-        self.stage_label = QLabel("Fáze: —")
-        controls_layout.addWidget(self.stage_label)
-
-        controls_layout.addStretch()
-        bottom_row.addWidget(controls, stretch=1)
-
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        self.actions = QWidget()
-        actions_layout = QVBoxLayout(self.actions)
-        actions_layout.setContentsMargins(0, 0, 0, 0)
-
+        # ------------------------------------------------------------- actions
         self.btn_capture = QPushButton("Capture")
         self.btn_capture.setMinimumHeight(48)
         self.btn_capture.clicked.connect(lambda: self._capture(scan=True))
-        actions_layout.addWidget(self.btn_capture)
+        right_layout.addWidget(self.btn_capture)
 
-        self.btn_autoexposure = QPushButton("Auto Exposure")
-        self.btn_autoexposure.clicked.connect(self._auto_exposure)
-        actions_layout.addWidget(self.btn_autoexposure)
-
+        calib_row = QHBoxLayout()
         self.btn_dark = QPushButton("Dark Frame")
         self.btn_dark.clicked.connect(lambda: self._capture(kind="dark"))
-        actions_layout.addWidget(self.btn_dark)
-
+        calib_row.addWidget(self.btn_dark)
         self.btn_flat = QPushButton("Flat Field")
         self.btn_flat.clicked.connect(lambda: self._capture(kind="flat"))
-        actions_layout.addWidget(self.btn_flat)
+        calib_row.addWidget(self.btn_flat)
+        right_layout.addLayout(calib_row)
 
         frame_row = QHBoxLayout()
         frame_row.addWidget(QLabel("Číslo snímku"))
@@ -313,18 +396,11 @@ class CaptureWindow(QMainWindow):
         self.frame_number.setSpecialValueText("auto")
         frame_row.addWidget(self.frame_number)
         frame_row.addStretch()
-        actions_layout.addLayout(frame_row)
+        right_layout.addLayout(frame_row)
 
-        right_layout.addWidget(self.actions)
-
-        self.filmic = FilmicPanel()
-        self.filmic.paramsChanged.connect(self._on_filmic_changed)
-        self.filmic.setEnabled(False)
-        filmic_scroll = QScrollArea()
-        filmic_scroll.setWidget(self.filmic)
-        filmic_scroll.setWidgetResizable(True)
-        filmic_scroll.setMaximumHeight(260)
-        right_layout.addWidget(filmic_scroll)
+        self.stage_label = QLabel("Fáze: —")
+        self.stage_label.setWordWrap(True)
+        right_layout.addWidget(self.stage_label)
 
         self.log_view = QLabel("")
         self.log_view.setWordWrap(True)
@@ -335,10 +411,14 @@ class CaptureWindow(QMainWindow):
         right_layout.addStretch()
 
         splitter = QSplitter()
-        splitter.addWidget(central)
-        right.setMaximumWidth(360)
+        splitter.addWidget(self.view)
+        right.setFixedWidth(360)
         splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setChildrenCollapsible(False)
         self.setCentralWidget(splitter)
+        self.view.set_zoom(ZOOM_LEVELS[0])
         self._refresh_buttons()
 
     # ------------------------------------------------------------- camera setup
@@ -404,13 +484,226 @@ class CaptureWindow(QMainWindow):
         self.act_connect.setEnabled(False)
         self.setWindowTitle(f"FilmScan Studio — Capture — {info.model}")
         self.act_new_film.setEnabled(True)
-        self._log(f"{info.manufacturer or ''} {info.model} · ISO {len(info.iso_choices)} · časů {len(info.shutter_choices)}")
+        # Earlier text printed len(iso_choices)/len(shutter_choices) here and
+        # read as "ISO 22 · časů 52" — counts of *offerings*, not settings.
+        iso_note = ""
+        if info.iso_choices:
+            iso_note = f" · ISO {min(info.iso_choices)}–{max(info.iso_choices)}"
+        shutter_note = ""
+        if info.shutter_choices:
+            shutter_note = (
+                f" · časy 1/{round(1 / min(info.shutter_choices))}–"
+                f"{max(info.shutter_choices):g}s"
+            )
+        self._log(f"{info.manufacturer or ''} {info.model}{iso_note}{shutter_note}")
         caps = camera.capabilities()
         if not caps.aperture:
             self._log("Clona není přes USB ovladatelná (manuální objektiv) — nastavuje se na objektivu.")
+        if not caps.live_view_zoom:
+            self._log(
+                "Tento backend neumí zoom proudu na straně těla — detail při "
+                "zoomu zůstane interpolovaný (gphoto2 posílá jen whole-frame "
+                "640 px). Přepni na Nikon SDK."
+            )
+        self.view.sensor = self._sensor_size()
+        self._populate_exposure_editors()
         self.start_live_view()
         self._refresh_settings()
         self._refresh_buttons()
+
+    def _sensor_size(self) -> SensorSize:
+        if self.info and self.info.sensor_width and self.info.sensor_height:
+            return SensorSize(self.info.sensor_width, self.info.sensor_height)
+        return SensorSize()  # D750 NEF default, documented fallback
+
+    # ------------------------------------------------------ camera exposure UI
+
+    def _populate_exposure_editors(self) -> None:
+        """Fill the shutter/ISO editors from what the body offers.
+
+        No signal suppression helper is needed for the shutter combo: its
+        handlers run on ``activated``/``editingFinished`` (user actions), not on
+        ``currentIndexChanged``; the ISO combo's index signal is guarded by
+        ``_echo`` because a refresh must not re-apply (and re-snap) settings the
+        body already has.
+        """
+        assert self.camera is not None and self.info is not None
+        self._echo = True
+        try:
+            self.shutter_edit.clear()
+            for seconds in self.info.shutter_choices:
+                text = ExposureSettings(shutter=seconds).shutter_string()
+                self.shutter_edit.addItem(text)
+            self.iso_select.clear()
+            for iso in self.info.iso_choices:
+                self.iso_select.addItem(str(iso), iso)
+        finally:
+            self._echo = False
+
+    def _apply_shutter_edit(self) -> None:
+        if self.camera is None:
+            return
+        text = self.shutter_edit.currentText().strip()
+        seconds = parse_shutter(text)
+        if seconds is None or seconds <= 0:
+            self.statusBar().showMessage(f"Čas '{text}' nejde pochopit (zkus 1/60 nebo 2.5)", 4000)
+            self._refresh_settings()
+            return
+        try:
+            applied = self.camera.set_shutter(seconds)
+        except CameraError as exc:
+            QMessageBox.warning(self, "Čas", str(exc))
+            self._refresh_settings()
+            return
+        if abs(applied - seconds) / seconds > 0.02:
+            self.statusBar().showMessage(
+                f"Čas {ExposureSettings(shutter=seconds).shutter_string()} "
+                f"snapnut na {ExposureSettings(shutter=applied).shutter_string()}", 4000
+            )
+        self._refresh_settings()
+
+    def _apply_iso_select(self) -> None:
+        if self.camera is None or self._echo:
+            return
+        iso = self.iso_select.currentData()
+        if iso is None:
+            return
+        try:
+            applied = self.camera.set_iso(int(iso))
+        except CameraError as exc:
+            QMessageBox.warning(self, "ISO", str(exc))
+            self._refresh_settings()
+            return
+        if applied != iso:
+            self.statusBar().showMessage(f"ISO {iso} snapnuto na {applied}", 4000)
+        self._refresh_settings()
+
+    def _iso_to_base(self) -> None:
+        """Lowest native ISO: the archival scan wants noise floor, not speed."""
+        if self.camera is None or self.info is None or not self.info.iso_choices:
+            return
+        try:
+            applied = self.camera.set_iso(min(self.info.iso_choices))
+        except CameraError as exc:
+            QMessageBox.warning(self, "ISO", str(exc))
+            return
+        self.statusBar().showMessage(f"ISO {applied} (minimum)", 4000)
+        self._refresh_settings()
+
+    def _apply_ev_comp(self) -> None:
+        if self.camera is None:
+            return
+        try:
+            applied = self.camera.set_exposure_ev(self.ev_spin.value())
+        except NotImplementedError:
+            self.statusBar().showMessage("Expoziční korekce přes tento backend nejde nastavit.", 4000)
+        except CameraError as exc:
+            QMessageBox.warning(self, "Korekce expozice", str(exc))
+            return
+        else:
+            self._echo = True
+            self.ev_spin.setValue(applied)
+            self._echo = False
+
+    # -------------------------------------------------------------- zoom wiring
+
+    def _on_zoom_selected(self) -> None:
+        self.view.set_zoom(self.zoom_select.currentData())
+        self._apply_body_zoom()
+
+    def _apply_body_zoom(self) -> None:
+        """Ask the body for the crop that serves the selected display scale.
+
+        Runs on the UI thread; the SDK helper's enum write is milliseconds and
+        the Live View worker retries the transient DeviceBusy the body answers
+        while a frame is in flight. The alternative (queue it, apply it seconds
+        later after the poller stopped) would make zoom feel lagged.
+        """
+        if self.camera is None:
+            return
+        caps = self.camera.capabilities()
+        if not caps.live_view_zoom:
+            self._update_zoom_note()
+            return
+        frame_size = self._last_source_size()
+        rate = choose_body_rate(
+            self.view.zoom(), self.view.width(), self.view.height(),
+            frame_size[0], frame_size[1], self._sensor_size(),
+        )
+        if rate == self._body_zoom:
+            self._update_zoom_note()
+            return
+        try:
+            self.camera.set_live_view_zoom(rate)
+        except CameraError as exc:
+            self.statusBar().showMessage(f"Zoom těla se nepovedl: {exc}", 4000)
+            self._update_zoom_note()
+            return
+        self._body_zoom = rate
+        self._update_zoom_note()
+
+    def _last_source_size(self) -> tuple[int, int]:
+        if self._last_linear is not None:
+            h, w = self._last_linear.shape[:2]
+            return w, h
+        return 640, 424  # D750 whole-frame LV stream, measured
+
+    def _update_zoom_note(self) -> None:
+        w, h = self._last_source_size()
+        detail = detail_for(self._body_zoom, w, h, self._sensor_size())
+        zoom = self.view.zoom()
+        # Fit lies least when it downsamples; on big widgets it stretches the
+        # 640px stream too — say so there as well, the whole point of the
+        # sensor-pixel ladder was to stop hiding that.
+        scale = display_scale(zoom, self._sensor_size(),
+                              self.view.width(), self.view.height())
+        interp = detail.interpolation_at(scale)
+        note = detail.summary() + f" · interpolace ×{interp:.1f}"
+        if interp > 2.0:
+            note += " — proud neposkytuje tolik detailu"
+        self.zoom_note.setText(note)
+        # On the picture itself only when zoomed: Fit is an overview, the
+        # overlay would just clutter it.
+        self.view.set_detail_note("" if zoom == FIT else note)
+
+    # ----------------------------------------------------------------- AE rect
+
+    def _on_ae_rect(self, rect) -> None:
+        if rect is None:
+            self._ae_rect = None
+            self.statusBar().showMessage("AE výřez zrušen", 2500)
+            return
+        self._ae_rect = (rect.x(), rect.y(),
+                         rect.x() + rect.width(), rect.y() + rect.height())
+        self.statusBar().showMessage(
+            f"AE výřez {rect.width()}×{rect.height()} px proudu "
+            "(pravé tlačítko zruší)", 4000
+        )
+
+    def _meter_source(self):
+        """Metering callable for Auto Exposure: whole frame or the red rect."""
+        rect = self._ae_rect
+
+        def read():
+            frame = self.camera.next_live_frame()
+            if frame is None:
+                raise RuntimeError("Live View neběží – nelze měřit")
+            encoded = self._meter.decode_live_frame(frame)
+            if rect is not None:
+                x0, y0, x1, y1 = rect
+                h, w = encoded.shape[:2]
+                x0, y0 = max(x0, 0), max(y0, 0)
+                x1, y1 = min(x1, w), min(y1, h)
+                if x1 <= x0 or y1 <= y0:
+                    raise RuntimeError("AE výřez leží mimo snímek")
+                encoded = encoded[y0:y1, x0:x1]
+            linear = self._meter.jpeg_to_linear(encoded)
+            lum = linear @ np.array([0.2126, 0.7152, 0.0722])
+            return self._meter.meter_raw_signal(
+                lum, self._meter.black_level, self._meter.white_level
+            )
+
+        return read
 
     def _pause_live_view(self) -> None:
         """Stop the poller so a blocking camera call owns the session."""
@@ -435,6 +728,9 @@ class CaptureWindow(QMainWindow):
 
     def _on_live_frame(self, image: np.ndarray, reading: MeterReading) -> None:
         self._last_reading = reading
+        h, w = image.shape[:2]
+        self._stream_detail = detail_for(self._body_zoom, w, h, self._sensor_size())
+        self.view.set_source_scale(self._stream_detail.sensor_px_per_lv_px)
         self._update_histogram(reading, image)
         self._update_meter_label(reading)
         self._last_linear = image
@@ -469,6 +765,14 @@ class CaptureWindow(QMainWindow):
         # Linear domain always -- the brief is explicit and this is not a toggle.
         hist = compute(luminance(image), black_level=0.0, white_level=1.0)
         self.histogram.set_histogram(hist)
+        total = max(hist.total, 1)
+        # The clip report the brief asks for: both rails, as a share of pixels.
+        # Red bar (blown) and blue bar (crushed) are drawn on the histogram
+        # itself; this is their numeric counterpart.
+        self.clip_label.setText(
+            f"clip: bílá {hist.clipped_high / total:.3%} (červeně) · "
+            f"černá {hist.clipped_low / total:.3%} (modře)"
+        )
         if self.raw_view:
             self.histogram.set_curve(None)
             self.histogram_label.setText("histogram: lineární data senzoru (RAW View)")
@@ -558,10 +862,12 @@ class CaptureWindow(QMainWindow):
         )
         self._set_actions_busy(True)
         self._pause_live_view()
-        self.statusBar().showMessage("Auto Exposure: měřím lineární data…")
+        area = "AE výřez" if self._ae_rect is not None else "celý snímek"
+        self.statusBar().showMessage(f"Auto Exposure: měřím lineárně — {area}…")
         self._start_worker(
             controller.run,
             self._on_auto_exposure_done,
+            self._meter_source(),
         )
 
     def _on_auto_exposure_done(self, result) -> None:
@@ -585,7 +891,10 @@ class CaptureWindow(QMainWindow):
     # ------------------------------------------------------------------ film
 
     def _new_film(self) -> None:
-        dialog = FilmDialog(self, defaults=self.session.film if self.session else None)
+        # The rig (body, lens, light, holder, mirroring) carries over from the
+        # last film — light settings etc. are deliberately reused; the film's
+        # own identity and development log never do.
+        dialog = FilmDialog(self, rig_defaults=self._last_film)
         if not dialog.exec():
             return
         film: FilmMetadata = dialog.metadata()
@@ -595,11 +904,15 @@ class CaptureWindow(QMainWindow):
         paths = SessionPaths.create(directory, film.film_id)
         assert self.camera is not None
         self.session = CaptureSession(camera=self.camera, film=film, paths=paths)
+        self._last_film = film
         self.positive = self.positive.with_base(None)
         self.setWindowTitle(f"FilmScan Studio — Capture — {film.label()}")
         self.act_export.setEnabled(True)
         self.statusBar().showMessage(f"Film {film.film_id}: {paths.root}")
         self._log(f"nový film {film.label()} ({film.film_type_class.value})")
+        if film.mirrored:
+            self._log("snímky označeny jako zrcadlově — zatím pouze v metadatech, "
+                      "převracení obrazů zatím neběží (CHANGELOG TODO).")
         self._refresh_stage()
         self._refresh_buttons()
 
@@ -658,6 +971,15 @@ class CaptureWindow(QMainWindow):
         self.settings_label.setText(
             f"ISO {settings.iso}   čas {settings.shutter_string()}   {aperture}"
         )
+        # Echo-guarded so syncing the widgets never re-applies to the camera.
+        self._echo = True
+        try:
+            index = self.iso_select.findData(settings.iso)
+            if index >= 0:
+                self.iso_select.setCurrentIndex(index)
+            self.shutter_edit.setCurrentText(settings.shutter_string())
+        finally:
+            self._echo = False
 
     def _refresh_stage(self) -> None:
         if self.session is None:

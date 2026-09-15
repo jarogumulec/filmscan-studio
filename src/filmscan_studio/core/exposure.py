@@ -95,6 +95,10 @@ class MeterReading:
     signal_max: float
     clipped_fraction: float
     near_black_fraction: float
+    #: Fraction of samples *near the black rail* (see ``measure``), reported as
+    #: its own number so the GUI's black-clip figure matches the histogram
+    #: widget instead of being a looser "nearly black" count.
+    black_fraction: float = 0.0
 
     @property
     def dynamic_range_stops(self) -> float:
@@ -145,6 +149,7 @@ def measure(
     # normalised 0..1 data alike.
     near_black = black_level + span * 1e-4
 
+    span_norm = (data - black_level) / span
     return MeterReading(
         black_level=black_level,
         white_level=white_level,
@@ -154,6 +159,8 @@ def measure(
         signal_max=float(data.max()),
         clipped_fraction=float(np.count_nonzero(data >= white_level) / data.size),
         near_black_fraction=float(np.count_nonzero(data <= near_black) / data.size),
+        # Exactly the histogram widget's black rail: normalised <= 0.
+        black_fraction=float(np.count_nonzero(span_norm <= 0.0) / data.size),
     )
 
 

@@ -21,6 +21,10 @@ import time
 from pathlib import Path
 
 from filmscan_studio.capture import nikon_sdk as sdk
+# The body's shutter/ISO vocabulary ('1/60', '100') parsed by the shared,
+# dependency-free module — importing the GUI-side parsers through
+# nikon_backend would pull numpy into this venv and kill the helper at import.
+from filmscan_studio.capture.parsing import parse_iso, parse_shutter
 
 JPEG_MAGIC = b"\xff\xd8\xff"
 
@@ -30,23 +34,40 @@ class Server:
         self.mod: sdk.MaidModule | None = None
         self.src: sdk.Source | None = None
         # Decoded packed-string enums, cached at connect(): index -> string.
+        # For PackedString caps ulValue is this *index* (measured: Sensitivity
+        # element 3 is the string '100'), so index is also what CapSet takes.
         self.shutter_strings: list[str] = []
         self.iso_strings: list[str] = []
+        # Parsed numeric forms, index -> seconds / ISO, so set_enum can answer
+        # with the value the GUI works in instead of a bare index.
+        self.shutter_seconds: list[float | None] = []
+        self.iso_values: list[int | None] = []
 
     # ------------------------------------------------------------------ setup
+
+    def _discover(self) -> list:
+        # ImageCaptureCore needs the run loop serviced for AddChild events.
+        for _ in range(300):
+            self.mod.tramp.runloop_tick(0.005)
+        return sdk.devices(self.mod)
 
     def connect(self) -> dict:
         self.mod = sdk.MaidModule()
         self.mod.__enter__()
-        # ImageCaptureCore needs the run loop serviced for AddChild events.
-        for _ in range(300):
-            self.mod.tramp.runloop_tick(0.005)
-        devs = sdk.devices(self.mod)
+        devs = self._discover()
+        if not devs:
+            # After an unplug/replug the first AddChild sweep can come up
+            # empty; one more serviced round is ~1.5 s and usually finds it.
+            # Deliberately only one retry — the arm64 side falls back to
+            # gphoto2 and needs a fast, honest "no device" otherwise.
+            devs = self._discover()
         if not devs:
             raise sdk.MaidError("no device — USB/PTP?", -1)
         self.src = sdk.Source(self.mod, devs[0])
         self.shutter_strings = self._packed_strings(sdk.CAP_SHUTTER_SPEED)
         self.iso_strings = self._packed_strings(sdk.CAP_SENSITIVITY)
+        self.shutter_seconds = [parse_shutter(s) for s in self.shutter_strings]
+        self.iso_values = [parse_iso(s) for s in self.iso_strings]
         battery: int | None
         try:
             battery = self.mod.get_integer(self.src.obj, sdk.CAP_BATTERY_LEVEL)
@@ -132,6 +153,8 @@ class Server:
                "iso": sdk.CAP_SENSITIVITY}[which]
         strings = {"shutter": self.shutter_strings,
                    "iso": self.iso_strings}[which]
+        numeric = {"shutter": self.shutter_seconds,
+                   "iso": self.iso_values}[which]
         if not 0 <= index < len(strings):
             raise ValueError(f"{which} index {index} out of range")
         if not self.src.has(cap, sdk.OP_SET):
@@ -143,7 +166,8 @@ class Server:
         # struct form.
         self.mod.set_enum_value(self.src.obj, cap, index)
         applied = self._enum_index(cap)
-        return {"index": applied, "string": strings[applied]}
+        return {"index": applied, "string": strings[applied],
+                "value": numeric[applied] if applied < len(numeric) else None}
 
     def set_exposure_comp(self, ev: float) -> dict:
         return {"ev": self.mod.set_range(self.src.obj, sdk.CAP_EXPOSURE_COMP,
@@ -166,6 +190,35 @@ class Server:
         self.src.set_zoom(rate)
         cur, _ = self.src.zoom_values()
         return {"zoom": cur}
+
+    def set_lv_size(self, element: int) -> dict:
+        """LiveViewImageSize (0x8353) — enumerated 1..2 on the D750, which
+        element is which resolution is NOT yet measured; the probe should
+        decode a frame per element and record pixel dimensions."""
+        self.mod.set_enum_value(self.src.obj, sdk.CAP_LIVE_VIEW_IMAGE_SIZE,
+                                element)
+        cur, vals = self.src.lv_image_size_values()
+        return {"size": cur, "available": vals}
+
+    def lv_capabilities(self) -> dict:
+        """What the LV controls report right now — zoom ladder, size ladder,
+        and whether exposure preview is offered at all (on the D750 CapInfo
+        says 0x8333 is GET-only: the body previews LV exposure itself and
+        refuses to be told; verified via sdk_probe_results.json)."""
+        out: dict = {}
+        try:
+            cur, vals = self.src.zoom_values()
+            out["zoom"] = {"current": cur, "values": vals}
+        except sdk.MaidError as exc:
+            out["zoom"] = f"error: {exc}"
+        try:
+            cur, vals = self.src.lv_image_size_values()
+            out["size"] = {"current": cur, "values": vals}
+        except sdk.MaidError as exc:
+            out["size"] = f"error: {exc}"
+        out["exposure_preview_settable"] = self.src.has(
+            sdk.CAP_LIVE_VIEW_EXPOSURE_PREVIEW, sdk.OP_SET)
+        return out
 
     def lv_frame(self) -> dict:
         blob = self.src.lv_image()
@@ -212,6 +265,10 @@ def _dispatch(server: Server, req: dict) -> dict:
         return server.exposure_ev()
     if method == "set_zoom":
         return server.set_zoom(req["rate"])
+    if method == "set_lv_size":
+        return server.set_lv_size(req["element"])
+    if method == "lv_capabilities":
+        return server.lv_capabilities()
     if method == "set_exposure_comp":
         return server.set_exposure_comp(req["ev"])
     if method == "lv_on":

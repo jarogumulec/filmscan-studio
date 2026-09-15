@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("pytestqt")
 
-from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
 
 from filmscan_studio.capture.mock import MockCamera  # noqa: E402
@@ -125,8 +125,10 @@ class TestCaptureWorkflow:
         window._refresh_buttons()
         window._capture(scan=True)
         assert not window.btn_capture.isEnabled()
-        qtbot.waitUntil(lambda: window.session.state.scan_count == 1, timeout=10000)
-        assert window.btn_capture.isEnabled()
+        # The catalog row lands from the camera thread; re-enabling follows via
+        # the queued on_done relay a moment later — wait for the re-enable
+        # itself, not for the count (which can be visible first; that raced).
+        qtbot.waitUntil(lambda: window.btn_capture.isEnabled(), timeout=10000)
         assert window.session.state.scan_count == 1
 
 
@@ -163,8 +165,13 @@ class TestConnect:
 
 
 class TestZoom:
-    def test_zoom_ladder_matches_brief(self):
-        assert ZOOM_LEVELS == (0.25, 1.0, 2.0, 4.0)
+    def test_zoom_ladder_is_sensor_pixels(self):
+        # 100% = one screen pixel per *sensor* pixel (of the 6016x4016 NEF),
+        # not per preview-window pixel: the brief's old 0.25/1/2/4 ladder
+        # scaled the 640px stream and is intentionally gone.
+        from filmscan_studio.core.zoom import FIT
+
+        assert ZOOM_LEVELS == (FIT, 0.125, 0.25, 0.5, 1.0, 2.0)
 
     def test_set_zoom_clamps_and_emits(self, qtbot):
         view = ZoomView()
@@ -178,17 +185,155 @@ class TestZoom:
         with pytest.raises(ValueError):
             view.set_zoom(3.0)
 
-    def test_click_recenters(self, qtbot):
+    def test_click_recenters_on_release(self, qtbot):
         view = ZoomView()
         qtbot.addWidget(view)
         view.resize(200, 200)
         view.show()
         view.set_image(np.zeros((400, 400)))
         view.set_zoom(1.0)
-        before = view._center
+        before = QPoint(view._center)
         view.mousePressEvent(_mouse_event(10, 10))
-        assert view._center != before or before.x() == 0  # moved toward click
+        view.mouseReleaseEvent(_mouse_event(10, 10))
+        assert view._center != before  # moved toward click
 
+    def test_drag_draws_ae_rect_not_recenter(self, qtbot):
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.show()
+        view.set_image(np.zeros((400, 400)))
+        view.set_zoom(1.0)
+        before = QPoint(view._center)
+        with qtbot.waitSignal(view.aeRectChanged):
+            view.mousePressEvent(_mouse_event(20, 20))
+            view.mouseMoveEvent(_mouse_event(90, 70))
+            view.mouseReleaseEvent(_mouse_event(90, 70))
+        rect = view.ae_rect()
+        assert rect is not None and rect.width() > 0
+        assert view._center == before  # a drag must not pan
+
+    def test_right_click_clears_ae_rect(self, qtbot):
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.show()
+        view.set_image(np.zeros((400, 400)))
+        view.set_zoom(1.0)
+        view.mousePressEvent(_mouse_event(20, 20))
+        view.mouseReleaseEvent(_mouse_event(90, 70))
+        assert view.ae_rect() is not None
+        view.mousePressEvent(_mouse_event(5, 5, Qt.MouseButton.RightButton))
+        assert view.ae_rect() is None
+
+    def test_source_scale_shows_in_detail_note(self, qtbot):
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.set_detail_note("stream 640×424")
+        assert view._detail_note == "stream 640×424"
+
+
+
+class TestBodyZoomWiring:
+    """Selecting a zoom level must ask the *body* for a zoomed stream."""
+
+    def test_zoom_selection_requests_body_crop(self, window, qtbot):
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(1.0))
+        qtbot.waitUntil(lambda: window.camera.live_view_zoom_rate != 0, timeout=2000)
+        # 100% sensor from a 640px whole-frame stream: a crop is the only way
+        # to any real detail; Whole is not acceptable any more.
+        assert window.camera.live_view_zoom_rate != 0
+        assert window.camera.live_view_zoom_history  # it actually reached the "camera"
+
+    def test_fit_returns_to_whole_frame(self, window, qtbot):
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(1.0))
+        qtbot.waitUntil(lambda: window.camera.live_view_zoom_rate != 0, timeout=2000)
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(0.0))
+        qtbot.waitUntil(lambda: window.camera.live_view_zoom_rate == 0, timeout=2000)
+
+    def test_zoom_note_discloses_interpolation(self, window, qtbot):
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(1.0))
+        qtbot.wait(50)
+        assert "interpolace" in window.zoom_note.text()
+
+    def test_no_body_zoom_without_capability(self, qtbot, camera):
+        from dataclasses import replace
+
+        base_caps = camera.capabilities()
+        camera.capabilities = lambda: replace(base_caps, live_view_zoom=False)
+        w = CaptureWindow(camera=camera)
+        qtbot.addWidget(w)
+        # A backend without the capability (gphoto2) must never be sent
+        # set_live_view_zoom, and must be called out in the log.
+        w.zoom_select.setCurrentIndex(w.zoom_select.findData(1.0))
+        qtbot.wait(50)
+        assert camera.live_view_zoom_history == []
+        assert "interpolovaný" in w.log_view.text()
+
+
+class TestAeRectMetering:
+    def test_ae_rect_reaches_window_state(self, window):
+        from PySide6.QtCore import QRect
+
+        window._on_ae_rect(QRect(10, 20, 100, 50))
+        assert window._ae_rect == (10, 20, 110, 70)
+        window._on_ae_rect(None)
+        assert window._ae_rect is None
+
+    def test_meter_source_meters_only_the_rect(self, window):
+        # A frame that is dark everywhere except the rect: whole-frame and
+        # rect metering must disagree, proving the crop is applied.
+        import cv2
+
+        # Bright patch must be < 0.1% of the frame or p99.9 of the whole
+        # frame would hit it too and the test would prove nothing.
+        img = np.zeros((200, 200, 3), dtype=np.uint8)
+        img[100:105, 100:105] = 250
+        ok, buf = cv2.imencode(".jpg", img)
+        assert ok
+        from filmscan_studio.capture.camera import LiveFrame
+
+        class RectCamera:
+            def next_live_frame(self):
+                return LiveFrame(jpeg=buf.tobytes())
+
+            def disconnect(self):  # window teardown calls it
+                pass
+
+        window.camera = RectCamera()
+        window._ae_rect = (100, 100, 105, 105)
+        reading = window._meter_source()()
+        assert reading.signal_p999 > 0.9
+
+        window._ae_rect = None
+        whole = window._meter_source()()
+        assert whole.signal_p999 < reading.signal_p999 / 3
+
+
+class TestExposureControls:
+    def test_iso_select_applies_to_camera(self, window, qtbot):
+        index = window.iso_select.findData(400)
+        assert index >= 0
+        window.iso_select.setCurrentIndex(index)
+        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 400, timeout=2000)
+
+    def test_iso_base_button_uses_lowest_choice(self, window, qtbot):
+        window.iso_select.setCurrentIndex(window.iso_select.findData(1600))
+        qtbot.wait(10)
+        window.btn_iso_low.click()
+        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 50, timeout=2000)
+
+    def test_shutter_text_edit_snaps_to_ladder(self, window, qtbot):
+        window.shutter_edit.setEditText("1/125")
+        window.shutter_edit.lineEdit().editingFinished.emit()
+        qtbot.waitUntil(lambda: window.camera.get_settings().shutter == 1 / 125,
+                        timeout=2000)
+
+    def test_refresh_does_not_reapply(self, window, qtbot):
+        window._refresh_settings()
+        before = list(window.camera.iso_history)
+        window._refresh_settings()
+        assert window.camera.iso_history == before
 
 class TestHistogramWidget:
     def test_paints_without_crashing(self, qtbot):
@@ -253,12 +398,13 @@ class SlowCaptureCamera(MockCamera):
         self.connect()
 
 
-def _mouse_event(x: int, y: int):
+def _mouse_event(x: int, y: int, button: Qt.MouseButton = Qt.MouseButton.LeftButton,
+                 kind: QEvent.Type = QEvent.Type.MouseButtonPress):
     return QMouseEvent(
-        QEvent.Type.MouseButtonPress,
+        kind,
         QPointF(float(x), float(y)),
         QPointF(float(x), float(y)),
-        Qt.MouseButton.LeftButton,
+        button,
         Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier,
     )

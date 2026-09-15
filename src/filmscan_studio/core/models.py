@@ -14,9 +14,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _now() -> datetime:
@@ -52,24 +52,74 @@ class ImageFormat(StrEnum):
     JPEG = "jpeg"
 
 
+#: Which fields survive from one film to the next as dialog defaults.
+#:
+#: The digitising rig barely changes between films — same body, same lens, same
+#: light, same holder — while the film's own identity and its development log are
+#: written afresh every time. Prefilling the second group would mean clearing it
+#: every session and risking a stale "developed at" on a strip that has not been
+#: in chemistry yet.
+RIG_FIELDS: tuple[str, ...] = (
+    "camera",
+    "format",
+    "film_type_class",
+    "mirrored",
+    "digitising_lens",
+    "digitising_light",
+    "digitising_holder",
+    "operator",
+)
+
+#: Always prefilled, but with *today* rather than the previous value.
+DIGITISATION_DATE_FIELD = "digitisation_date"
+
+
 class FilmMetadata(BaseModel):
     """Describes the physical film strip being digitised.
 
     Mirrors the archival fields a darkroom log would contain, so a scan remains
     interpretable without knowing anything about the scanner.
+
+    Two field groups live here deliberately. The first is the strip and its
+    development; the second (``digitising_*``, ``camera``, ``mirrored``) describes
+    the *rig* it was scanned on, which is what makes a scan reproducible and is
+    what carries over when a new film is started — see :data:`RIG_FIELDS`.
+
+    Every field except ``film_id`` is optional: a strip is often started before
+    its development is known, and dates are free text on purpose because a darkroom
+    log records things like ``"asi 12/25"`` that no date parser should reject.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = SCHEMA_VERSION
     film_id: str = Field(description="Stable identifier, e.g. 'HP5_001'.")
-    manufacturer: str | None = None
-    film_type: str | None = None
+    #: Manufacturer and stock as one string, e.g. 'Fomapan 100 Classic' — they are
+    #: always typed together and splitting them only lost information.
+    film_name: str | None = None
+    #: Body the scan was made on, typed rather than taken from EXIF: the operator
+    #: records what they believe they used, and may be digitising on a spare body.
+    camera: str | None = None
     format: str | None = Field(default=None, description="e.g. '35mm', '120', '4x5'.")
     film_type_class: FilmType = FilmType.BW_NEGATIVE
-    developer: str | None = None
-    developer_dilution: str | None = None
-    development_time: str | None = None
+    #: Whole development line as one string, e.g. 'R 09 1:50 8 min @22C'.
+    development: str | None = None
+    #: Free text: 'asi 12/25' must survive, so no date type.
+    development_start: str | None = None
+    development_end: str | None = None
+    content: str | None = Field(
+        default=None, description="What is on the strip."
+    )
+    #: True when the strip was digitised emulsion-side to the lens, which flips
+    #: the image horizontally. Recorded, not yet applied anywhere — the flip
+    #: belongs in the developer's output, and applying it to a live preview
+    #: before it is applied to the export would make the two disagree.
+    mirrored: bool = False
+    digitising_lens: str | None = None
+    digitising_light: str | None = None
+    digitising_holder: str | None = None
+    #: Also free text, but the dialog offers today's date as the default.
+    digitisation_date: str | None = None
     operator: str | None = None
     box_number: str | None = None
     expiry: str | None = None
@@ -77,8 +127,44 @@ class FilmMetadata(BaseModel):
     notes: str | None = None
 
     def label(self) -> str:
-        parts = [p for p in (self.manufacturer, self.film_type) if p]
-        return " ".join(parts) if parts else self.film_id
+        return self.film_name or self.film_id
+
+    def rig_defaults(self) -> dict[str, object]:
+        """The subset of fields that carry over to the next film; see RIG_FIELDS."""
+        return {name: getattr(self, name) for name in RIG_FIELDS}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_v1(cls, data: object) -> object:
+        """Fold schema-v1 sidecars into the current field set.
+
+        v1 split the stock name into ``manufacturer`` + ``film_type`` and the
+        development log into three columns. Archived projects must stay
+        readable without a migration pass over every sidecar on disk, so the
+        merge happens here, once, on load; the on-disk v1 files are left as
+        they are. Unknown keys still fail loudly — ``extra="forbid"`` is what
+        catches a typo'd field name, and a migration must not eat that.
+        """
+        if not isinstance(data, dict):
+            return data
+        if not any(k in data for k in ("manufacturer", "film_type",
+                                       "developer", "developer_dilution",
+                                       "development_time")):
+            return data
+        data = dict(data)
+        name = " ".join(
+            str(p).strip() for p in (data.pop("manufacturer", None),
+                                     data.pop("film_type", None))
+            if p and str(p).strip()
+        )
+        parts = [str(data.pop(k, "") or "").strip()
+                 for k in ("developer", "developer_dilution", "development_time")]
+        development = " ".join(p for p in parts if p)
+        if name and not data.get("film_name"):
+            data["film_name"] = name
+        if development and not data.get("development"):
+            data["development"] = development
+        return data
 
 
 class AcquisitionMetadata(BaseModel):

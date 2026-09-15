@@ -11,6 +11,7 @@ callbacks from Python exactly as the Nikon module's worker threads would.
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 from pathlib import Path
 
@@ -348,3 +349,63 @@ class TestBackendRpc:
         b = nb.NikonSdkBackend()
         with pytest.raises(CameraError, match="install_helper"):
             b.connect()
+
+    def test_crashed_helper_fails_fast_and_names_the_reason(self, monkeypatch):
+        """The 2026-09 regression: sdk_server imported numpy, died at import
+        inside the stdlib-only .venv-x86, and the GUI sat on the readline for
+        the full 30 s RPC timeout, reporting an opaque 'helper neodpověděl'.
+        A dead helper must raise immediately, quoting its stderr."""
+        import subprocess
+        from filmscan_studio.capture import nikon_backend as nb
+        from filmscan_studio.capture.camera import CameraError
+
+        class DeadHelper:
+            class Pipe:
+                @staticmethod
+                def write(s): pass
+                @staticmethod
+                def flush(): pass
+                @staticmethod
+                def readline(): return ""      # EOF — process is gone
+
+            def __init__(self, *a, **k):
+                self.stdin = DeadHelper.Pipe()
+                self.stdout = DeadHelper.Pipe()
+                self._stderr = io.StringIO(
+                    "ModuleNotFoundError: No module named 'numpy'\n")
+
+            def poll(self): return 1           # exited
+            def kill(self): pass
+            def wait(self, timeout=None): return 1
+
+        monkeypatch.setattr(subprocess, "Popen", DeadHelper)
+        b = nb.NikonSdkBackend(helper_python=Path("/fake/python"),
+                               rpc_timeout=30.0)
+        with pytest.raises(CameraError, match="spadl"):
+            b.connect()
+
+
+class TestHelperImports:
+    """The x86_64 helper venv holds stdlib + cffi only. If sdk_server ever
+    pulls numpy/Qt/gphoto2 back into its import graph, the helper dies at
+    startup and the GUI silently degrades to gphoto2 — catch it offline."""
+
+    def test_sdk_server_imports_only_stdlib_and_cffi(self):
+        import subprocess as sp
+        import filmscan_studio.capture.nikon_backend as nb
+        helper = nb._helper_python()
+        if helper is None:
+            pytest.skip("Rosetta helper venv not installed")
+        src = ("import sys, json, filmscan_studio.capture.sdk_server;"
+               "mods = {m.split('.')[0] for m in sys.modules};"
+               "print(json.dumps(sorted(mods - sys.stdlib_module_names)))")
+        out = sp.run([str(helper), "-c", src], capture_output=True, text=True,
+                     env={"PYTHONPATH": str(Path(nb.__file__).parent.parent.parent),
+                          "PATH": "/usr/bin:/bin"})
+        assert out.returncode == 0, out.stderr
+        # The helper venv is stdlib + cffi (+ its pycparser dep) — nothing else.
+        # __main__ = the -c script; _virtualenv = venv bootstrap .pth.
+        allowed = {"filmscan_studio", "cffi", "pycparser", "_cffi_backend",
+                   "__main__", "_virtualenv"}
+        extra = set(json.loads(out.stdout)) - allowed
+        assert not extra, f"sdk_server pulls in what .venv-x86 lacks: {extra}"

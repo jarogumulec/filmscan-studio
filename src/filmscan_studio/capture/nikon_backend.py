@@ -22,10 +22,11 @@ import base64
 import json
 import logging
 import os
-import re
 import subprocess
+import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from filmscan_studio.capture.camera import (
@@ -37,33 +38,13 @@ from filmscan_studio.capture.camera import (
     LiveFrame,
     NotConnectedError,
 )
+from filmscan_studio.capture.parsing import parse_iso, parse_shutter  # noqa: F401  (re-export)
 from filmscan_studio.core.exposure import ExposureSettings
 
 log = logging.getLogger(__name__)
 
 #: Zoom levels for LiveViewImageZoomRate (eNkMAIDLiveViewImageZoomRate).
 ZOOM_ALL, ZOOM_25, ZOOM_33, ZOOM_50, ZOOM_66, ZOOM_100, ZOOM_200 = range(7)
-
-_SHUTTER_RE = re.compile(r"^(?:(\d+)\s*/\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?))$")
-
-
-def parse_shutter(value: str) -> float | None:
-    """'1/60' -> 0.0166…, '2.5' -> 2.5; None for 'Bulb'/'Time'-style entries."""
-    m = _SHUTTER_RE.match(value.strip())
-    if not m:
-        return None
-    num, den, whole = m.groups()
-    if num is not None:
-        d = float(den)
-        return int(num) / d if d else None
-    return float(whole)
-
-
-def parse_iso(value: str) -> int | None:
-    """'100' -> 100; None for 'LO-1'/'Hi-2.0' extended ranges (out of the
-    auto-exposure controller's world anyway)."""
-    m = re.fullmatch(r"(\d+)", value.strip())
-    return int(m.group(1)) if m else None
 
 
 def _helper_python() -> Path | None:
@@ -91,6 +72,11 @@ class NikonSdkBackend(CameraBackend):
         self._current_shutter: float | None = None
         self._current_iso: int | None = None
         self._live_view = False
+        #: Helper's stderr lands here (a pipe would deadlock once the crash
+        #: traceback outgrows the 64 KB buffer; a file the child shares with
+        #: us cannot). Read on failure to explain *why* it died — the numpy
+        #: import crash of 2026-09 hid behind DEVNULL for a whole afternoon.
+        self._err_log: tempfile.TemporaryFile | None = None
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -107,18 +93,29 @@ class NikonSdkBackend(CameraBackend):
             raise CameraError(
                 "Nikon SDK není nainstalovaný — spusť scripts/install_sdk.sh "
                 "(sudo, zkopíruje modul do /Library/Application Support/Nikon).")
-        self._proc = subprocess.Popen(
-            [str(helper), "-m", "filmscan_studio.capture.sdk_server"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True,
-            env={**os.environ,
-                 "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
-        )
+        self._err_log = tempfile.TemporaryFile(mode="w+b")
+        try:
+            self._proc = subprocess.Popen(
+                [str(helper), "-m", "filmscan_studio.capture.sdk_server"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=self._err_log, text=True,
+                env={**os.environ,
+                     "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+            )
+        except OSError as exc:            # unspawnable helper (bad path/arch)
+            self._close_err_log()
+            raise CameraError(f"Nelze spustit Nikon SDK helper: {exc}") from exc
         try:
             reply = self._rpc("connect")
-        except CameraError:
+        except CameraError as exc:
+            reason = self._helper_error()
             self._kill()
-            raise
+            if isinstance(exc, NotConnectedError):
+                # _rpc refused to talk to a process that is already gone —
+                # the log tail is the whole story, drop the boilerplate.
+                raise CameraError(reason or "Nikon SDK helper spadl") from None
+            raise CameraError(f"{exc} — helper: {reason}" if reason
+                              else str(exc)) from None
         model = reply["model"]
         parsed_shutter = [(i, v) for i, s in enumerate(reply["shutter"]["strings"])
                           if (v := parse_shutter(s)) is not None]
@@ -136,6 +133,9 @@ class NikonSdkBackend(CameraBackend):
             battery_percent=reply.get("battery"),
             shutter_choices=tuple(v for _, v in parsed_shutter),
             iso_choices=tuple(v for _, v in parsed_iso),
+            # D750 NEF geometry; not queried from the body (no cap verified).
+            sensor_width=6016,
+            sensor_height=4016,
         )
         log.info("SDK backend: %s, %d shutter / %d ISO choices",
                  model, len(parsed_shutter), len(parsed_iso))
@@ -157,6 +157,30 @@ class NikonSdkBackend(CameraBackend):
             self._proc.kill()
             self._proc.wait(timeout=5)
             self._proc = None
+        self._close_err_log()
+
+    def _close_err_log(self) -> None:
+        if self._err_log is not None:
+            self._err_log.close()
+            self._err_log = None
+
+    def _helper_error(self) -> str:
+        """Why an already-exited helper died — the tail of its stderr, or ''
+        while it is still alive. Returns '' cheaply so callers can append."""
+        if (self._proc is None or self._err_log is None
+                or self._proc.poll() is None):
+            return ""
+        try:
+            self._err_log.seek(0)
+            data = self._err_log.read()
+        except OSError:
+            return ""
+        lines = [ln for ln in data.decode(errors="replace").splitlines()
+                 if ln.strip()]
+        if not lines:
+            return f"spadl (exit {self._proc.poll()}) bez hlášky"
+        return (f"spadl (exit {self._proc.poll()}): "
+                + " ┃ ".join(deque(lines, maxlen=4)))
 
     # ------------------------------------------------------------------ RPC
 
@@ -196,6 +220,7 @@ class NikonSdkBackend(CameraBackend):
             # hardware probe); even on electronic glass focus stacking wants
             # the macro rail, not the lens motor.
             focus_drive=False,
+            live_view_zoom=True,
             notes=("Nikon SDK:Live View zoom (Whole..200%) na straně těla; "
                    "clona se na manuálním skle nenastavuje (z EXIF)."),
         )
@@ -258,13 +283,20 @@ class NikonSdkBackend(CameraBackend):
 
     # SDK-only extras (the reason for the whole swap) -------------------------
 
-    def set_zoom(self, rate: int) -> None:
-        """Whole-frame .. 200% camera-side LV crop (ZOOM_* constants)."""
+    def set_live_view_zoom(self, rate: int) -> None:
+        """Whole-frame .. 200% camera-side LV crop (core.zoom ZOOM_* rates)."""
         self._rpc("set_zoom", rate=rate)
+
+    #: Backwards-compatible alias for probe scripts and older call sites.
+    set_zoom = set_live_view_zoom
 
     def exposure_ev(self) -> float:
         """Body's meter reading in EV; the AE loop drives this to 0."""
         return float(self._rpc("exposure_ev")["ev"])
+
+    def set_exposure_ev(self, ev: float) -> float:
+        """ExposureComp (Range cap) — a third actuator beside shutter and ISO."""
+        return float(self._rpc("set_exposure_comp", ev=ev)["ev"])
 
     # ---------------------------------------------------------------- capture
 

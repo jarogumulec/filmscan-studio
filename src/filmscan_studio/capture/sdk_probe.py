@@ -116,6 +116,32 @@ def _probe_live_view(source, report: dict, outdir: Path) -> None:
         lv["header_bytes_all"] = off
         (outdir / "lv_all.jpg").write_bytes(frame[off:] if off >= 0 else frame)
 
+        # ``core.zoom.BODY_ZOOM_SENSOR_PX_PER_LV_PX`` assumes what each zoom
+        # rate does to the stream. Two of its numbers have never been measured
+        # against a ruler, so dump one frame per rate: pointing the body at a
+        # ruler/graph paper and comparing lv_zoom_<rate>.jpg gives the true
+        # sensor-pixels-per-delivered-pixel for every rate. The rate that shows
+        # the same physical width as the frame's pixel count is the true 1:1.
+        crops: dict[str, dict] = {}
+        for rate in range(7):
+            try:
+                source.set_zoom(rate)
+                time.sleep(0.35)
+                blob = source.lv_image()
+            except sdk.MaidError as exc:
+                crops[str(rate)] = {"error": str(exc)}
+                continue
+            off = blob.find(JPEG_MAGIC)
+            frame_bytes = blob[off:] if off >= 0 else blob
+            (outdir / f"lv_zoom_{rate}.jpg").write_bytes(frame_bytes)
+            crops[str(rate)] = {"bytes": len(frame_bytes)}
+        lv["per_rate_frames"] = crops
+        lv["per_rate_note"] = (
+            "Změř na lv_zoom_*.jpg fyzickým pravítkem/graph paper: kolik px "
+            "senzoru (6016px wide NEF) zastupuje 1 px proudu — ty čísla patří "
+            "do core.zoom.BODY_ZOOM_SENSOR_PX_PER_LV_PX. Předpoklad "
+            "25/33/50/66/100/200% = 4/3/2/1.5/1/0.5 nebyl změřen.")
+
         for label, rate in (("all", sdk.ZOOM_ALL), ("100pct", sdk.ZOOM_100)):
             if rate not in vals and rate != sdk.ZOOM_ALL:
                 lv[f"fps_{label}"] = "rate not enumerated"

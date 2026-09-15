@@ -31,6 +31,12 @@ class CameraInfo:
     shutter_choices: tuple[float, ...] = ()
     #: ISO values the body actually offers.
     iso_choices: tuple[int, ...] = ()
+    #: Full-resolution frame size — the NEF, what 1:1 zoom is measured against.
+    #: Not read from the body (no MAID cap verified for it on the D750), so
+    #: backends state it explicitly; ``None`` makes the UI fall back to the
+    #: D750's known 6016x4016 rather than guess from the LV stream.
+    sensor_width: int | None = None
+    sensor_height: int | None = None
 
     def nearest_shutter(self, wanted: float) -> float | None:
         return _nearest(self.shutter_choices, wanted)
@@ -91,6 +97,10 @@ class CameraCapabilities:
     iso: bool = True
     aperture: bool = False
     focus_drive: bool = True
+    #: Body can reframe the Live View stream itself (Nikon SDK's
+    #: LiveViewImageZoomRate). gphoto2's capturePreview always sends the whole
+    #: downscaled frame, so the zoomed-detail path is SDK-only.
+    live_view_zoom: bool = False
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -126,6 +136,27 @@ class CameraBackend(ABC):
     @abstractmethod
     def next_live_frame(self) -> LiveFrame | None:
         """Blocking single frame. Returns None when the body offers nothing."""
+
+    def set_live_view_zoom(self, rate: int) -> None:
+        """Ask the body to reframe its Live View stream (core.zoom ZOOM_* rates).
+
+        Optional: backends without the capability (gphoto2) inherit this
+        no-op-raising default, and the caller checks
+        ``capabilities().live_view_zoom`` first.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} neumí zoom Live View proudu"
+        )
+
+    def set_exposure_ev(self, ev: float) -> float:
+        """Body-side exposure compensation in EV (optional).
+
+        The Nikon SDK exposes ExposureComp as a writable Range cap; gphoto2
+        exposes it variably. Returns the value the body accepted.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} neumí nastavit expoziční korekci"
+        )
 
     @abstractmethod
     def capture(self, destination: Path, filename_stem: str) -> CaptureResult:

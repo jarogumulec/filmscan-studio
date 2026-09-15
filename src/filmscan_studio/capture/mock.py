@@ -24,6 +24,10 @@ from filmscan_studio.capture.camera import (
     NotConnectedError,
 )
 from filmscan_studio.core.exposure import ExposureSettings
+from filmscan_studio.core.zoom import ZOOM_ALL, SensorSize
+
+#: What the mock's "NEF" is, mirroring the D750 it emulates.
+MOCK_SENSOR = (6016, 4016)
 
 #: The D750's real shutter ladder, in seconds.
 D750_SHUTTERS: tuple[float, ...] = (
@@ -74,6 +78,10 @@ class MockCamera(CameraBackend):
         self._rng = np.random.default_rng(1234)
         self.shutter_history: list[float] = []
         self.iso_history: list[int] = []
+        #: Body-side LV zoom rate (core.zoom ZOOM_*); the mock reframes its
+        #: synthetic pattern when it changes, like the D750 does.
+        self.live_view_zoom_rate = ZOOM_ALL
+        self.live_view_zoom_history: list[int] = []
 
     def connect(self) -> CameraInfo:
         self._connected = True
@@ -84,6 +92,8 @@ class MockCamera(CameraBackend):
             battery_percent=92,
             shutter_choices=D750_SHUTTERS,
             iso_choices=D750_ISOS,
+            sensor_width=MOCK_SENSOR[0],
+            sensor_height=MOCK_SENSOR[1],
         )
 
     def disconnect(self) -> None:
@@ -99,10 +109,14 @@ class MockCamera(CameraBackend):
             battery_percent=92,
             shutter_choices=D750_SHUTTERS,
             iso_choices=D750_ISOS,
+            sensor_width=MOCK_SENSOR[0],
+            sensor_height=MOCK_SENSOR[1],
         )
 
     def capabilities(self) -> CameraCapabilities:
-        return CameraCapabilities(aperture=False)
+        # live_view_zoom True so the SDK-only zoomed-detail path is exercised
+        # by the GUI tests; the real gphoto2 backend reports False there.
+        return CameraCapabilities(aperture=False, live_view_zoom=True)
 
     def get_settings(self) -> ExposureSettings:
         self._require()
@@ -137,6 +151,11 @@ class MockCamera(CameraBackend):
             time.sleep(1.0 / self._live_fps)
         self._frame_index += 1
         return LiveFrame(jpeg=self._synth_jpeg(), width=self._width, height=self._height)
+
+    def set_live_view_zoom(self, rate: int) -> None:
+        self._require()
+        self.live_view_zoom_rate = rate
+        self.live_view_zoom_history.append(rate)
 
     def capture(self, destination: Path, filename_stem: str) -> CaptureResult:
         self._require()
@@ -190,11 +209,26 @@ class MockCamera(CameraBackend):
         return np.clip(noisy, 0, MOCK_WHITE).astype(np.uint16)
 
     def _synth_jpeg(self) -> bytes:
-        """A minimal valid JPEG so the GUI decodes a real image, not a stub."""
+        """A minimal valid JPEG so the GUI decodes a real image, not a stub.
+
+        The body-side zoom rate is honoured the way the D750 honours it: the
+        frame keeps its pixel size but stands for a crop of the scene, so the
+        scene's gradient is spread across the frame by 1/crop instead of
+        uniform. Tests use the pattern change to prove a zoom request actually
+        reached the camera.
+        """
         import cv2
 
-        level = int(np.clip(self.sensor_signal() / MOCK_WHITE * 255, 0, 255))
-        img = np.full((self._height, self._width, 3), level, dtype=np.uint8)
+        from filmscan_studio.core.zoom import detail_for
+
+        detail = detail_for(self.live_view_zoom_rate, self._width, self._height,
+                            SensorSize(*MOCK_SENSOR))
+        base = self.sensor_signal() / MOCK_WHITE
+        span = min(base * 0.6, 1.0)
+        ramp = np.linspace(-0.5, 0.5, self._width) * (1.0 / max(detail.crop_fraction, 1e-6))
+        ramp = np.clip(base + span * ramp, 0.0, 1.0)
+        level = np.clip((ramp * 255).astype(np.uint8)[None, :, None], 0, 255)
+        img = np.repeat(np.repeat(level, self._height, axis=0), 3, axis=2)
         ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         return buf.tobytes() if ok else b""
 

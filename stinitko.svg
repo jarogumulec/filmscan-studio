@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="800mm"
+     height="500mm"
+     viewBox="0 0 800 500">
+
+<style>
+.cut  { stroke:black; fill:none; stroke-width:0.3; }
+.fold { stroke:blue; stroke-dasharray:3 2; fill:none; stroke-width:0.2; }
+</style>
+
+<!-- Stěna 1 -->
+<polygon class="cut"
+ points="40,220 191,220 138.3,347.9 93.3,347.9"/>
+
+<!-- spodní límec -->
+<polyline class="cut"
+ points="40,220 191,220 191,225 40,225 40,220"/>
+
+<!-- horní límec -->
+<polyline class="cut"
+ points="93.3,347.9 138.3,347.9 138.3,342.9 93.3,342.9 93.3,347.9"/>
+
+<!-- Stěna 2 -->
+<polygon class="cut"
+ points="191,220 317.0,245.3 352.0,358.4 138.3,347.9"/>
+
+<!-- Stěna 3 -->
+<polygon class="cut"
+ points="317.0,245.3 468.0,245.3 415.0,369.7 352.0,358.4"/>
+
+<!-- Stěna 4 -->
+<polygon class="cut"
+ points="468.0,245.3 594.0,220.0 478.0,334.1 415.0,369.7"/>
+
+<!-- ohyby -->
+<line class="fold" x1="191" y1="220" x2="138.3" y2="347.9"/>
+<line class="fold" x1="317.0" y1="245.3" x2="352.0" y2="358.4"/>
+<line class="fold" x1="468.0" y1="245.3" x2="415.0" y2="369.7"/>
+
+</svg>

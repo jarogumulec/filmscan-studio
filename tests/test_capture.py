@@ -28,13 +28,11 @@ from filmscan_studio.core.rawio import RawFrame
 def film() -> FilmMetadata:
     return FilmMetadata(
         film_id="HP5_001",
-        manufacturer="Ilford",
-        film_type="HP5+",
+        film_name="Ilford HP5+",
+        camera="Nikon D750",
         format="35mm",
         film_type_class=FilmType.BW_NEGATIVE,
-        developer="ID-11",
-        developer_dilution="1+1",
-        development_time="13 min",
+        development="ID-11 1+1 13 min",
         operator="JG",
     )
 
@@ -365,3 +363,66 @@ class TestAutoExposure:
         controller = AutoExposureController(camera, LiveMeter())
         result = controller.run(read=lambda: self._reading(0.999, clipped=True))
         assert result.clipped
+
+
+class TestFilmMetadataV2:
+    """Schema v2: name+developer collapsed, rig fields added, v1 readable."""
+
+    def test_v1_sidecar_migrates_on_load(self):
+        v1 = {
+            "schema_version": 1,
+            "film_id": "HP5_001",
+            "manufacturer": "Ilford",
+            "film_type": "HP5+",
+            "developer": "ID-11",
+            "developer_dilution": "1+1",
+            "development_time": "13 min",
+        }
+        film = FilmMetadata.model_validate(v1)
+        assert film.film_name == "Ilford HP5+"
+        assert film.development == "ID-11 1+1 13 min"
+        assert film.film_id == "HP5_001"
+
+    def test_v1_migration_keeps_explicit_v2_fields(self):
+        v1 = {
+            "film_id": "X",
+            "manufacturer": "Foma",
+            "film_type": "100 Classic",
+            "film_name": "KEEP ME",
+        }
+        assert FilmMetadata.model_validate(v1).film_name == "KEEP ME"
+
+    def test_unknown_fields_still_rejected(self):
+        with pytest.raises(Exception):
+            FilmMetadata.model_validate({"film_id": "X", "typo_field": 1})
+
+    def test_label_prefers_film_name(self):
+        assert FilmMetadata(film_id="F1", film_name="Fomapan 100").label() == "Fomapan 100"
+        assert FilmMetadata(film_id="F1").label() == "F1"
+
+    def test_rig_defaults_subset(self):
+        film = FilmMetadata(
+            film_id="F1", film_name="Fomapan 100", camera="D750",
+            digitising_light="CRS LED", mirrored=True, development="R09 8 min",
+            content="hrady",
+        )
+        rig = film.rig_defaults()
+        assert rig["camera"] == "D750"
+        assert rig["digitising_light"] == "CRS LED"
+        assert rig["mirrored"] is True
+        # The film's own identity and its development log never carry over.
+        assert "film_name" not in rig
+        assert "development" not in rig
+        assert "content" not in rig
+
+    def test_all_optional_fields_may_stay_empty(self):
+        film = FilmMetadata(film_id="F1")
+        assert film.film_name is None and not film.mirrored
+        assert film.digitisation_date is None
+
+    def test_roundtrip_json(self):
+        film = FilmMetadata(film_id="F2", film_name="Astia 100",
+                            film_type_class=FilmType.COLOR_NEGATIVE,
+                            development_start="asi 12/25", mirrored=True)
+        again = FilmMetadata.model_validate_json(film.model_dump_json())
+        assert again == film
