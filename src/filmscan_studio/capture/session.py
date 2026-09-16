@@ -34,7 +34,7 @@ from filmscan_studio.core.models import (
     ImageFormat,
     to_json_dict,
 )
-from filmscan_studio.core.rawio import RawFrame, open_frame
+from filmscan_studio.core.rawio import RawFrame, jpeg_dimensions, open_frame
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +175,22 @@ class CaptureSession:
         self, result: CaptureResult, kind: FrameKind, frame_number: int | None
     ) -> CaptureRecord:
         """Write the JSON sidecar and the catalog row for one captured file."""
-        frame = self._safe_read(result.path)
+        is_jpeg = result.file_format == "jpeg"
+        if is_jpeg:
+            # Never rawpy: LibRaw reads it as a broken NEF (b'Input/output
+            # error'). Geometry from the SOF marker, radiometry N/A — a
+            # body-JPEG is a display-referred picture, not sensor data.
+            dims = jpeg_dimensions(result.path)
+            frame = None
+            width, height = dims if dims else (None, None)
+            log.warning(
+                "%s je JPEG, ne RAW (tělo má Compression Level jinou než RAW) "
+                "— pro archivní skenování je to nepoužitelné, viz tlačítko "
+                "Nastavit RAW v okně Capture.", result.path.name)
+        else:
+            frame = self._safe_read(result.path)
+            width = frame.width if frame else None
+            height = frame.height if frame else None
         acquisition = (frame.acquisition if frame else None) or AcquisitionMetadata()
         # Settings at release win over EXIF for shutter and ISO: a long or bulb
         # exposure can report a rounded EXIF time that is not what was applied.
@@ -192,9 +207,9 @@ class CaptureSession:
             frame_number=frame_number,
             kind=kind,
             filename=result.path.name,
-            file_format=ImageFormat.RAW,
-            width=frame.width if frame else None,
-            height=frame.height if frame else None,
+            file_format=ImageFormat.JPEG if is_jpeg else ImageFormat.RAW,
+            width=width,
+            height=height,
             black_level=frame.black_level if frame else None,
             white_level=frame.white_level if frame else None,
             film=self.film,

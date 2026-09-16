@@ -81,6 +81,13 @@ class TestBodyRateChoice:
         # its cost, so the body stays at Whole.
         assert choose_body_rate(0.125, 1200, 800, 640, 424, D750) == ZOOM_ALL
 
+    def test_half_scale_still_shows_whole_frame(self):
+        """2026-09 rule ('nedělej ořez'): below 1:1 nobody judges grain —
+        the body's shallowest crop is a ~43%x48% window (measured: zoomed
+        rates deliver 640x480), and cutting the frame off reads as a bug.
+        Interpolating an overview is the honest trade; crop only at 1:1+."""
+        assert choose_body_rate(0.5, 1200, 800, 640, 424, D750) == ZOOM_ALL
+
     def test_full_1to1_picks_the_native_rate(self):
         # Display 1.0 wants delivered pixels that land one-per-screen-pixel:
         # body 100% (1 sensor px per source px) is exactly native; 200% would
@@ -90,12 +97,13 @@ class TestBodyRateChoice:
     def test_200pct_display_uses_the_deepest_crop(self):
         assert choose_body_rate(2.0, 1200, 800, 640, 424, D750) == ZOOM_200
 
-    def test_half_scale_picks_shallowest_rate_that_serves_it(self):
-        rate = choose_body_rate(0.5, 1200, 800, 640, 424, D750)
-        # Whole-frame would be 4.7x invention; 50% body (2.0 sensor px per
-        # source px at 0.5 display -> interp 1.0) is native and the largest
-        # visible crop that qualifies.
-        assert rate == ZOOM_50
+    def test_cropped_rate_still_native_at_1to1(self):
+        # The crop selection itself is unchanged at >= 1:1: body 100% is
+        # native, and a shallower crop that served the scale natively would
+        # win if one existed (it does not at 1.0 display).
+        assert choose_body_rate(1.0, 1200, 800, 640, 424, D750,
+                                available_rates=(ZOOM_ALL, ZOOM_50, ZOOM_100)) \
+            == ZOOM_100
 
     def test_respects_available_rates(self):
         rate = choose_body_rate(1.0, 1200, 800, 640, 424, D750,

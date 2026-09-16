@@ -234,9 +234,59 @@ class Server:
         # capture_still writes exactly what the body sent.
         target = dest / f"{stem}.NEF"
         self.src.capture_still(target)
+        # The extension is a promise the body does not always keep: with
+        # Compression Level != RAW the very same transfer lands as a JPEG
+        # (measured 2026-09: JPEG Basic at S 3008x2008, ~1 MB, saved as
+        # .NEF). Sniff the magic so callers can stop lying in sidecars and
+        # rawpy never sees a JPEG wearing a NEF mask (LibRaw answers the
+        # misleading b'Input/output error').
+        with open(target, "rb") as fh:
+            magic = fh.read(4)
+        if magic.startswith(JPEG_MAGIC[:3]):
+            file_format = "jpeg"
+        elif magic[:4] in (b"II*\x00", b"MM\x00*"):
+            file_format = "nef"
+        else:
+            file_format = "unknown"
         return {"path": str(target),
                 "bytes": target.stat().st_size,
-                "elapsed": round(time.monotonic() - started, 2)}
+                "elapsed": round(time.monotonic() - started, 2),
+                "file_format": file_format}
+
+    # ------------------------------------------------------------- media caps
+
+    #: Media-quality caps measured live on the D750 (2026-09-15):
+    #: 0x8110 Compression Level = JPEG Basic|JPEG Normal|JPEG Fine|RAW|
+    #:        RAW + JPEG Basic|...  (element 3 = RAW)
+    #: 0x8157 Image Size = L(6016*4016)|M(4512*3008)|S(3008*2008) (element 0 = L)
+    CAP_COMPRESSION_LEVEL = 0x8110
+    CAP_IMAGE_SIZE = 0x8157
+
+    def media_settings(self) -> dict:
+        out: dict = {}
+        for name, cap in (("compression", self.CAP_COMPRESSION_LEVEL),
+                          ("size", self.CAP_IMAGE_SIZE)):
+            try:
+                cur, _, raw = self._enum_raw(cap)
+                out[name] = {"current": cur,
+                             "strings": [s.decode(errors="replace")
+                                         for s in raw.split(b"\x00")[:-1]],
+                             "settable": self.src.has(cap, sdk.OP_SET)}
+            except sdk.MaidError as exc:
+                out[name] = {"error": str(exc)}
+        return out
+
+    def set_media(self, compression: int | None = None,
+                  size: int | None = None) -> dict:
+        for cap, val in ((self.CAP_COMPRESSION_LEVEL, compression),
+                         (self.CAP_IMAGE_SIZE, size)):
+            if val is None:
+                continue
+            if not self.src.has(cap, sdk.OP_SET):
+                raise RuntimeError(
+                    f"cap 0x{cap:04x} tělo nastavit nedovolí (režim voličem?)")
+            self.mod.set_enum_value(self.src.obj, cap, val)
+        return self.media_settings()
 
     # ------------------------------------------------------------------- misc
 
@@ -279,6 +329,10 @@ def _dispatch(server: Server, req: dict) -> dict:
         return server.lv_frame()
     if method == "capture":
         return server.capture(req["destination"], req["stem"])
+    if method == "media_settings":
+        return server.media_settings()
+    if method == "set_media":
+        return server.set_media(req.get("compression"), req.get("size"))
     if method == "close":
         result = server.close()
         result["bye"] = True

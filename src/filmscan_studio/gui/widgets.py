@@ -7,15 +7,17 @@ per pixel of the 6016x4016 NEF, and the widget states honestly how many sensor
 pixels one delivered Live View pixel actually represents, because the app
 cannot invent detail the USB stream does not carry.
 
-The view also serves as the Auto Exposure framing tool: a drag draws the thin
-red rectangle AE meters inside of, so a bright sky bordering the film cannot
-drag the exposure down (or the frame's white border up).
+The view also serves as the Auto Exposure framing tool: a Shift-drag draws the
+thin red rectangle AE meters inside of, so a bright sky bordering the film
+cannot drag the exposure down (or the frame's white border up). Plain drag when
+zoomed in pans the picture instead — focusing wants the point of interest
+wherever it sits, not just the centre — and a plain click re-centres.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QPointF, QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QSizePolicy,
@@ -71,8 +73,10 @@ class ZoomView(QWidget):
         self._has_image = False
         self.sensor = sensor or SensorSize()
         self._ae_rect: QRect | None = None   # source coordinates
-        self._drag_origin: QPoint | None = None
-        self._drag_current: QPoint | None = None
+        self._drag_origin: QPointF | None = None
+        self._drag_current: QPointF | None = None
+        self._drag_shift = False             # this gesture drags AE, not pans
+        self._drag_pan_accum = QPointF(0, 0)
         self._detail_note = ""
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumSize(320, 240)
@@ -155,68 +159,80 @@ class ZoomView(QWidget):
             return self._zoom
         return self.sensor.fit_scale(self.width(), self.height())
 
-    def _crop_rect(self) -> tuple[QRect, QRect]:
-        """(crop in source px, destination on screen) for the current state."""
+    def _crop_rect(self) -> tuple[QRectF, QRectF]:
+        """(crop in source px, destination on screen) for the current state.
+
+        Fractional maths on purpose: rounding the crop *size* down and then
+        drawing it at an integer destination left empty margins (the 2026-09
+        complaint: "jen od levého horního rohu, neplní okno"). Now the crop is
+        exactly the widget at the display scale, clamped to the frame at its
+        edges, and the destination covers the full crop — sub-pixel accuracy
+        comes from drawImage's QRectF overload.
+        """
         if self._image is None:
-            return QRect(), QRect()
-        h, w = self._image.shape[:2]
-        s = self._display_scale()
+            return QRectF(), QRectF()
+        h, w = float(self._image.shape[1]), float(self._image.shape[0])
         if self._zoom == FIT:
             # Fit means "see the whole frame": the entire stream, whatever the
             # body's crop — a body-side zoom at Fit would hide most of it.
             scale = min(self.width() / (w * self._source_scale),
                         self.height() / (h * self._source_scale))
-            crop = QRect(0, 0, w, h)
-            dest = QRect(
-                int((self.width() - w * self._source_scale * scale) / 2),
-                int((self.height() - h * self._source_scale * scale) / 2),
-                int(w * self._source_scale * scale),
-                int(h * self._source_scale * scale),
-            )
-            return crop, dest
-        self._clamp_center()
+            dw, dh = w * self._source_scale * scale, h * self._source_scale * scale
+            return (QRectF(0, 0, w, h),
+                    QRectF((self.width() - dw) / 2, (self.height() - dh) / 2, dw, dh))
+        self._clamp_center()          # keeps the crop inside the frame
         # screen px -> source px: divide by (screen/sensor) * (sensor/source)
-        per_source = max(s * self._source_scale, 1e-9)
-        cw = max(min(w, int(self.width() / per_source)), 1)
-        ch = max(min(h, int(self.height() / per_source)), 1)
-        cx = self._center.x() / self._source_scale
-        cy = self._center.y() / self._source_scale
-        x0 = int(np.clip(cx - cw / 2, 0, w - cw))
-        y0 = int(np.clip(cy - ch / 2, 0, h - ch))
-        crop = QRect(x0, y0, cw, ch)
-        dest = QRect(0, 0, int(cw * per_source), int(ch * per_source))
+        per_source = max(self._display_scale() * self._source_scale, 1e-9)
+        crop_w = min(self.width() / per_source, w)
+        crop_h = min(self.height() / per_source, h)
+        x0 = np.clip(self._center.x() / self._source_scale - crop_w / 2, 0, w - crop_w)
+        y0 = np.clip(self._center.y() / self._source_scale - crop_h / 2, 0, h - crop_h)
+        crop = QRectF(float(x0), float(y0), crop_w, crop_h)
+        # A strict-subset crop fills the widget exactly, so this centring is a
+        # no-op there; it only kicks in when the *whole* frame is smaller than
+        # the viewport (low zoom) — letterbox it instead of parking it in the
+        # top-left corner, which read as a broken scale.
+        dw, dh = crop_w * per_source, crop_h * per_source
+        dest = QRectF((self.width() - dw) / 2, (self.height() - dh) / 2, dw, dh)
         return crop, dest
 
     def _clamp_center(self) -> None:
         if self._image is None:
             return
-        h, w = self._image.shape[:2]
-        s = self._display_scale()
-        per_source = max(s * self._source_scale, 1e-9)
-        half_w = int(self.width() / per_source / 2) * self._source_scale
-        half_h = int(self.height() / per_source / 2) * self._source_scale
-        max_x = w * self._source_scale
-        max_y = h * self._source_scale
-        self._center.setX(int(np.clip(self._center.x(), half_w, max(half_w, max_x - half_w))))
-        self._center.setY(int(np.clip(self._center.y(), half_h, max(half_h, max_y - half_h))))
+        h, w = float(self._image.shape[1]), float(self._image.shape[0])
+        per_source = max(self._display_scale() * self._source_scale, 1e-9)
+        half_w = self.width() / per_source / 2
+        half_h = self.height() / per_source / 2
+        cx = self._center.x() / self._source_scale
+        cy = self._center.y() / self._source_scale
+        cx = float(np.clip(cx, min(half_w, w / 2), max(w - half_w, w / 2)))
+        cy = float(np.clip(cy, min(half_h, h / 2), max(h - half_h, h / 2)))
+        self._center = QPoint(int(round(cx * self._source_scale)),
+                              int(round(cy * self._source_scale)))
 
-    def _screen_to_source(self, pos: QPoint) -> QPoint:
+    def _screen_to_source(self, pos: QPointF | QPoint) -> QPoint:
         """Widget position -> source pixel (for the current crop)."""
         crop, dest = self._crop_rect()
         if crop.isEmpty() or dest.isEmpty():
             return QPoint(0, 0)
-        x = crop.x() + (pos.x() - dest.x()) * crop.width() / max(dest.width(), 1)
-        y = crop.y() + (pos.y() - dest.y()) * crop.height() / max(dest.height(), 1)
+        x = crop.x() + (pos.x() - dest.x()) * crop.width() / max(dest.width(), 1e-9)
+        y = crop.y() + (pos.y() - dest.y()) * crop.height() / max(dest.height(), 1e-9)
         return QPoint(int(np.clip(x, 0, self._image.shape[1] - 1)),
                       int(np.clip(y, 0, self._image.shape[0] - 1)))
 
-    def _source_to_screen(self, p: QPoint) -> QPoint:
+    def _source_to_screen(self, p: QPoint) -> QPointF:
         crop, dest = self._crop_rect()
         if crop.isEmpty() or dest.isEmpty():
-            return QPoint(0, 0)
-        x = dest.x() + (p.x() - crop.x()) * dest.width() / max(crop.width(), 1)
-        y = dest.y() + (p.y() - crop.y()) * dest.height() / max(crop.height(), 1)
-        return QPoint(int(x), int(y))
+            return QPointF(0, 0)
+        return QPointF(
+            dest.x() + (p.x() - crop.x()) * dest.width() / max(crop.width(), 1e-9),
+            dest.y() + (p.y() - crop.y()) * dest.height() / max(crop.height(), 1e-9),
+        )
+
+    def _is_panning(self) -> bool:
+        """Zoomed in (not Fit) and no Shift held: drag pans, Shift drags AE."""
+        return (self._zoom != FIT
+                and not self._drag_shift)
 
     # ------------------------------------------------------------------ painting
 
@@ -241,10 +257,12 @@ class ZoomView(QWidget):
             a = self._source_to_screen(self._ae_rect.topLeft())
             b = self._source_to_screen(self._ae_rect.bottomRight())
             painter.setPen(_AE_PEN)
-            painter.drawRect(QRect(a, b).normalized())
-        if self._drag_origin is not None and self._drag_current is not None:
+            painter.drawRect(QRectF(a, b).normalized())
+        if (self._drag_origin is not None and self._drag_current is not None
+                and not self._is_panning()):
             painter.setPen(_AE_PEN)
-            painter.drawRect(QRect(self._drag_origin, self._drag_current).normalized())
+            painter.drawRect(QRectF(self._drag_origin,
+                                    self._drag_current).normalized())
 
         if self._detail_note and self._zoom != FIT:
             painter.setPen(QColor(255, 200, 120))
@@ -258,22 +276,43 @@ class ZoomView(QWidget):
         if event.button() == Qt.MouseButton.RightButton:
             self.clear_ae_rect()
             return
-        self._drag_origin = event.position().toPoint()
+        self._drag_origin = event.position()
         self._drag_current = self._drag_origin
+        # Decided once per gesture so holding/releasing Shift mid-drag cannot
+        # switch a pan into an AE rectangle under the pointer.
+        self._drag_shift = bool(
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        self._drag_pan_accum = QPointF(0, 0)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt naming
         if self._drag_origin is None:
             return
-        self._drag_current = event.position().toPoint()
+        pos = event.position()
+        if self._is_panning():
+            # Drag the picture: the sensor point grabbed stays under the
+            # pointer, which is what "posunuji se fotkou" means physically.
+            per_source = max(self._display_scale() * self._source_scale, 1e-9)
+            d = pos - self._drag_current
+            cx = self._center.x() - d.x() / per_source * self._source_scale
+            cy = self._center.y() - d.y() / per_source * self._source_scale
+            self._center = QPoint(int(round(cx)), int(round(cy)))
+            self._clamp_center()
+            self._drag_pan_accum += d
+            self._drag_current = pos
+            self.update()
+            return
+        self._drag_current = pos
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
         if self._drag_origin is None or self._image is None:
             return
-        origin, current = self._drag_origin, event.position().toPoint()
+        origin, current = self._drag_origin, event.position()
+        panning = self._is_panning()
         self._drag_origin = None
         self._drag_current = None
-        drag = QRect(origin, current).normalized()
+        self._drag_pan_accum = QPointF(0, 0)
+        drag = QRectF(origin, current).normalized()
         if drag.width() < _DRAG_THRESHOLD_PX or drag.height() < _DRAG_THRESHOLD_PX:
             # A click, not a drag: re-centre as before.
             if self._zoom != FIT:
@@ -284,6 +323,12 @@ class ZoomView(QWidget):
                 )
                 self._clamp_center()
                 self.centerChanged.emit(self._center.x(), self._center.y())
+            self.update()
+            return
+        if panning:
+            # A pan gesture ends silently — it moved the view, that was its
+            # whole purpose. (panned is only used for the status line.)
+            self.centerChanged.emit(self._center.x(), self._center.y())
             self.update()
             return
         tl = self._screen_to_source(drag.topLeft())

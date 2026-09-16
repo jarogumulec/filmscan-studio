@@ -234,6 +234,58 @@ class TestSessionWorkflow:
             s.capture_scan()
         assert s.state.last_error == "Závěrka se nespustila"
 
+    def test_jpeg_disguised_as_nef_is_recorded_honestly(
+        self, tmp_path: Path, film: FilmMetadata
+    ) -> None:
+        """Body at Compression Level != RAW delivers JPEG at the .NEF path.
+        The sidecar must say jpeg with SOF geometry — and rawpy must never be
+        called (that call is the b'Input/output error' in the 2026-09 log)."""
+        import cv2
+
+        jpeg = cv2.imencode(".jpg", np.zeros((2008, 3008, 3), np.uint8))[1].tobytes()
+
+        class JpegBody(MockCamera):
+            def capture(self, destination: Path, filename_stem: str):
+                target = destination / f"{filename_stem}.NEF"
+                target.write_bytes(jpeg)
+                from filmscan_studio.capture.camera import CaptureResult
+                return CaptureResult(
+                    path=target, size_bytes=len(jpeg), settings=self._settings,
+                    elapsed=0.1, capture_target="card", file_format="jpeg")
+
+        def never_reader(_path: Path) -> RawFrame:
+            raise AssertionError("rawpy musí na JPEG nikdy sahnout")
+
+        camera = JpegBody()
+        camera.connect()
+        s = CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id),
+                           frame_reader=never_reader)
+        result = s.capture_scan()
+        payload = json.loads(s.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["file_format"] == "jpeg"
+        assert payload["width"] == 3008 and payload["height"] == 2008
+        assert payload["acquisition"]["iso"] == result.settings.iso
+        assert s.state.scan_count == 1
+
+
+class TestJpegDimensions:
+    def test_reads_sof_without_decoding(self, tmp_path: Path) -> None:
+        import cv2
+
+        from filmscan_studio.core.rawio import jpeg_dimensions
+
+        buf = np.zeros((64, 96, 3), np.uint8)
+        path = tmp_path / "a.jpg"
+        path.write_bytes(cv2.imencode(".jpg", buf)[1].tobytes())
+        assert jpeg_dimensions(path) == (96, 64)
+
+    def test_returns_none_for_non_jpeg(self, tmp_path: Path) -> None:
+        from filmscan_studio.core.rawio import jpeg_dimensions
+
+        path = tmp_path / "b.nef"
+        path.write_bytes(b"II*\x00never a jpeg")
+        assert jpeg_dimensions(path) is None
+
 
 class TestLiveMeter:
     def test_jpeg_is_linearised_before_metering(self) -> None:
@@ -363,6 +415,123 @@ class TestAutoExposure:
         controller = AutoExposureController(camera, LiveMeter())
         result = controller.run(read=lambda: self._reading(0.999, clipped=True))
         assert result.clipped
+
+
+class BodyMeterCamera(MockCamera):
+    """MockCamera plus the SDK backend's ``exposure_ev`` behaviour.
+
+    The D750's ExposureStatus cap reports ``log2(applied / correctly_exposed)``
+    and answered *exactly* in stops on the measured body (2026-09-15): -3.00
+    for three stops of shutter, +4.00 for four of ISO. Correct exposure here
+    means shutter*iso == ``reference`` — the same convention as
+    ``MockCamera.sensor_signal``'s reference term.
+    """
+
+    def __init__(self, reference: float = 1 / 60 * 100, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._reference = reference
+
+    def exposure_ev(self) -> float:
+        s = self.get_settings()
+        return math.log2(s.shutter * s.iso / self._reference)
+
+
+class TestAutoExposureBodyMeter:
+    """The 2026-09 rewrite: the SDK's Live View stream is auto-brightness, so
+    the controller closes the loop on the body's own exposure meter instead —
+    and must therefore converge in ONE press, not one stop per click."""
+
+    def test_without_body_meter_falls_back_to_lv_path(self) -> None:
+        camera = MockCamera(settings=ExposureSettings(1 / 60, 100))
+        camera.connect()
+        # MockCamera has no exposure_ev: run() without `read` must use LV
+        # metering and report no body_ev.
+        controller = AutoExposureController(camera, LiveMeter())
+        result = controller.run(read=lambda: TestAutoExposure._reading(0.05))
+        assert result.body_ev is None
+
+    def test_one_press_solves_a_three_stop_move(self) -> None:
+        # 1/500 ISO 100 is 2.97 stops under correct -> must land on target in
+        # a single actuator write, shutter first, ISO untouched.
+        camera = BodyMeterCamera(settings=ExposureSettings(1 / 500, 100))
+        camera.connect()
+        controller = AutoExposureController(camera, LiveMeter())
+        result = controller.run()
+        assert result.converged
+        assert result.iterations == 1
+        assert abs(result.body_ev) <= 0.06
+        assert result.limited_by_lens is False and result.limit_note is None
+        # Quality policy: shutter ladder buys the light, ISO stays at floor.
+        assert camera.iso_history == [] or result.settings.iso == 100
+        assert result.settings.shutter > 1 / 500
+
+    def test_shutter_bottomed_out_raises_iso_instead_of_lying(self) -> None:
+        """The exact complaint of 2026-09: 'nejmenší dostupný čas' at 1/50
+        while the real fix was ISO. With the shutter already at the slowest
+        rung the controller must climb ISO and converge, no limit report."""
+        # Scene needs 3 stops more than 30 s ISO 100 delivers.
+        camera = BodyMeterCamera(reference=2 ** 3 * 30 * 100,
+                                 settings=ExposureSettings(
+                                     max(D750_SHUTTERS), 100))
+        camera.connect()
+        controller = AutoExposureController(camera, LiveMeter())
+        result = controller.run()
+        assert result.converged, result.limit_note
+        assert result.settings.iso > 100
+        assert result.settings.shutter == max(D750_SHUTTERS)
+
+    def test_darkening_lowers_iso_before_shortening(self) -> None:
+        # 4 stops over: ISO 1600 -> 100 is exactly four stops, free quality.
+        camera = BodyMeterCamera(settings=ExposureSettings(1 / 60, 1600))
+        camera.connect()
+        controller = AutoExposureController(camera, LiveMeter())
+        result = controller.run()
+        assert result.converged, result.limit_note
+        assert result.settings.iso == 100
+        assert result.settings.shutter == pytest.approx(1 / 60)
+
+    def test_move_beyond_both_ladders_reports_real_extremes(self) -> None:
+        # Scene 19 stops dark; the ladders' full travel is 30 s (+9) at
+        # ISO 25600 (+8) = 17 EV — two EV short, and the note must say so.
+        camera = BodyMeterCamera(reference=2 ** 19 / 60 * 100,
+                                 settings=ExposureSettings(1 / 60, 100))
+        camera.connect()
+        controller = AutoExposureController(camera, LiveMeter())
+        result = controller.run()
+        assert not result.converged
+        assert result.limited_by_lens and result.limited_by_iso
+        assert "30" in result.limit_note and "25600" in result.limit_note
+        assert "tmavší" in result.limit_note
+
+    def test_straddle_converges_with_residual_note(self) -> None:
+        """Target between two neighbouring rungs: no finer step exists, so it
+        is honest convergence — the note reports the residue, no fake limit."""
+        # 1/60 ISO 100 correct; move +0.3 EV: no ladder pair lands within eps.
+        camera = BodyMeterCamera(reference=2 ** 3.0 / 60 * 100 * 2 ** 0.3,
+                                 settings=ExposureSettings(1 / 60, 100))
+        camera.connect()
+        controller = AutoExposureController(camera, LiveMeter())
+        result = controller.run()
+        # Either it landed exactly (some ladder pair hits it) or it converged
+        # as a straddle: never a limit report, always a note when imperfect.
+        assert result.converged, result.limit_note
+        assert not result.limited_by_lens and not result.limited_by_iso
+        if abs(result.body_ev or 0.0) > 0.06:
+            assert "jemnější krok" in (result.limit_note or "")
+
+    def test_stops_on_no_move_available_without_claiming_limits(self) -> None:
+        """Iteration-cap/dither residue must not be reported as a hardware
+        limit — the old bug was exactly this confident lie."""
+        camera = BodyMeterCamera(settings=ExposureSettings(1 / 60, 100))
+        camera.connect()
+        evs = iter([-8.0, 8.0, -7.0, 7.0])     # never converges: oscillates
+        controller = AutoExposureController(camera, LiveMeter(),
+                                            max_iterations=2)
+        controller._body_meter = lambda: (lambda: next(evs))
+        result = controller.run()
+        assert not result.converged
+        assert not result.limited_by_lens and not result.limited_by_iso
+        assert "zkus Auto Exposure znovu" in result.limit_note
 
 
 class TestFilmMetadataV2:

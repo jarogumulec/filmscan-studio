@@ -66,6 +66,12 @@ class NikonSdkBackend(CameraBackend):
         self._helper_python = helper_python
         self._rpc_timeout = rpc_timeout
         self._proc: subprocess.Popen | None = None
+        #: One JSON request must complete (write + its reply read) before the
+        #: next starts. Without it the LiveView poller and a UI-thread zoom or
+        #: shutter write interleave on the same pipe pair: each thread reads
+        #: the other's line and json sees 'Extra data'/'Expecting value'
+        #: (observed 2026-09 with the D750 attached).
+        self._rpc_lock = threading.Lock()
         self._info = CameraInfo(model="unknown")
         self._shutter_choices: list[tuple[int, float]] = []   # (index, seconds)
         self._iso_choices: list[tuple[int, int]] = []         # (index, iso)
@@ -187,25 +193,31 @@ class NikonSdkBackend(CameraBackend):
     def _rpc(self, method: str, timeout: float | None = None, **params):
         if self._proc is None or self._proc.poll() is not None:
             raise NotConnectedError("Nikon SDK helper neběží")
-        assert self._proc.stdin is not None and self._proc.stdout is not None
-        self._proc.stdin.write(json.dumps({"method": method, **params}) + "\n")
-        self._proc.stdin.flush()
-        deadline = time.monotonic() + (timeout or self._rpc_timeout)
-        # select() would be nicer but stdout of a Popen text-mode pipe is not
-        # always select()-safe on macOS; a watchdog thread around readline is.
-        result: list[str] = []
+        # One complete request/reply at a time, poller thread and UI thread
+        # alike — see the comment on _rpc_lock in __init__.
+        with self._rpc_lock:
+            if self._proc is None or self._proc.poll() is not None:
+                raise NotConnectedError("Nikon SDK helper neběží")
+            assert self._proc.stdin is not None and self._proc.stdout is not None
+            self._proc.stdin.write(json.dumps({"method": method, **params}) + "\n")
+            self._proc.stdin.flush()
+            deadline = time.monotonic() + (timeout or self._rpc_timeout)
+            # select() would be nicer but stdout of a Popen text-mode pipe is
+            # not always select()-safe on macOS; a watchdog thread around
+            # readline is.
+            result: list[str] = []
 
-        def _read() -> None:
-            line = self._proc.stdout.readline()
-            result.append(line)
+            def _read() -> None:
+                line = self._proc.stdout.readline()
+                result.append(line)
 
-        t = threading.Thread(target=_read, daemon=True)
-        t.start()
-        t.join(timeout=max(0.05, deadline - time.monotonic()))
-        if t.is_alive() or not result or not result[0]:
-            self._kill()
-            raise CameraError(f"Nikon SDK helper neodpověděl na {method!r}")
-        reply = json.loads(result[0])
+            t = threading.Thread(target=_read, daemon=True)
+            t.start()
+            t.join(timeout=max(0.05, deadline - time.monotonic()))
+            if t.is_alive() or not result or not result[0]:
+                self._kill()
+                raise CameraError(f"Nikon SDK helper neodpověděl na {method!r}")
+            reply = json.loads(result[0])
         if not reply.get("ok"):
             raise CameraError(f"Nikon SDK ({method}): {reply.get('error')}")
         return reply
@@ -278,7 +290,17 @@ class NikonSdkBackend(CameraBackend):
     def next_live_frame(self) -> LiveFrame | None:
         if self._proc is None:
             raise NotConnectedError("Nikon SDK helper neběží")
-        reply = self._rpc("lv_frame", timeout=15.0)
+        try:
+            reply = self._rpc("lv_frame", timeout=15.0)
+        except CameraError as exc:
+            # -127 on GetLiveViewImage means the body has left Live View while
+            # we still thought it ran (a cancelled capture does this). One
+            # lv_on + retry turns a GUI-visible error into one blank moment.
+            if "-127" not in str(exc) or not self._live_view:
+                raise
+            log.info("LV odpovídá -127 (tělo mimo Live View) — restartuji LV")
+            self.start_live_view()
+            reply = self._rpc("lv_frame", timeout=15.0)
         return LiveFrame(jpeg=base64.b64decode(reply["jpeg_b64"]))
 
     # SDK-only extras (the reason for the whole swap) -------------------------
@@ -310,13 +332,30 @@ class NikonSdkBackend(CameraBackend):
         reply = self._rpc("capture", timeout=90.0,
                           destination=str(destination), stem=filename_stem)
         target = Path(reply["path"])
+        if reply.get("file_format") == "jpeg":
+            target = target.with_suffix(".jpg")
+            Path(reply["path"]).rename(target)
+            log.warning("tělo poslalo JPEG místo RAW (Compression Level "
+                        "není RAW) — uloženo poctivě jako %s", target.name)
         return CaptureResult(
             path=target,
             size_bytes=reply["bytes"],
             settings=settings,
             elapsed=reply["elapsed"],
             capture_target="card",
+            file_format=reply.get("file_format", "nef"),
         )
+
+    # ------------------------------------------------------------- media caps
+
+    def media_settings(self) -> dict:
+        """Compression Level + Image Size as the body reports them now."""
+        return self._rpc("media_settings")
+
+    def set_media(self, compression: int | None = None,
+                  size: int | None = None) -> dict:
+        """Set RAW/size and return the read-back state (verified write)."""
+        return self._rpc("set_media", compression=compression, size=size)
 
     @property
     def info(self) -> CameraInfo:

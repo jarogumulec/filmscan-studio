@@ -38,6 +38,7 @@ it afterwards.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections import deque
@@ -57,6 +58,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -213,7 +215,20 @@ class CaptureWindow(QMainWindow):
         self._camera_queue = CameraWorker(self._relay)
         self._camera_queue.start()
         self._last_reading: MeterReading | None = None
+        #: The reading computed from the last frame *before* prediction —
+        #: what the histogram repaints from when the toggle flips.
+        self._last_frame_reading: MeterReading | None = None
         self._last_linear: np.ndarray | None = None
+        #: Body exposure-meter EV (log2(applied/correct)) from the poller, and
+        #: whether the histogram should be *predicted* to the NEF with it.
+        #: The D750 Live View JPEG is auto-brightness (measured 2026-09-15:
+        #: identical median at 1/2 s and 1/500 s), so its own histogram says
+        #: nothing about the capture; the body meter does. See _update_histogram.
+        self._body_ev: float | None = None
+        #: When a body meter exists, the histogram shows the *predicted NEF*
+        #: (frame x 2^ev) instead of the auto-brightnessed preview. Switchable:
+        #: preview metering is still what you want while composing.
+        self._hist_follows_body = True
         #: Body-side Live View zoom rate currently applied (core.zoom ZOOM_*).
         self._body_zoom = ZOOM_ALL
         #: Honest account of the delivered stream, refreshed per frame.
@@ -269,37 +284,49 @@ class CaptureWindow(QMainWindow):
         self.clip_label.setWordWrap(True)
         right_layout.addWidget(self.clip_label)
 
+        self.hist_predict = QCheckBox("Histogram = predikce NEFu (tělní meter)")
+        self.hist_predict.setStyleSheet("font-size: 11px;")
+        self.hist_predict.setChecked(True)
+        self.hist_predict.setToolTip(
+            "Náhledový JPEG těla je automaticky podsvícený — jeho histogram "
+            "o expozici NEFu nevypovídá nic (změřeno 2026-09). Zapnuto "
+            "histogram zobrazuje, jak snímek dopadne: náhled posunutý o "
+            "měřič těla. Vypni pro histogram samotného náhledu (skládání)."
+        )
+        self.hist_predict.toggled.connect(self._on_hist_predict_toggled)
+        right_layout.addWidget(self.hist_predict)
+
         # ------------------------------------------------ camera exposure layer
+        # Vertical economy (2026-09: "pravý panel se nevhází — zkomprimuj"):
+        # one QFormLayout whose rows are two-control HBoxLayouts — label text
+        # lives in tooltips, which are shorter than the widgets they name.
         exposure_box = CollapsibleBox("Expozice fotoaparátu (ovlivňuje focení)",
                                       expanded=True)
         exposure_form = QFormLayout()
+        exposure_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         exposure_box.body_layout().addLayout(exposure_form)
 
         self.shutter_edit = QComboBox()
         self.shutter_edit.setEditable(True)
         self.shutter_edit.setToolTip(
-            "Zadej čas (1/60, 2.5…) — tělo Snapne na nejbližší dostupný. "
+            "Čas — zadej 1/60, 2.5…; tělo snapne na nejbližší dostupný. "
             "Vyžaduje režim M/S na těle."
         )
         self.shutter_edit.activated.connect(self._apply_shutter_edit)
         # editingFinished lives on the editable combo's line edit, not the combo.
         self.shutter_edit.lineEdit().editingFinished.connect(self._apply_shutter_edit)
-        exposure_form.addRow("Čas", self.shutter_edit)
-
         self.iso_select = QComboBox()
         self.iso_select.setToolTip(
             "ISO nabízené tělem. Pro digitalizaci platí: nejnižší = nejlepší "
             "odstup signálu od šumu."
         )
         self.iso_select.currentIndexChanged.connect(self._apply_iso_select)
-        exposure_form.addRow("ISO", self.iso_select)
-
-        iso_row = QHBoxLayout()
-        self.btn_iso_low = QPushButton("ISO na minimum (kvalita)")
-        self.btn_iso_low.clicked.connect(self._iso_to_base)
-        iso_row.addWidget(self.btn_iso_low)
-        iso_row.addStretch()
-        exposure_form.addRow(iso_row)
+        row = QHBoxLayout()
+        row.addWidget(self.shutter_edit)
+        row.addWidget(self.iso_select)
+        # No field label: in a 360 px column the label would steal width from
+        # the two widgets it names, and both say what they are once opened.
+        exposure_form.addRow(row)
 
         self.ev_spin = QDoubleSpinBox()
         self.ev_spin.setRange(-5.0, 5.0)
@@ -311,43 +338,66 @@ class CaptureWindow(QMainWindow):
             "v Working Positive je jiná vrstva — viz Náhled výše."
         )
         self.ev_spin.editingFinished.connect(self._apply_ev_comp)
-        exposure_form.addRow("Korekce expozice", self.ev_spin)
+        self.btn_iso_low = QPushButton("ISO min")
+        self.btn_iso_low.setToolTip("Nejnižší native ISO — archivní sken chce odstup od šumu.")
+        self.btn_iso_low.clicked.connect(self._iso_to_base)
+        row = QHBoxLayout()
+        row.addWidget(self.ev_spin)
+        row.addWidget(self.btn_iso_low)
+        exposure_form.addRow("Korekce", row)
 
         self.btn_autoexposure = QPushButton("Auto Exposure")
         self.btn_autoexposure.clicked.connect(self._auto_exposure)
+        self.btn_autoexposure.setToolTip(
+            "Řeší expozici najednou na tělním měřiči — stiskni jednou a hotovo. "
+            "Změníš-li pak ručně čas/ISO nebo osvětlení, stiskni znovu (histogram "
+            "= predikce NEFu hnutí hned ukáže)."
+        )
         self.ae_hint = QLabel(
-            "AE červení myší do náhledu: měří jen uvnitř rámečku "
-            "(pravé tlačítko = zrušit)."
+            "Shift+tažení: červený AE rámeček (histogram měří uvnitř; pravé "
+            "tlačítko zruší). Tažení bez Shiftu při zoomu posouvá, klik = "
+            "vycentrovat."
         )
         self.ae_hint.setWordWrap(True)
-        self.ae_hint.setStyleSheet("color: #9a9;")
+        self.ae_hint.setStyleSheet("color: #9a9; font-size: 11px;")
         exposure_box.body_layout().addWidget(self.btn_autoexposure)
         exposure_box.body_layout().addWidget(self.ae_hint)
         right_layout.addWidget(exposure_box)
 
         self.settings_label = QLabel("ISO —   čas —   clona —")
         self.settings_label.setStyleSheet("font-family: Menlo, monospace; font-size: 13px;")
-        right_layout.addWidget(self.settings_label)
-
         self.meter_label = QLabel("—")
         self.meter_label.setStyleSheet("font-family: Menlo, monospace;")
         self.meter_label.setWordWrap(True)
+        right_layout.addWidget(self.settings_label)
         right_layout.addWidget(self.meter_label)
 
         # ------------------------------------------------------- preview layer
+        # The negative toggle used to need three clicks inside this box
+        # (expand → Working Positive → Invertovat) and effectively vanished;
+        # the brief asks for the toggle alone, so it sits in the panel header
+        # row next to the mode checkboxes — same layer, same one line.
         self.preview_box = CollapsibleBox(
             "Náhled — expozice & křivka (NEOVlivňuje focení)", expanded=False
         )
         mode_row = QHBoxLayout()
+        self.neg_toggle = QCheckBox("Negativ")
+        self.neg_toggle.setToolTip(
+            "Invertuje a aplikuje křivku na náhled. Uložený RAW se nemění."
+        )
+        self.neg_toggle.toggled.connect(self._toggle_negative_preview)
+        mode_row.addWidget(self.neg_toggle)
         self.mode_raw = QCheckBox("RAW View")
         self.mode_raw.setChecked(True)
         self.mode_raw.toggled.connect(lambda on: self._set_mode(raw_view=on))
         mode_row.addWidget(self.mode_raw)
-        self.mode_positive = QCheckBox("Working Positive")
+        self.mode_positive = QCheckBox("Positive")
         self.mode_positive.toggled.connect(lambda on: self._set_mode(raw_view=not on))
         mode_row.addWidget(self.mode_positive)
         mode_row.addStretch()
-        self.preview_box.body_layout().addLayout(mode_row)
+        # Outside the collapsed box on purpose: the toggle is the point of the
+        # box's whole layer, hidden-behind-expand is what made it disappear.
+        right_layout.addLayout(mode_row)
         self.filmic = FilmicPanel()
         self.filmic.paramsChanged.connect(self._on_filmic_changed)
         self.filmic.setEnabled(False)
@@ -380,6 +430,21 @@ class CaptureWindow(QMainWindow):
         self.btn_capture.clicked.connect(lambda: self._capture(scan=True))
         right_layout.addWidget(self.btn_capture)
 
+        # Media-format guard. The D750 answers a still capture with whatever
+        # Compression Level/Image Size the body dial says — measured 2026-09:
+        # JPEG Basic at S size, a ~1 MB 'NEF'. The button only appears when
+        # the body is actually misconfigured (or a JPEG capture proved it).
+        self.btn_raw_media = QPushButton("⚠ Tělo posílá JPEG — Nastavit RAW + L")
+        self.btn_raw_media.setStyleSheet(
+            "QPushButton { color: #211; background: #fc9; font-weight: bold; }"
+        )
+        self.btn_raw_media.clicked.connect(self._fix_raw_media)
+        self.btn_raw_media.setVisible(False)
+        right_layout.addWidget(self.btn_raw_media)
+
+        # Calibration and numbering happen once per session each, yet used to
+        # claim three permanent rows (2026-09: "nevleze se tam vše").
+        calib_box = CollapsibleBox("Kalibrace & číslo snímku", expanded=False)
         calib_row = QHBoxLayout()
         self.btn_dark = QPushButton("Dark Frame")
         self.btn_dark.clicked.connect(lambda: self._capture(kind="dark"))
@@ -387,8 +452,7 @@ class CaptureWindow(QMainWindow):
         self.btn_flat = QPushButton("Flat Field")
         self.btn_flat.clicked.connect(lambda: self._capture(kind="flat"))
         calib_row.addWidget(self.btn_flat)
-        right_layout.addLayout(calib_row)
-
+        calib_box.body_layout().addLayout(calib_row)
         frame_row = QHBoxLayout()
         frame_row.addWidget(QLabel("Číslo snímku"))
         self.frame_number = QSpinBox()
@@ -396,24 +460,37 @@ class CaptureWindow(QMainWindow):
         self.frame_number.setSpecialValueText("auto")
         frame_row.addWidget(self.frame_number)
         frame_row.addStretch()
-        right_layout.addLayout(frame_row)
+        calib_box.body_layout().addLayout(frame_row)
+        right_layout.addWidget(calib_box)
 
         self.stage_label = QLabel("Fáze: —")
         self.stage_label.setWordWrap(True)
+        self.stage_label.setStyleSheet("font-size: 11px;")
         right_layout.addWidget(self.stage_label)
 
         self.log_view = QLabel("")
         self.log_view.setWordWrap(True)
+        self.log_view.setMaximumHeight(64)
         self.log_view.setStyleSheet(
-            "color: #aaa; font-family: Menlo, monospace; font-size: 11px;"
+            "color: #aaa; font-family: Menlo, monospace; font-size: 10px;"
         )
         right_layout.addWidget(self.log_view)
         right_layout.addStretch()
 
+        # Belt and braces for the vertical economy: even with every row
+        # merged, a short window must not cut controls off — it scrolls.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(right)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.setFrameShape(scroll.Shape.NoFrame)
+
         splitter = QSplitter()
         splitter.addWidget(self.view)
         right.setFixedWidth(360)
-        splitter.addWidget(right)
+        splitter.addWidget(scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         splitter.setChildrenCollapsible(False)
@@ -510,6 +587,7 @@ class CaptureWindow(QMainWindow):
         self.start_live_view()
         self._refresh_settings()
         self._refresh_buttons()
+        self._check_media_settings()
 
     def _sensor_size(self) -> SensorSize:
         if self.info and self.info.sensor_width and self.info.sensor_height:
@@ -640,6 +718,9 @@ class CaptureWindow(QMainWindow):
             self._update_zoom_note()
             return
         self._body_zoom = rate
+        # The red rect is in *stream* pixels; the new rate delivers different
+        # pixels, so a kept rect would silently meter the wrong film area.
+        self.view.clear_ae_rect()
         self._update_zoom_note()
 
     def _last_source_size(self) -> tuple[int, int]:
@@ -718,7 +799,13 @@ class CaptureWindow(QMainWindow):
     def start_live_view(self) -> None:
         if self.camera is None or (self._worker is not None and self._worker.running):
             return
-        worker = LiveViewWorker(self.camera, self._meter)
+        worker = LiveViewWorker(
+            self.camera, self._meter,
+            # None where the backend has no body meter (mock, gphoto2): the
+            # worker then emits None with every frame and the histogram stays
+            # a plain preview histogram.
+            body_ev_fn=getattr(self.camera, "exposure_ev", None),
+        )
         worker.frameReady.connect(self._on_live_frame)
         worker.error.connect(self._on_live_error)
         worker.start()
@@ -726,13 +813,20 @@ class CaptureWindow(QMainWindow):
 
     # ------------------------------------------------------------------ frames
 
-    def _on_live_frame(self, image: np.ndarray, reading: MeterReading) -> None:
-        self._last_reading = reading
+    def _on_live_frame(
+        self, image: np.ndarray, reading: MeterReading, body_ev=None
+    ) -> None:
         h, w = image.shape[:2]
         self._stream_detail = detail_for(self._body_zoom, w, h, self._sensor_size())
         self.view.set_source_scale(self._stream_detail.sensor_px_per_lv_px)
-        self._update_histogram(reading, image)
-        self._update_meter_label(reading)
+        if body_ev is not None:
+            self._body_ev = float(body_ev)
+        self._last_frame_reading = reading
+        # The reading the histogram describes (rect-trimmed, NEF-predicted when
+        # the body meter is on) is also what the label shows — one number, one
+        # truth.
+        self._last_reading = self._update_histogram(reading, image)
+        self._update_meter_label(self._last_reading)
         self._last_linear = image
         self.view.set_image(self._display_for(image))
 
@@ -761,9 +855,54 @@ class CaptureWindow(QMainWindow):
             self._worker.stop()
             self._worker = None
 
-    def _update_histogram(self, reading: MeterReading, image: np.ndarray) -> None:
+    def _hist_prediction(self) -> float | None:
+        """EV factor the preview must be scaled by to predict the NEF.
+
+        The auto-brightnessed LV display shows the scene as *correct* (mid at
+        18%) whatever the capture settings are; the body meter reports
+        ``ev = log2(applied/correct)``. So the NEF's mid lands at
+        ``0.18 * 2**ev`` and every preview luminance scales by ``2**ev``.
+        None = no body meter (mock/gphoto2) or the operator wants the raw
+        preview histogram (compose-time mode).
+        """
+        if not self._hist_follows_body or self._body_ev is None:
+            return None
+        return self._body_ev
+
+    def _on_hist_predict_toggled(self, on: bool) -> None:
+        self._hist_follows_body = on
+        # Repaint from the last *frame* (not from `_last_reading`, which on
+        # the prediction path is a synthetic predicted reading): waiting for
+        # the next frame would make the checkbox feel dead when LV is paused.
+        if (self._last_linear is not None
+                and self._last_frame_reading is not None):
+            self._last_reading = self._update_histogram(
+                self._last_frame_reading, self._last_linear
+            )
+            self._update_meter_label(self._last_reading)
+
+    def _update_histogram(self, reading: MeterReading, image: np.ndarray) -> MeterReading:
         # Linear domain always -- the brief is explicit and this is not a toggle.
-        hist = compute(luminance(image), black_level=0.0, white_level=1.0)
+        # Same source as Auto Exposure: when the red rect is set, the histogram
+        # describes exactly the area AE meters, or the two tools disagree and
+        # the operator starts trusting the wrong one.
+        region = image
+        if self._ae_rect is not None:
+            x0, y0, x1, y1 = self._ae_rect
+            h, w = image.shape[:2]
+            x0, y0 = max(int(x0), 0), max(int(y0), 0)
+            x1, y1 = min(int(x1), w), min(int(y1), h)
+            if x1 > x0 and y1 > y0:      # stale rect after a zoom-stream change
+                region = image[y0:y1, x0:x1]
+        lum = luminance(region)
+        predicted = self._hist_prediction()
+        scale = 2.0**predicted if predicted is not None else 1.0
+        display_lum = np.clip(lum * scale, 0.0, 1.0)
+        hist = compute(display_lum, black_level=0.0, white_level=1.0)
+        if self._ae_rect is not None or predicted is not None:
+            reading = self._meter.meter_raw_signal(
+                display_lum, self._meter.black_level, self._meter.white_level
+            )
         self.histogram.set_histogram(hist)
         total = max(hist.total, 1)
         # The clip report the brief asks for: both rails, as a share of pixels.
@@ -773,14 +912,27 @@ class CaptureWindow(QMainWindow):
             f"clip: bílá {hist.clipped_high / total:.3%} (červeně) · "
             f"černá {hist.clipped_low / total:.3%} (modře)"
         )
+        scope = "AE výřez" if self._ae_rect is not None else "celý snímek"
+        if predicted is not None:
+            source = f"predikce NEFu ({scope}, tělní meter {predicted:+.2f} EV)"
+        else:
+            source = f"lineární data náhledu · {scope}"
         if self.raw_view:
             self.histogram.set_curve(None)
-            self.histogram_label.setText("histogram: lineární data senzoru (RAW View)")
+            self.histogram_label.setText(f"histogram: {source} (RAW View)")
         else:
             self.histogram.set_curve(self.positive.profile.curve_table(256))
             self.histogram_label.setText(
-                "histogram: stále lineární data — křivka je jen přiložený model"
+                f"histogram: {source} — křivka je jen přiložený model"
             )
+        return reading
+
+    def _toggle_negative_preview(self, on: bool) -> None:
+        """One-switch negative → picture preview; the filmic settings stay in
+        the collapsed panel. RAW capture is untouched — this only repaints."""
+        self._set_mode(raw_view=not on)
+        if on and not self.filmic.invert.isChecked():
+            self.filmic.invert.setChecked(True)   # fires _on_filmic_changed
 
     def _update_meter_label(self, reading: MeterReading) -> None:
         util = reading.highlight_utilisation
@@ -799,6 +951,10 @@ class CaptureWindow(QMainWindow):
             self.mode_raw.setChecked(raw_view)
         if sender is not self.mode_positive:
             self.mode_positive.setChecked(not raw_view)
+        # Keep the one-switch negative toggle honest whichever way we got here.
+        self.neg_toggle.blockSignals(True)
+        self.neg_toggle.setChecked(not raw_view)
+        self.neg_toggle.blockSignals(False)
         self.filmic.setEnabled(not raw_view)
         # Repaint the last frame now, so switching modes is instant even with
         # Live View stopped.
@@ -841,6 +997,83 @@ class CaptureWindow(QMainWindow):
         self.statusBar().showMessage(f"{label}: expozice…")
         self._start_worker(fn, lambda res: self._on_captured(label, res), *args)
 
+    def _check_media_settings(self) -> None:
+        """Ask the body what format/size its stills will be, warn if wrong.
+
+        Runs on the UI thread because both calls are one CapGet each (the same
+        small-write exception as the shutter/ISO editors); a backend without
+        the caps answers None/raises and is simply skipped.
+        """
+        fn = getattr(self.camera, "media_settings", None)
+        if fn is None:
+            return
+        try:
+            media = fn()
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not block
+            self._log(f"Kontrola formátu snímání selhala: {exc}")
+            return
+        if self._media_is_raw_full_frame(media):
+            self.btn_raw_media.setVisible(False)
+        else:
+            self.btn_raw_media.setVisible(True)
+            self._log("Tělo má Compression Level/Size nastaveno tak, že "
+                      "posílá JPEG místo RAW — Archiv chce 6016×4016 NEF. "
+                      "Klikni 'Nastavit RAW + L'.")
+
+    @staticmethod
+    def _media_is_raw_full_frame(media: dict) -> bool:
+        """NEF-only depends on Compression Level alone.
+
+        Measured 2026-09-15 on the D750: with Compression Level = RAW the body
+        drops OP_SET from Image Size — size then configures only the JPEG
+        companion of a RAW+JPEG combo, never the NEF, which is always
+        L(6016×4016). Checking size here would nag forever in RAW mode.
+        """
+        comp = media.get("compression", {})
+        cur, strings = comp.get("current"), comp.get("strings") or []
+        if cur is None or not strings or cur >= len(strings):
+            return True      # unreadable cap: do not nag on an unknown
+        return strings[cur].upper().startswith("RAW")
+
+    def _fix_raw_media(self) -> None:
+        if self.camera is None:
+            return
+        fn = getattr(self.camera, "set_media", None)
+        if fn is None:
+            QMessageBox.information(self, "RAW", "Tento backend neumí nastavit formát.")
+            return
+        try:
+            wanted = self._raw_media_indices()
+            readback = fn(**wanted) if wanted else self.camera.media_settings()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "RAW", f"Tělo nastavení nepřijalo: {exc}")
+            return
+        if self._media_is_raw_full_frame(readback):
+            self.btn_raw_media.setVisible(False)
+            self.statusBar().showMessage(
+                "Formát nastaven: RAW (NEF 6016×4016) — ověřeno zpětným čtením", 6000
+            )
+            self._log("Compression Level → RAW, ověřeno CapGet (Image Size se "
+                      "na NEF nevztahuje — měřeno 2026-09)")
+        else:
+            QMessageBox.warning(
+                self, "RAW",
+                "Tělo sice odpovědělo, ale zpětné čtení hlásí jiný stav:\n"
+                + json.dumps(readback, ensure_ascii=False)
+                + "\nZkontroluj, není volič režimů na M/P/S/A (režim scény "
+                "umí JPEG vynutit).",
+            )
+
+    def _raw_media_indices(self) -> dict:
+        """Index of a RAW-bearing element in the body's own enum strings."""
+        comp = self.camera.media_settings().get("compression", {})
+        if not comp.get("settable", False):
+            return {}        # body refuses writes right now (mode dial)
+        for i, s in enumerate(comp.get("strings") or []):
+            if s.upper().startswith("RAW"):
+                return {"compression": i}
+        return {}
+
     def _on_captured(self, label: str, results) -> None:
         self._set_actions_busy(False)
         self._resume_live_view()
@@ -849,6 +1082,18 @@ class CaptureWindow(QMainWindow):
             f"{label} uložen: {first.path.name} ({first.size_bytes / 1e6:.1f} MB, {first.elapsed:.1f} s)"
         )
         self._log(f"{label}: {first.path.name} · {first.settings.shutter_string()} · ISO {first.settings.iso}")
+        if getattr(first, "file_format", "nef") == "jpeg":
+            # A capture is harder evidence than any CapGet read: the body
+            # answered a still with JPEG. Surface the fix, not just a log line.
+            self.btn_raw_media.setVisible(True)
+            QMessageBox.warning(
+                self, label,
+                f"{first.path.name} je ve skutečnosti JPEG "
+                f"({first.size_bytes / 1e6:.1f} MB) — tělo má Compression "
+                "Level jinou než RAW. Na archivní digitalizaci je "
+                "nepoužitelné. Klikni na '⚠ Nastavit RAW + L' a snímek "
+                "zopakuj.",
+            )
         self._refresh_settings()
         self._refresh_stage()
         self.act_export.setEnabled(True)
@@ -861,32 +1106,53 @@ class CaptureWindow(QMainWindow):
             self.camera, self._meter, headroom_ev=DEFAULT_HEADROOM_EV
         )
         self._set_actions_busy(True)
+        if self._worker is not None:
+            # AE keeps grabbing frames after the worker stops — the body must
+            # stay in Live View (the SDK answers GetLiveViewImage with -127
+            # once the worker's teardown has switched it off).
+            self._worker.leave_live_view = True
         self._pause_live_view()
-        area = "AE výřez" if self._ae_rect is not None else "celý snímek"
-        self.statusBar().showMessage(f"Auto Exposure: měřím lineárně — {area}…")
+        # No `read` callable: the controller probes the body's own exposure
+        # meter and uses the LV-rect metering below only where no body meter
+        # exists (mock/gphoto2). Passing read unconditionally used to force the
+        # LV path — and the SDK's LV stream is auto-brightness, so the loop
+        # never saw its own moves and reported ladder limits that were lies.
+        self.statusBar().showMessage("Auto Exposure: řeším na tělní meter…")
         self._start_worker(
             controller.run,
             self._on_auto_exposure_done,
-            self._meter_source(),
+            None if self._has_body_meter() else self._meter_source(),
         )
+
+    def _has_body_meter(self) -> bool:
+        return self.camera is not None and hasattr(self.camera, "exposure_ev")
 
     def _on_auto_exposure_done(self, result) -> None:
         self._set_actions_busy(False)
         self._resume_live_view()
         self._refresh_settings()
-        if result.limited_by_lens:
+        # The controller converged on the body meter: one press solves the
+        # whole move. If it stopped short, it names the concrete ladder rungs
+        # and the residual EV — show exactly that, never a canned sentence.
+        if not result.converged:
             QMessageBox.warning(
                 self,
                 "Auto Exposure",
-                "Fotoaparát je na nejdelším dostupném čase a scéna je stále "
-                "tmavá. Jde o limit osvětlení nebo objektivu, ne softwaru.",
+                result.limit_note
+                or "Vyčerpaná žebříková nastavení — scéna mimo rozsah fotoaparátu.",
             )
         else:
             self.statusBar().showMessage(
-                f"Auto Exposure: {result.settings.shutter_string()} "
-                f"(konvergovalo po {result.iterations} krocích)"
+                f"Auto Exposure: {result.settings.shutter_string()} · ISO "
+                f"{result.settings.iso} — vyřešeno v {result.iterations} krocích"
+                + (f" ({result.limit_note})" if result.limit_note else
+                   ", tělní meter na nule")
             )
-        self._log(f"AE: {result.settings.shutter_string()} converged={result.converged}")
+        self._log(
+            f"AE: {result.settings.shutter_string()} ISO {result.settings.iso} "
+            f"converged={result.converged}"
+            + (f" · {result.limit_note}" if result.limit_note else "")
+        )
 
     # ------------------------------------------------------------------ film
 
@@ -953,13 +1219,17 @@ class CaptureWindow(QMainWindow):
         self._log(f"CHYBA: {message}")
 
     def _set_actions_busy(self, busy: bool) -> None:
-        for button in (
-            self.btn_capture,
-            self.btn_autoexposure,
-            self.btn_dark,
-            self.btn_flat,
-        ):
-            button.setEnabled(not busy and self.session is not None)
+        buttons = (self.btn_capture, self.btn_autoexposure,
+                   self.btn_dark, self.btn_flat)
+        if busy:
+            for button in buttons:
+                button.setEnabled(False)
+        else:
+            # _refresh_buttons is the single source of truth for who may be
+            # enabled — Auto Exposure needs only the camera, the captures also
+            # need a film. Disabling with a blanket session check here is what
+            # left Auto Exposure greyed out after its first (failed) run.
+            self._refresh_buttons()
 
     # -------------------------------------------------------------- indicators
 

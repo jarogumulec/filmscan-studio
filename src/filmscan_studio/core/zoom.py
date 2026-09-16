@@ -76,6 +76,14 @@ BODY_ZOOM_SENSOR_PX_PER_LV_PX: dict[int, float | None] = {
 #: capture than by upscaling Live View; the UI says so instead of pretending.
 HONEST_INTERPOLATION_LIMIT = 2.0
 
+#: Below this display scale a body-side crop is never requested. Measured
+#: 2026-09-15 on the D750: every zoomed rate delivers 640x480 — at the
+#: shallowest crop the visible area is ~43 % x 48 % of the frame, a crop the
+#: operator read as "výřez je čtverec a je oříznutý — nedělej ořez". Body
+#: crops buy real detail only where the operator inspects pixels (>= 1:1);
+#: an overview must show the whole frame even if that means interpolating.
+MIN_ZOOM_FOR_BODY_CROP = 1.0
+
 
 @dataclass(frozen=True)
 class SensorSize:
@@ -176,6 +184,12 @@ def choose_body_rate(
     rates = available_rates or tuple(BODY_ZOOM_SENSOR_PX_PER_LV_PX)
     if zoom == FIT:
         return ZOOM_ALL
+    # Operator-visible rule ("nedělej ořez"): below 1:1 nobody is judging
+    # grain, they are judging the frame — and the body's zoomed stream is a
+    # 43%x48% window at best. Interpolating an overview is honest; cutting off
+    # the picture is not.
+    if zoom < MIN_ZOOM_FOR_BODY_CROP:
+        return ZOOM_ALL if ZOOM_ALL in rates else max(rates)
     whole = detail_for(ZOOM_ALL, lv_width, lv_height, sensor)
     # If the whole-frame stream already serves the request without inventing
     # more than the limit, never crop: overview scales want to see the frame.

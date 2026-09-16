@@ -197,7 +197,9 @@ class TestZoom:
         view.mouseReleaseEvent(_mouse_event(10, 10))
         assert view._center != before  # moved toward click
 
-    def test_drag_draws_ae_rect_not_recenter(self, qtbot):
+    SHIFT = Qt.KeyboardModifier.ShiftModifier
+
+    def test_shift_drag_draws_ae_rect_not_recenter(self, qtbot):
         view = ZoomView()
         qtbot.addWidget(view)
         view.resize(200, 200)
@@ -206,12 +208,58 @@ class TestZoom:
         view.set_zoom(1.0)
         before = QPoint(view._center)
         with qtbot.waitSignal(view.aeRectChanged):
+            view.mousePressEvent(_mouse_event(20, 20, modifiers=self.SHIFT))
+            view.mouseMoveEvent(_mouse_event(90, 70, modifiers=self.SHIFT))
+            view.mouseReleaseEvent(_mouse_event(90, 70, modifiers=self.SHIFT))
+        rect = view.ae_rect()
+        assert rect is not None and rect.width() > 0
+        assert view._center == before  # an AE drag must not pan
+
+    def test_plain_drag_pans_when_zoomed(self, qtbot):
+        """2026-09 brief: zoomed in, drag = move around the picture (focus the
+        point of interest), not an AE rectangle. Shift is the AE modifier."""
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.show()
+        view.set_image(np.zeros((400, 400)))
+        view.set_zoom(1.0)
+        before = QPoint(view._center)
+        view.mousePressEvent(_mouse_event(150, 150))
+        view.mouseMoveEvent(_mouse_event(50, 50))
+        view.mouseReleaseEvent(_mouse_event(50, 50))
+        assert view.ae_rect() is None            # plain drag never draws AE
+        moved = QPoint(view._center)
+        assert moved != before                    # it panned
+        # Dragged image up-left → the sensor point moved the other way.
+        assert moved.x() > before.x() and moved.y() > before.y()
+
+    def test_plain_drag_at_fit_still_draws_ae_rect(self, qtbot):
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.show()
+        view.set_image(np.zeros((400, 400)))      # zoom == FIT
+        with qtbot.waitSignal(view.aeRectChanged):
             view.mousePressEvent(_mouse_event(20, 20))
             view.mouseMoveEvent(_mouse_event(90, 70))
             view.mouseReleaseEvent(_mouse_event(90, 70))
-        rect = view.ae_rect()
-        assert rect is not None and rect.width() > 0
-        assert view._center == before  # a drag must not pan
+        assert view.ae_rect() is not None
+
+    def test_zoomed_view_fills_the_widget(self, qtbot):
+        """The 2026-09 complaint: zoomed frames drew from the top-left corner
+        without filling the view. The crop destination must cover the widget."""
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.show()
+        view.set_image(np.zeros((400, 400)))
+        view.set_source_scale(1.0)
+        view.set_zoom(0.5)
+        crop, dest = view._crop_rect()
+        assert dest.width() == pytest.approx(200, abs=1)
+        assert dest.height() == pytest.approx(200, abs=1)
+        assert crop.width() <= 400 and crop.height() <= 400
 
     def test_right_click_clears_ae_rect(self, qtbot):
         view = ZoomView()
@@ -220,8 +268,8 @@ class TestZoom:
         view.show()
         view.set_image(np.zeros((400, 400)))
         view.set_zoom(1.0)
-        view.mousePressEvent(_mouse_event(20, 20))
-        view.mouseReleaseEvent(_mouse_event(90, 70))
+        view.mousePressEvent(_mouse_event(20, 20, modifiers=self.SHIFT))
+        view.mouseReleaseEvent(_mouse_event(90, 70, modifiers=self.SHIFT))
         assert view.ae_rect() is not None
         view.mousePressEvent(_mouse_event(5, 5, Qt.MouseButton.RightButton))
         assert view.ae_rect() is None
@@ -335,6 +383,198 @@ class TestExposureControls:
         window._refresh_settings()
         assert window.camera.iso_history == before
 
+class TestHistogramFollowsAeRect:
+    def test_histogram_uses_only_the_rect(self, window):
+        """2026-09 brief: histogram must describe the same area AE meters —
+        bright film borders may not fake a blown/clipped report."""
+        from filmscan_studio.core.exposure import measure
+
+        img = np.zeros((200, 200, 3), dtype=np.float64)
+        img[:, :] = 0.05                      # dark film base
+        img[10:14, 10:14] = 2.5               # blown patch, 0.08% of frame
+        from filmscan_studio.gui.liveview import luminance
+        reading = measure(luminance(img), 0.0, 1.0)
+
+        window._ae_rect = None
+        window._update_histogram(reading, img)
+        hist_whole = window.histogram._hist
+
+        window._ae_rect = (60, 60, 160, 160)  # away from the blown corner
+        returned = window._update_histogram(reading, img)
+        hist_rect = window.histogram._hist
+
+        assert hist_whole.clipped_high > 0
+        assert hist_rect.clipped_high == 0
+        assert hist_rect.total < hist_whole.total
+        # The returned reading follows the rect too (p99.9 inside is 0.05).
+        assert returned.signal_p999 < 0.2
+
+    def test_stale_rect_outside_frame_falls_back_to_whole(self, window):
+        from filmscan_studio.core.exposure import measure
+        from filmscan_studio.gui.liveview import luminance
+        img = np.full((100, 100, 3), 0.4)
+        reading = measure(luminance(img), 0.0, 1.0)
+        window._ae_rect = (500, 500, 700, 700)
+        window._update_histogram(reading, img)
+        assert window.histogram._hist.total == 100 * 100
+
+
+class TestHistogramPredictsNef:
+    """2026-09 brief: the D750's LV stream is auto-brightness, so its own
+    histogram is decorative — with a body meter the histogram must show how
+    the NEF will land, not how the preview looks."""
+
+    @staticmethod
+    def _frame():
+        from filmscan_studio.core.exposure import measure
+        from filmscan_studio.gui.liveview import luminance
+        img = np.full((100, 100, 3), 0.4)     # bright auto-brightness preview
+        return img, measure(luminance(img), 0.0, 1.0)
+
+    def test_body_ev_shifts_histogram_toward_capture(self, window):
+        img, reading = self._frame()
+        window._ae_rect = None
+        window._body_ev = None
+        window._update_histogram(reading, img)
+
+        window._body_ev = -2.0        # capture will be 2 stops under preview
+        predicted = window._update_histogram(reading, img)
+        assert predicted.signal_p999 == pytest.approx(0.4 / 4, rel=0.01)
+        # Label must name what it describes — the user must never wonder
+        # whether this is the preview or the prediction.
+        assert "predikce NEFu" in window.histogram_label.text()
+        assert "-2.00" in window.histogram_label.text()
+
+    def test_toggle_switches_back_to_preview_metering(self, window):
+        img, reading = self._frame()
+        window._ae_rect = None
+        window._body_ev = -2.0
+        window._update_histogram(reading, img)
+        window.hist_predict.setChecked(False)
+        after = window._update_histogram(reading, img)
+        assert after.signal_p999 == pytest.approx(0.4, rel=0.01)
+        assert "predikce" not in window.histogram_label.text()
+        window.hist_predict.setChecked(True)
+
+    def test_no_body_ev_keeps_plain_preview(self, window):
+        # MockCamera has no exposure_ev -> worker emits None -> label honest.
+        img, reading = self._frame()
+        window._ae_rect = None
+        window._body_ev = None
+        window._update_histogram(reading, img)
+        assert "predikce" not in window.histogram_label.text()
+
+
+class TestRawMediaGuard:
+    """The 1 MB 'NEF' complaint: body at Compression Level != RAW answers
+    stills with JPEG; the GUI must detect it and offer the verified fix."""
+
+    STRINGS = ["JPEG Basic", "JPEG Normal", "JPEG Fine", "RAW",
+               "RAW + JPEG Basic"]
+
+    def test_button_shown_when_body_sends_jpeg(self, window, monkeypatch):
+        state = {"compression": 0, "settable": True}
+
+        def media_settings():
+            return {"compression": {"current": state["compression"],
+                                    "strings": self.STRINGS,
+                                    "settable": state["settable"]},
+                    "size": {"current": 2, "strings": ["L(6016*4016)", "S"],
+                             "settable": False}}
+
+        def set_media(compression=None, size=None):
+            if compression is not None:
+                state["compression"] = compression
+            return media_settings()
+
+        monkeypatch.setattr(window.camera, "media_settings", media_settings,
+                            raising=False)
+        monkeypatch.setattr(window.camera, "set_media", set_media,
+                            raising=False)
+        window._check_media_settings()
+        assert window.btn_raw_media.isVisibleTo(window)
+
+        window._fix_raw_media()          # the button's handler, no dialog path
+        assert state["compression"] == self.STRINGS.index("RAW")
+        assert not window.btn_raw_media.isVisibleTo(window)
+
+    def test_raw_size_not_demanded(self, window, monkeypatch):
+        """Measured: with RAW selected the body drops Image Size OP_SET —
+        size configures only the JPEG companion. Demanding L would nag
+        forever; RAW alone must satisfy the guard."""
+        def media_settings():
+            return {"compression": {"current": 3, "strings": self.STRINGS,
+                                    "settable": True},
+                    "size": {"current": 2, "strings": ["L(6016*4016)", "S"],
+                             "settable": False}}
+
+        monkeypatch.setattr(window.camera, "media_settings", media_settings,
+                            raising=False)
+        window._check_media_settings()
+        assert not window.btn_raw_media.isVisibleTo(window)
+
+    def test_backend_without_caps_is_skipped(self, window):
+        # MockCamera has no media caps: no crash, no nag.
+        window._check_media_settings()
+        assert not window.btn_raw_media.isVisibleTo(window)
+
+
+class TestNegativeQuickToggle:
+    """The 'negative with curve' preview switch must exist and work alone."""
+
+    def test_toggle_switches_to_working_positive_with_invert(self, window):
+        assert window.raw_view
+        window.neg_toggle.setChecked(True)
+        assert not window.raw_view
+        assert window.positive.invert
+
+    def test_toggle_back_returns_to_raw_view(self, window):
+        window.neg_toggle.setChecked(True)
+        window.neg_toggle.setChecked(False)
+        assert window.raw_view
+
+    def test_mode_checkboxes_sync_the_toggle(self, window):
+        window.mode_positive.setChecked(True)
+        assert window.neg_toggle.isChecked()
+        window.mode_raw.setChecked(True)
+        assert not window.neg_toggle.isChecked()
+
+
+class TestAutoExposureStaysClickable:
+    def test_failed_run_re_enables_buttons_without_session(self, window):
+        """2026-09 bug: after 1–2 AE runs the button greyed out forever —
+        end-of-run un-busy checked for a film session AE never needed."""
+        window.btn_autoexposure.setEnabled(False)
+        window._set_actions_busy(False)
+        assert window.btn_autoexposure.isEnabled()
+        # Captures still require the session:
+        assert not window.btn_capture.isEnabled()
+
+    def test_ae_pause_leaves_live_view_on(self, window, qtbot):
+        """AE keeps polling after the worker stops — the worker's teardown
+        must not switch the body's Live View off (-127 source)."""
+        calls: list[str] = []
+        window.camera.stop_live_view = lambda: calls.append("stop")
+        assert window._worker is not None and window._worker.running
+        window._auto_exposure()
+        # worker.stop() joins the thread, so its finally has run by now:
+        assert calls == []          # AE left the body in Live View
+        # A normally-stopped worker still turns it off:
+        window._worker = None       # the AE-restarted worker; stop fresh one
+        window.start_live_view()
+        w = window._worker
+        w.leave_live_view = False
+        w.stop()
+        assert calls == ["stop"]
+        # Let the queued AE finish while the mock is still connected, then
+        # close — otherwise it completes against a dead camera in teardown
+        # and reports a phantom error.
+        qtbot.waitUntil(lambda: not window._camera_queue.busy, timeout=10000)
+        qtbot.wait(200)           # deliver the result callbacks
+        window.close()
+        window._camera_queue.stop(wait_ms=8000)
+
+
 class TestHistogramWidget:
     def test_paints_without_crashing(self, qtbot):
         from filmscan_studio.core.histogram import compute
@@ -366,10 +606,28 @@ class TestLiveWorker:
             worker.start()
         worker.stop()
         del worker
-        image, reading = blocker.args
+        image, reading, body_ev = blocker.args
         assert image.ndim == 3 and image.shape[2] == 3
         assert 0.0 <= float(image.min()) and float(image.max()) <= 1.0
         assert reading.signal_p999 > 0.0
+        # MockCamera has no body meter: the third slot must be None, not a
+        # fabricated zero (zero would make the histogram predict a lie).
+        assert body_ev is None
+
+    def test_body_ev_fn_is_throttled_and_delivered(self, qtbot, camera):
+        calls = []
+
+        def meter():
+            calls.append(1)
+            return -1.5
+
+        worker = LiveViewWorker(camera, max_fps=30.0, body_ev_fn=meter)
+        with qtbot.waitSignal(worker.frameReady, timeout=5000) as blocker:
+            worker.start()
+        worker.stop()
+        image, reading, body_ev = blocker.args
+        assert body_ev == -1.5
+        assert calls and reading is not None and image is not None
 
 
 def _npy_reader(path):
@@ -399,12 +657,13 @@ class SlowCaptureCamera(MockCamera):
 
 
 def _mouse_event(x: int, y: int, button: Qt.MouseButton = Qt.MouseButton.LeftButton,
-                 kind: QEvent.Type = QEvent.Type.MouseButtonPress):
+                 kind: QEvent.Type = QEvent.Type.MouseButtonPress,
+                 modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier):
     return QMouseEvent(
         kind,
         QPointF(float(x), float(y)),
         QPointF(float(x), float(y)),
         button,
         Qt.MouseButton.NoButton,
-        Qt.KeyboardModifier.NoModifier,
+        modifiers,
     )

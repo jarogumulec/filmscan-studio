@@ -335,12 +335,104 @@ class TestBackendRpc:
         with pytest.raises(CameraError, match="boom"):
             b.exposure_ev()
 
+    def test_concurrent_rpcs_never_interleave(self, backend):
+        """The 2026-09 crash: the LiveView poller called lv_frame while a UI
+        zoom/shutter write was mid-flight; both read the other's JSON line
+        (json 'Extra data' / 'Expecting value'). With _rpc_lock held across
+        write+reply each reply must answer its own request."""
+        import threading as th
+
+        b, state = backend
+        b.connect()
+
+        class Repeated:
+            """The fixture's fake pops presets — this answers every call."""
+            TABLE = {"lv_frame": {"ok": True, "jpeg_b64": "eHk="},
+                     "set_zoom": {"ok": True, "zoom": 5}}
+
+            @staticmethod
+            def pop(key, default=None):
+                return dict(Repeated.TABLE[key])
+
+        state["replies"] = Repeated
+
+        errors: list[Exception] = []
+        start = th.Barrier(2)
+
+        def poller():
+            try:
+                start.wait()
+                for _ in range(30):
+                    assert b.next_live_frame() is not None
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def setter():
+            try:
+                start.wait()
+                for _ in range(30):
+                    b.set_live_view_zoom(5)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [th.Thread(target=poller), th.Thread(target=setter)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors, errors
+        # Each request line was answered exactly once (no stolen replies).
+        kinds = [r["method"] for r in state["requests"]]
+        assert kinds.count("lv_frame") == 30 and kinds.count("set_zoom") == 30
+
     def test_not_connected_raises(self):
         from filmscan_studio.capture.camera import NotConnectedError
         from filmscan_studio.capture.nikon_backend import NikonSdkBackend
         b = NikonSdkBackend()
         with pytest.raises(NotConnectedError):
             b.next_live_frame()
+
+    def test_capture_sniffs_jpeg_masked_as_nef(self, backend, tmp_path):
+        """Compression Level != RAW makes the body deliver a JPEG at the .NEF
+        path (measured 2026-09: JPEG Basic, S size, ~1 MB). The helper must
+        report the truth so the backend renames and the sidecar stops lying;
+        LibRaw reading that file is the b'Input/output error' from the log."""
+        import cv2
+        import numpy as np
+        from filmscan_studio.capture import sdk_server
+
+        jpeg = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()
+        assert jpeg[:3] == sdk_server.JPEG_MAGIC
+
+        class FakeSrc:
+            def capture_still(self, target):
+                Path(target).write_bytes(jpeg)
+
+        server = sdk_server.Server()
+        server.src = FakeSrc()
+        reply = server.capture(str(tmp_path), "frame001")
+        assert reply["file_format"] == "jpeg"
+        assert reply["path"].endswith("frame001.NEF")
+
+        class FakeNefSrc(FakeSrc):
+            def capture_still(self, target):
+                Path(target).write_bytes(b"II*\x00" + b"\x00" * 64)   # TIFF magic
+
+        server.src = FakeNefSrc()
+        assert server.capture(str(tmp_path), "frame002")["file_format"] == "nef"
+
+    def test_backend_renames_jpeg_to_jpg(self, backend, tmp_path):
+        b, state = backend
+        b.connect()
+        state["replies"]["capture"] = {
+            "ok": True, "path": str(tmp_path / "frame001.NEF"),
+            "bytes": 1024, "elapsed": 1.0, "file_format": "jpeg"}
+        (tmp_path / "frame001.NEF").write_bytes(b"\xff\xd8\xff\xe0fake")
+        result = b.capture(tmp_path, "frame001")
+        assert result.file_format == "jpeg"
+        assert result.path.suffix == ".jpg"
+        assert not (tmp_path / "frame001.NEF").exists()
+        assert (tmp_path / "frame001.jpg").read_bytes().startswith(b"\xff\xd8")
 
     def test_missing_helper_reports_install_hint(self, monkeypatch):
         from filmscan_studio.capture.camera import CameraError

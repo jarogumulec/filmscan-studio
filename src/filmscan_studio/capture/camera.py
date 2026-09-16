@@ -80,6 +80,9 @@ class CaptureResult:
     elapsed: float = 0.0
     #: Where the file was written: memory card or internal RAM.
     capture_target: str = "card"
+    #: Actual bytes on disk ('nef' | 'jpeg' | 'unknown'), sniffed — the file
+    #: extension is what we asked for, this is what the body delivered.
+    file_format: str = "nef"
 
 
 @dataclass

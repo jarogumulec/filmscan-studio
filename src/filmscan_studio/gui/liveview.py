@@ -38,28 +38,45 @@ class LiveViewWorker(QThread):
     later frame than the one on screen would be a subtle lie about exposure.
     """
 
-    #: (linear 0..1 luminance-ready RGB float image, meter reading for that image)
-    frameReady = Signal(object, object)
+    #: (linear 0..1 luminance-ready RGB float image, meter reading for that
+    #: image, body exposure-meter EV or None when the backend has no meter)
+    frameReady = Signal(object, object, object)
     error = Signal(str)
     stopped = Signal()
+
+    #: The body meter is a cheap CapGet, but not free: read it at most this
+    #: often so a 20 fps poller does not spend half its USB bandwidth on it.
+    BODY_EV_INTERVAL_S = 0.2
 
     def __init__(
         self,
         camera: CameraBackend,
         meter: LiveMeter | None = None,
         max_fps: float = DELIVERY_FPS,
+        body_ev_fn=None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._camera = camera
         self._meter = meter or LiveMeter()
+        self._body_ev_fn = body_ev_fn
         self._min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
         self._running = False
+        #: Last successful body exposure-meter reading (EV, log2 domain).
+        #: Delivered with every frame so the histogram can be *predicted* to
+        #: the exposure the NEF will actually get (see capture_window).
+        self._body_ev: float | None = None
+        self._body_ev_updated = 0.0
         #: The newest undelivered frame. Older ones are discarded, not queued:
         #: a stale frame on a focus screen is worse than a dropped one. A lost
         #: race on this single reference can only drop a frame, which is the
         #: designed behaviour, so it needs no lock.
         self._pending: LiveFrame | None = None
+        #: Set by the owner before stop() when it will keep metering itself:
+        #: Auto Exposure polls frames right after the worker is stopped, and
+        #: the Nikon SDK answers GetLiveViewImage with -127 if the teardown
+        #: already switched the body's Live View off (observed 2026-09).
+        self.leave_live_view = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -109,14 +126,24 @@ class LiveViewWorker(QThread):
                 except Exception as exc:  # noqa: BLE001 - one bad frame is not fatal
                     log.debug("skipping undecodable Live View frame: %s", exc)
                     continue
+                if (
+                    self._body_ev_fn is not None
+                    and now - self._body_ev_updated >= self.BODY_EV_INTERVAL_S
+                ):
+                    self._body_ev_updated = now
+                    try:
+                        self._body_ev = self._body_ev_fn()
+                    except Exception:  # noqa: BLE001 - a missed read is not fatal
+                        log.debug("exposure_ev read failed", exc_info=True)
                 if not self._running:
                     break
-                self.frameReady.emit(linear, reading)
+                self.frameReady.emit(linear, reading, self._body_ev)
         finally:
-            try:
-                self._camera.stop_live_view()
-            except Exception:  # noqa: BLE001 - nothing useful to do on the way out
-                log.exception("stop_live_view failed")
+            if not self.leave_live_view:
+                try:
+                    self._camera.stop_live_view()
+                except Exception:  # noqa: BLE001 - nothing useful to do on the way out
+                    log.exception("stop_live_view failed")
             self.stopped.emit()
 
 

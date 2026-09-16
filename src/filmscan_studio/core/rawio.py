@@ -99,6 +99,38 @@ def open_preview_frame(path: str | Path, half_size: bool = True) -> RawFrame:
     )
 
 
+def jpeg_dimensions(path: str | Path) -> tuple[int, int] | None:
+    """(width, height) from a JPEG's SOF marker — no decode, no dependency.
+
+    Exists because the D750 can be configured to answer a still capture with
+    a JPEG wearing a .NEF extension (Compression Level != RAW); feeding such
+    a file to rawpy yields LibRaw's cryptic b'Input/output error', and the
+    session needs geometry for the sidecar either way.
+    """
+    with open(path, "rb") as fh:
+        if fh.read(2) != b"\xff\xd8":
+            return None
+        while True:
+            marker = fh.read(2)
+            if len(marker) < 2 or marker[0] != 0xFF:
+                return None
+            code = marker[1]
+            # SOF0..SOF15 minus DHT(C4)/JPG(C8)/DAC(CC); SOF1 is progressive.
+            if 0xC0 <= code <= 0xCF and code not in (0xC4, 0xC8, 0xCC):
+                seg = fh.read(7)
+                if len(seg) < 7:
+                    return None
+                h = int.from_bytes(seg[3:5], "big")
+                w = int.from_bytes(seg[5:7], "big")
+                return (w, h) if w and h else None
+            if code in (0xD8, 0x01) or 0xD0 <= code <= 0xD7:
+                continue                      # standalone markers, no length
+            length = fh.read(2)
+            if len(length) < 2:
+                return None
+            fh.seek(int.from_bytes(length, "big") - 2, 1)
+
+
 def _acquisition_from_rawpy(other: rawpy.Other) -> AcquisitionMetadata:
     """Fall back to LibRaw's summary when EXIF parsing finds nothing."""
     from datetime import datetime
