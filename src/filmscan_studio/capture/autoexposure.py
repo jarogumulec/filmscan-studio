@@ -116,14 +116,19 @@ class LiveMeter:
         black, white = self.frame_levels(frame)
         return measure(self.decode_live_frame(frame), black, white, self.percentile)
 
-    def meter_normalized(self, frame) -> MeterReading:
-        """Meter normalised to 0..1 (what the histogram widgets consume)."""
-        data = self.decode_live_frame(frame)
+    def normalized_frame(self, frame) -> tuple[np.ndarray, MeterReading]:
+        """(0..1 float data, reading) for one frame — one pass, one truth.
+
+        The GUI paints and histograms from the same normalised array, so the
+        histogram cannot disagree with the picture the way a JPEG preview and
+        a body meter used to.
+        """
         black, white = self.frame_levels(frame)
         span = white - black
         if span <= 0:
             raise ValueError("white_level must exceed black_level")
-        return measure((data - black) / span, 0.0, 1.0, self.percentile)
+        data = (self.decode_live_frame(frame) - black) / span
+        return data, measure(data, 0.0, 1.0, self.percentile)
 
 
 def _snap(value: float, ladder: list[float]) -> float:
