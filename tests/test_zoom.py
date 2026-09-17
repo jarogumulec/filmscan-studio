@@ -1,9 +1,9 @@
-"""The sensor-pixel zoom model.
+"""The sensor-pixel zoom model for a binned-overview + hardware-ROI stream.
 
-These numbers are the promises the UI makes to the operator, so they are
-pinned here rather than eyeballed: "100 %" must mean one screen pixel per NEF
-pixel, and every honest-detail claim must follow the delivered stream, not the
-widget size.
+These numbers are the promises the UI makes to the operator: "100 %" means
+one screen pixel per *sensor* pixel whichever stream delivers it, the 3x3
+overview is honest up to 3x display, and past that the sensor itself must
+reframe (a 1:1 ROI) rather than have the widget invent detail.
 """
 
 from __future__ import annotations
@@ -12,117 +12,144 @@ import pytest
 
 from filmscan_studio.core.zoom import (
     FIT,
-    ZOOM_100,
-    ZOOM_200,
-    ZOOM_50,
-    ZOOM_ALL,
+    MIN_ROI_PX,
+    OVERVIEW_SCALE,
+    ZOOM_LEVELS,
+    ZOOM_ROI_SIZE,
+    Roi,
     SensorSize,
-    StreamDetail,
-    choose_body_rate,
-    detail_for,
     display_scale,
+    overview_detail,
+    overview_to_sensor,
+    roi_detail,
+    roi_for_center,
+    stream_plan,
 )
 
-D750 = SensorSize(6016, 4016)
+IMX571 = SensorSize(6224, 4168)
 
 
 class TestSensorSize:
     def test_fit_is_the_smaller_ratio(self):
-        # 2000x1000 widget, 6016x4016 sensor -> height binds.
-        assert D750.fit_scale(2000, 1000) == pytest.approx(1000 / 4016)
+        # 2000x1000 widget, 6224x4168 sensor -> height binds.
+        assert IMX571.fit_scale(2000, 1000) == pytest.approx(1000 / 4168)
 
     def test_rejects_garbage(self):
         with pytest.raises(ValueError):
             SensorSize(0, 100)
 
 
-class TestStreamDetail:
-    def test_whole_frame_maps_lv_px_to_sensor_px(self):
-        detail = detail_for(ZOOM_ALL, 640, 424, D750)
-        # 6016/640 ≈ 9.4 sensor pixels per delivered pixel — the number the
-        # old UI lied about when it called the fit view "100%".
-        assert detail.sensor_px_per_lv_px == pytest.approx(6016 / 640, rel=1e-3)
-        assert detail.crop_fraction == 1.0
+class TestRoi:
+    def test_rejects_bad_geometry(self):
+        with pytest.raises(ValueError):
+            Roi(0, 0, 0, 10)
+        with pytest.raises(ValueError):
+            Roi(-1, 0, 10, 10)
 
-    def test_body_zoom_100_is_sensor_one_to_one(self):
-        detail = detail_for(ZOOM_100, 640, 480, D750)
+    def test_center(self):
+        assert Roi(100, 200, 1200, 1200).center == (700, 800)
+
+    def test_clamped_slides_inside(self):
+        # Far-edge overhang slides back; near-edge origin clamp happens in
+        # roi_for_center before construction (see its test).
+        roi = Roi(6000, 4000, 1200, 1200).clamped(IMX571)
+        assert roi.x == IMX571.width - 1200
+        assert roi.y == IMX571.height - 1200
+
+    def test_clamped_shrinks_only_if_sensor_smaller(self):
+        roi = Roi(0, 0, 9000, 9000).clamped(IMX571)
+        assert (roi.width, roi.height) == (IMX571.width, IMX571.height)
+
+
+class TestRoiForCenter:
+    def test_centre_of_sensor(self):
+        roi = roi_for_center(3112, 2084, IMX571)
+        assert (roi.width, roi.height) == (ZOOM_ROI_SIZE, ZOOM_ROI_SIZE)
+        assert abs(roi.center[0] - 3112) <= 1
+        assert abs(roi.center[1] - 2084) <= 1
+
+    def test_top_left_aim_does_not_crash(self):
+        # Regression (smoke test 2026-09): the view's centre starts at the
+        # frame's top-left on a fresh image; a naive sensor_x - half went
+        # negative and tripped the Roi guard.
+        roi = roi_for_center(30, 20, IMX571)
+        assert (roi.x, roi.y) == (0, 0)
+
+    def test_far_edge_slides_inside(self):
+        roi = roi_for_center(IMX571.width - 10, IMX571.height - 10, IMX571)
+        assert roi.x + roi.width <= IMX571.width
+        assert roi.y + roi.height <= IMX571.height
+        assert (roi.width, roi.height) == (ZOOM_ROI_SIZE, ZOOM_ROI_SIZE)
+
+
+class TestStreamPlan:
+    def test_fit_and_low_zooms_keep_the_binned_overview(self):
+        # 1x/2x display of sensor px: the 3x3 overview already delivers one
+        # real sensor px per 3 screen px max here — cropping a ROI would only
+        # cut away frame the overview shows honestly.
+        assert stream_plan(FIT, IMX571) is None
+        assert stream_plan(1.0, IMX571) is None
+        assert stream_plan(2.0, IMX571) is None
+
+    def test_beyond_the_overview_scale_asks_for_a_roi(self):
+        detail = stream_plan(4.0, IMX571)
+        assert detail is not None and not detail.binned
         assert detail.sensor_px_per_lv_px == 1.0
-        assert detail.crop_fraction < 0.15  # a 640px window on a 6016px frame
+        assert detail.roi.width == ZOOM_ROI_SIZE
 
-    def test_body_zoom_200_supersamples(self):
-        assert detail_for(ZOOM_200, 640, 480, D750).sensor_px_per_lv_px == 0.5
+    def test_roi_aims_at_the_requested_center(self):
+        detail = stream_plan(4.0, IMX571, center_uv=(1000, 500))
+        # Overview px -> sensor px is the OVERVIEW_SCALE multiply.
+        assert abs(detail.roi.center[0] - 1000 * OVERVIEW_SCALE) <= 1
+        assert abs(detail.roi.center[1] - 500 * OVERVIEW_SCALE) <= 1
 
-    def test_interpolation_is_display_scale_times_detail(self):
-        detail = detail_for(ZOOM_ALL, 640, 424, D750)
-        # At 25% display of a whole-frame stream: 0.25 screen px per sensor px
-        # while one source px is worth 9.4 sensor px -> source px lands on
-        # ~2.3 screen px: mild upscaling, which the badge must disclose.
-        assert detail.interpolation_at(0.25) == pytest.approx(9.4 * 0.25, rel=0.01)
-        # Even Fit stretches the 640px stream on any widget wider than ~640px
-        # (a 2000px-wide widget: 640 source px spread over 2000 screen px);
-        # only a widget narrower than the stream downsamples it.
-        assert detail.interpolation_at(2000 / 6016) == pytest.approx(
-            2000 / 640, rel=0.01
-        )
-        assert detail.interpolation_at(600 / 6016) < 1.0
+    def test_default_center_is_the_frame_centre(self):
+        detail = stream_plan(4.0, IMX571)
+        cx, cy = detail.roi.center
+        assert abs(cx - IMX571.width / 2) <= OVERVIEW_SCALE
+        assert abs(cy - IMX571.height / 2) <= OVERVIEW_SCALE
 
-    def test_unknown_rate_treated_as_whole_frame(self):
-        detail = detail_for(99, 640, 424, D750)
-        assert detail.sensor_px_per_lv_px == pytest.approx(6016 / 640, rel=1e-3)
+    def test_near_edge_center_clamps_instead_of_crashing(self):
+        detail = stream_plan(4.0, IMX571, center_uv=(0.0, 0.0))
+        assert (detail.roi.x, detail.roi.y) == (0, 0)
 
 
-class TestBodyRateChoice:
-    def test_fit_never_crops(self):
-        assert choose_body_rate(FIT, 1200, 800, 640, 424, D750) == ZOOM_ALL
+class TestOverviewMapping:
+    def test_overview_detail(self):
+        detail = overview_detail()
+        assert detail.is_overview and detail.roi is None
+        assert detail.sensor_px_per_lv_px == OVERVIEW_SCALE
 
-    def test_low_percentages_keep_whole_frame(self):
-        # 12.5% of sensor: 640 px stream covers the whole frame at ~1.2x
-        # upscale — cropping away 94% of the frame would not buy detail worth
-        # its cost, so the body stays at Whole.
-        assert choose_body_rate(0.125, 1200, 800, 640, 424, D750) == ZOOM_ALL
+    def test_overview_to_sensor_is_the_linear_scale(self):
+        assert overview_to_sensor(100, 200) == (300, 600)
 
-    def test_half_scale_still_shows_whole_frame(self):
-        """2026-09 rule ('nedělej ořez'): below 1:1 nobody judges grain —
-        the body's shallowest crop is a ~43%x48% window (measured: zoomed
-        rates deliver 640x480), and cutting the frame off reads as a bug.
-        Interpolating an overview is the honest trade; crop only at 1:1+."""
-        assert choose_body_rate(0.5, 1200, 800, 640, 424, D750) == ZOOM_ALL
-
-    def test_full_1to1_picks_the_native_rate(self):
-        # Display 1.0 wants delivered pixels that land one-per-screen-pixel:
-        # body 100% (1 sensor px per source px) is exactly native; 200% would
-        # downsample, 50% would upscale — both discard or invent what 100% has.
-        assert choose_body_rate(1.0, 1200, 800, 640, 424, D750) == ZOOM_100
-
-    def test_200pct_display_uses_the_deepest_crop(self):
-        assert choose_body_rate(2.0, 1200, 800, 640, 424, D750) == ZOOM_200
-
-    def test_cropped_rate_still_native_at_1to1(self):
-        # The crop selection itself is unchanged at >= 1:1: body 100% is
-        # native, and a shallower crop that served the scale natively would
-        # win if one existed (it does not at 1.0 display).
-        assert choose_body_rate(1.0, 1200, 800, 640, 424, D750,
-                                available_rates=(ZOOM_ALL, ZOOM_50, ZOOM_100)) \
-            == ZOOM_100
-
-    def test_respects_available_rates(self):
-        rate = choose_body_rate(1.0, 1200, 800, 640, 424, D750,
-                                available_rates=(ZOOM_ALL, ZOOM_100))
-        assert rate == ZOOM_100  # best available, even if beyond the limit
+    def test_roi_detail_is_one_to_one(self):
+        roi = Roi(1000, 1000, 1200, 1200)
+        detail = roi_detail(roi)
+        assert not detail.is_overview and detail.roi == roi
+        assert detail.sensor_px_per_lv_px == 1.0
 
 
 class TestDisplayScale:
-    def test_named_scales_pass_through(self):
-        assert display_scale(0.25, D750, 1200, 800) == 0.25
+    def test_named_zooms_are_per_sensor_pixel(self):
+        # The combobox label promise: 200 % = two screen px per sensor px,
+        # whatever the stream.
+        assert display_scale(2.0, IMX571, 1200, 800) == 2.0
 
     def test_fit_resolves_to_widget(self):
-        # Height binds on a 2008x803 widget showing a 3:2 frame.
-        assert display_scale(FIT, D750, 2008, 803) == pytest.approx(803 / 4016)
+        assert display_scale(FIT, IMX571, 2000, 1000) == pytest.approx(
+            IMX571.fit_scale(2000, 1000)
+        )
 
 
-def test_detail_summary_mentions_sizes_and_crop():
-    detail: StreamDetail = detail_for(ZOOM_100, 640, 480, D750)
-    text = detail.summary()
-    assert "640×480" in text
-    assert "1.00 px senzoru" in text
-    assert "výřez" in text
+def test_summary_mentions_binning_or_roi():
+    assert "3x3 binnig" in overview_detail().summary()
+    text = roi_detail(Roi(1000, 1000, 1200, 1200)).summary()
+    assert "1200" in text and "1000" in text and "1:1" in text
+
+
+def test_constants_agree_with_the_sdk_contract():
+    # Even-pixel ROI geometry: the SDK refuses odd sizes and sub-64 windows.
+    assert ZOOM_ROI_SIZE % 2 == 0 and ZOOM_ROI_SIZE >= MIN_ROI_PX
+    assert OVERVIEW_SCALE == 3.0
+    assert FIT in ZOOM_LEVELS and 1.0 in ZOOM_LEVELS

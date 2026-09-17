@@ -1,27 +1,48 @@
 """Tests for the capture layer: camera contract, session workflow, auto exposure.
 
-Everything here runs against :class:`MockCamera`, which enforces the D750's real
-shutter and ISO ladders so that snapping behaviour and the auto-exposure loop are
-tested against actual constraints rather than idealised ones.
+Everything here runs against :class:`MockCamera`, which is shaped like the
+Touptek TS2600MP-G2 — continuous microsecond shutter, permille gain ladder,
+binned/ROI stream modes and real 16-bit TIFF output — so snapping behaviour,
+the session's read path and the auto-exposure loop are tested against the
+constraints the real backend has, not idealised ones.
 """
 
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from filmscan_studio.capture.autoexposure import AutoExposureController, LiveMeter
-from filmscan_studio.capture.camera import CameraInfo, LiveFrame, NotConnectedError
-from filmscan_studio.capture.gphoto2 import parse_iso, parse_shutter
-from filmscan_studio.capture.mock import D750_ISOS, D750_SHUTTERS, MockCamera
-from filmscan_studio.capture.session import CaptureSession, SessionPaths
-from filmscan_studio.core.exposure import ExposureSettings, MeterReading
-from filmscan_studio.core.models import AcquisitionMetadata, FilmMetadata, FilmType, FrameKind
-from filmscan_studio.core.rawio import RawFrame
+from filmscan_studio.capture.camera import (
+    CameraError,
+    CameraInfo,
+    CaptureResult,
+    LiveFrame,
+    NotConnectedError,
+)
+from filmscan_studio.capture.mock import MOCK_GAIN_RANGE, MOCK_SENSOR, MockCamera
+from filmscan_studio.capture.session import (
+    DARK_TEMPERATURE_TOLERANCE_C,
+    CaptureSession,
+    SessionPaths,
+)
+from filmscan_studio.core.exposure import (
+    ARCHIVE_GAIN,
+    ExposureSettings,
+    MeterReading,
+    parse_shutter,
+)
+from filmscan_studio.core.models import FilmMetadata, FilmType, FrameKind
+from filmscan_studio.core.rawio import open_frame
+from filmscan_studio.core.zoom import (
+    MIN_ROI_PX,
+    NO_BINNING,
+    OVERVIEW_BINNING,
+    ZOOM_ROI_SIZE,
+)
 
 
 @pytest.fixture
@@ -29,26 +50,11 @@ def film() -> FilmMetadata:
     return FilmMetadata(
         film_id="HP5_001",
         film_name="Ilford HP5+",
-        camera="Nikon D750",
-        format="35mm",
+        camera="Touptek TS2600MP-G2",
+        format="aps-c",
         film_type_class=FilmType.BW_NEGATIVE,
         development="ID-11 1+1 13 min",
         operator="JG",
-    )
-
-
-def npy_frame_reader(path: Path) -> RawFrame:
-    """Stand-in for rawpy.open_frame against the mock's .npy output."""
-    data = np.load(path)
-    return RawFrame(
-        path=path,
-        data=data,
-        black_level=600.0,
-        white_level=16383.0,
-        color_desc="RGGB",
-        width=data.shape[1],
-        height=data.shape[0],
-        acquisition=AcquisitionMetadata(camera="NIKON D750", lens="Micro Nikkor 60/2.8"),
     )
 
 
@@ -56,9 +62,9 @@ def npy_frame_reader(path: Path) -> RawFrame:
 def session(tmp_path: Path, film: FilmMetadata) -> CaptureSession:
     camera = MockCamera()
     camera.connect()
-    return CaptureSession(
-        camera, film, SessionPaths.create(tmp_path, film.film_id), frame_reader=npy_frame_reader
-    )
+    # No frame_reader override: the mock writes real TIFFs and the session
+    # reads them through the production rawio path.
+    return CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id))
 
 
 class TestShutterParsing:
@@ -79,26 +85,38 @@ class TestShutterParsing:
     def test_non_numeric_returns_none(self, text: str) -> None:
         assert parse_shutter(text) is None
 
-    def test_iso_parse(self) -> None:
-        assert parse_iso("100") == 100
-        assert parse_iso("Hi 25600") == 25600
-
 
 class TestCameraContract:
     def test_context_manager_connects_and_disconnects(self) -> None:
         with MockCamera() as camera:
-            assert camera.info.model.startswith("NIKON D750")
+            assert camera.info.model.startswith("TS2600MP-G2")
         with pytest.raises(NotConnectedError):
             camera.get_settings()
 
-    def test_shutter_snaps_to_body_ladder(self) -> None:
+    def test_shutter_is_continuous(self) -> None:
+        """No ladder on a µs-resolution shutter: the camera takes what it is asked."""
         with MockCamera() as camera:
             applied = camera.set_shutter(1 / 61)
-            assert applied == pytest.approx(1 / 60)
+            assert applied == pytest.approx(1 / 61)
+            assert camera.info.shutter_choices == ()
 
-    def test_iso_snaps(self) -> None:
+    def test_gain_snaps_to_permille(self) -> None:
         with MockCamera() as camera:
-            assert camera.set_iso(110) in D750_ISOS
+            applied = camera.set_gain(1.2345)
+            assert applied == pytest.approx(1.234, abs=1e-9)
+            assert camera.get_settings().gain == pytest.approx(1.234)
+
+    def test_gain_clamped_to_range(self) -> None:
+        with MockCamera() as camera:
+            assert camera.set_gain(50.0) == MOCK_GAIN_RANGE[1]
+            assert camera.set_gain(0.1) == MOCK_GAIN_RANGE[0]
+
+    def test_iso_is_not_offered(self) -> None:
+        with MockCamera() as camera:
+            with pytest.raises(NotImplementedError):
+                camera.set_iso(100)
+            assert camera.capabilities().iso is False
+            assert camera.capabilities().gain is True
 
     def test_aperture_is_not_offered(self) -> None:
         with MockCamera() as camera:
@@ -108,14 +126,83 @@ class TestCameraContract:
         with MockCamera(live_fps=200) as camera:
             assert camera.next_live_frame() is None
             camera.start_live_view()
-            assert camera.next_live_frame() is not None
+            frame = camera.next_live_frame()
+            assert frame is not None
             camera.stop_live_view()
             assert camera.next_live_frame() is None
+
+    def test_live_frame_is_linear_uint16(self) -> None:
+        with MockCamera(live_fps=200) as camera:
+            camera.start_live_view()
+            frame = camera.next_live_frame()
+        assert frame.data.dtype == np.uint16 and frame.data.ndim == 2
+        assert (frame.width, frame.height) == frame.data.shape[::-1]
+        assert frame.black_level == 0.0 and frame.white_level == 65535.0
+
+    def test_overview_is_binned_third_scale(self) -> None:
+        with MockCamera(live_fps=200) as camera:
+            camera.start_live_view()
+            frame = camera.next_live_frame()
+        assert frame.width == MOCK_SENSOR.width // 3
+        assert frame.height == MOCK_SENSOR.height // 3
+
+    def test_roi_mode_delivers_one_to_one_window(self) -> None:
+        with MockCamera(live_fps=200) as camera:
+            camera.set_live_view_roi((1000, 1000, ZOOM_ROI_SIZE, ZOOM_ROI_SIZE))
+            camera.start_live_view()
+            frame = camera.next_live_frame()
+        assert (frame.width, frame.height) == (ZOOM_ROI_SIZE, ZOOM_ROI_SIZE)
+        assert camera.binning == NO_BINNING
+
+    def test_roi_records_stream_switches(self) -> None:
+        with MockCamera() as camera:
+            camera.set_live_view_roi((2000, 1500, 1200, 1200))
+            camera.set_live_view_roi(None)
+        assert camera.stream_history[0][0] == NO_BINNING
+        assert camera.stream_history[-1] == (OVERVIEW_BINNING, None)
+
+    def test_tiny_roi_refused(self) -> None:
+        with MockCamera() as camera:
+            with pytest.raises(ValueError):
+                camera.set_live_view_roi((100, 100, MIN_ROI_PX - 2, 1200))
+
+    def test_roi_clamped_into_sensor(self) -> None:
+        with MockCamera() as camera:
+            camera.set_live_view_roi((6200, 4160, 1200, 1200))
+        assert camera.roi.x + camera.roi.width <= MOCK_SENSOR.width
 
     def test_nearest_helpers_on_empty_choices(self) -> None:
         info = CameraInfo(model="x")
         assert info.nearest_shutter(1 / 60) is None
         assert info.nearest_iso(100) is None
+
+
+class TestCoolingContract:
+    def test_temperature_and_target_reported(self) -> None:
+        with MockCamera(temperature_c=22.0) as camera:
+            assert camera.capabilities().cooling is True
+            assert camera.get_temperature_c() == pytest.approx(22.0, abs=0.6)
+            assert camera.get_target_temperature_c() == -5.0
+
+    def test_temperature_moves_toward_target(self) -> None:
+        import time
+        with MockCamera(temperature_c=22.0) as camera:
+            first = camera.get_temperature_c()
+            time.sleep(0.3)
+            second = camera.get_temperature_c()
+        assert second < first  # cooling toward -5 °C
+
+    def test_target_settable(self) -> None:
+        with MockCamera() as camera:
+            assert camera.set_target_temperature_c(-10.0) == -10.0
+            assert camera.target_history == [-10.0]
+
+    def test_uncold_camera_has_no_temperature(self) -> None:
+        with MockCamera(cooling=False) as camera:
+            assert camera.capabilities().cooling is False
+            assert camera.get_temperature_c() is None
+            with pytest.raises(CameraError):
+                camera.set_target_temperature_c(-10.0)
 
 
 class TestSessionWorkflow:
@@ -131,14 +218,21 @@ class TestSessionWorkflow:
         state = session.state
         assert (state.dark_count, state.flat_count, state.scan_count) == (1, 3, 2)
 
-    def test_raw_files_are_written(self, session: CaptureSession) -> None:
+    def test_tiff_files_are_written(self, session: CaptureSession) -> None:
         session.capture_dark(1)
-        files = list(session.paths.frames.glob("*.npy"))
+        files = list(session.paths.frames.glob("*.tif"))
         assert len(files) == 1
 
-    def test_keep_live_view_reaches_the_backend(self, session, film) -> None:
-        """Mirror-up capture: the session passes the flag through, and flipping
-        it off (after a body refused) reaches the next capture too."""
+    def test_written_tiff_reads_back_16bit_mono(self, session: CaptureSession) -> None:
+        """The archive promise across the real read path: what write_frame put
+        in the file comes out at 6224x4168 with the 16-bit levels."""
+        result = session.capture_scan()
+        frame = open_frame(result.path)
+        assert (frame.width, frame.height) == (MOCK_SENSOR.width, MOCK_SENSOR.height)
+        assert frame.data.dtype == np.uint16 and frame.data.ndim == 2
+        assert frame.black_level == 0.0 and frame.white_level == 65535.0
+
+    def test_keep_live_view_reaches_the_backend(self, session) -> None:
         session.capture_scan()
         assert session.camera.last_keep_live_view is True
         session.keep_live_view = False
@@ -161,17 +255,19 @@ class TestSessionWorkflow:
         assert result.path.read_bytes() == before
 
     def test_sidecar_records_calibration_settings(self, session: CaptureSession) -> None:
-        session.camera.set_shutter(1 / 8)
-        session.camera.set_iso(200)
+        session.camera.set_shutter(8.0)
+        session.camera.set_gain(1.5)
         result = session.capture_dark(1)[0]
         payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
         assert payload["acquisition"]["exposure_time"] == pytest.approx(result.settings.shutter)
-        assert payload["acquisition"]["iso"] == result.settings.iso
+        assert payload["acquisition"]["gain"] == pytest.approx(1.5)
 
-    def test_sidecar_carries_lens_from_exif(self, session: CaptureSession) -> None:
-        result = session.capture_scan()
+    def test_sidecar_records_sensor_temperature(self, session: CaptureSession) -> None:
+        result = session.capture_dark(1)[0]
         payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
-        assert payload["acquisition"]["lens"] == "Micro Nikkor 60/2.8"
+        assert payload["sensor_temperature_c"] == pytest.approx(
+            result.sensor_temperature_c
+        )
 
     def test_frame_numbers_follow_film(self, session: CaptureSession) -> None:
         session.capture_scan(12)
@@ -192,38 +288,64 @@ class TestSessionWorkflow:
         session.capture_dark(1)
         session.capture_flat(2)
         session.capture_scan()
-        path = session.export_project()
+        path, unmatched = session.export_project()
+        assert unmatched == []   # mock temperature is stable: darks match
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["counts"] == {"scans": 1, "dark": 1, "flat": 2}
         assert payload["film"]["film_id"] == "HP5_001"
         assert payload["operator"] == "JG"
 
-    def test_catalog_export_is_readable(self, session: CaptureSession) -> None:
-        session.capture_dark(1)
-        session.export_project()
-        dump = json.loads((session.paths.root / "project_export.json").read_text(encoding="utf-8"))
-        assert len(dump["captures"]) == 1
-        assert dump["films"][0]["film_id"] == "HP5_001"
+    def test_export_lists_scans_without_temperature_matching_dark(
+        self, tmp_path: Path, film: FilmMetadata
+    ) -> None:
+        """The cooling rule (INSTRUCTIONS §7): a dark taken warm does not
+        calibrate a scan taken cold — export must name the frame.
+
+        The mock's TEC is time-accelerated (×20), so switching it off and
+        idling a third of a second drifts the sensor degrees off the setpoint
+        — the same physical situation the warning exists for.
+        """
+        camera = MockCamera()
+        camera.connect()
+        s = CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id))
+        s.capture_dark(1)                                   # dark at the setpoint
+        camera.set_tec_enabled(False)                       # sensor drifts warm
+        import time
+        time.sleep(0.4)
+        scan = s.capture_scan()
+        assert abs(scan.sensor_temperature_c - (-5.0)) > DARK_TEMPERATURE_TOLERANCE_C
+        _, unmatched = s.export_project()
+        assert unmatched == [1]
+
+    def test_capture_without_temperature_is_unmatched(
+        self, tmp_path: Path, film: FilmMetadata
+    ) -> None:
+        """Unknown is not the same as matching: an uncooled capture's scans
+        are reported so the operator knows darks were never thermal-logged."""
+        camera = MockCamera(cooling=False)
+        camera.connect()
+        s = CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id))
+        s.capture_dark(1)
+        s.capture_scan()
+        assert s.unmatched_scan_frame_numbers() == [1]
 
     def test_unreadable_raw_still_records_metadata(
         self, tmp_path: Path, film: FilmMetadata
     ) -> None:
-        """A file LibRaw cannot parse must not cost us the shot's metadata."""
+        """A file tifffile cannot parse must not cost us the shot's metadata."""
 
-        def broken(_path: Path) -> RawFrame:
-            raise RuntimeError("LibRaw: unsupported format")
+        def broken(_path: Path):
+            raise RuntimeError("tifffile: unreadable tag")
 
         camera = MockCamera()
         camera.connect()
         s = CaptureSession(
-            camera,
-            film,
-            SessionPaths.create(tmp_path, film.film_id),
+            camera, film, SessionPaths.create(tmp_path, film.film_id),
             frame_reader=broken,
         )
         result = s.capture_scan()
         payload = json.loads(s.paths.sidecar(result.path).read_text(encoding="utf-8"))
-        assert payload["acquisition"]["iso"] == result.settings.iso
+        assert payload["acquisition"]["gain"] == pytest.approx(result.settings.gain)
         assert payload["width"] is None
         assert s.state.scan_count == 1
 
@@ -233,93 +355,48 @@ class TestSessionWorkflow:
         class Failing(MockCamera):
             def capture(self, destination: Path, filename_stem: str,
                         keep_live_view: bool = True):
-                raise RuntimeError("Závěrka se nespustila")
+                raise RuntimeError("Čtení proudu selhalo")
 
         camera = Failing()
         camera.connect()
-        s = CaptureSession(
-            camera, film, SessionPaths.create(tmp_path, film.film_id), frame_reader=npy_frame_reader
-        )
-        with pytest.raises(RuntimeError, match="Závěrka"):
+        s = CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id))
+        with pytest.raises(RuntimeError, match="Čtení proudu"):
             s.capture_scan()
-        assert s.state.last_error == "Závěrka se nespustila"
-
-    def test_jpeg_disguised_as_nef_is_recorded_honestly(
-        self, tmp_path: Path, film: FilmMetadata
-    ) -> None:
-        """Body at Compression Level != RAW delivers JPEG at the .NEF path.
-        The sidecar must say jpeg with SOF geometry — and rawpy must never be
-        called (that call is the b'Input/output error' in the 2026-09 log)."""
-        import cv2
-
-        jpeg = cv2.imencode(".jpg", np.zeros((2008, 3008, 3), np.uint8))[1].tobytes()
-
-        class JpegBody(MockCamera):
-            def capture(self, destination: Path, filename_stem: str,
-                        keep_live_view: bool = True):
-                target = destination / f"{filename_stem}.NEF"
-                target.write_bytes(jpeg)
-                from filmscan_studio.capture.camera import CaptureResult
-                return CaptureResult(
-                    path=target, size_bytes=len(jpeg), settings=self._settings,
-                    elapsed=0.1, capture_target="card", file_format="jpeg")
-
-        def never_reader(_path: Path) -> RawFrame:
-            raise AssertionError("rawpy musí na JPEG nikdy sahnout")
-
-        camera = JpegBody()
-        camera.connect()
-        s = CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id),
-                           frame_reader=never_reader)
-        result = s.capture_scan()
-        payload = json.loads(s.paths.sidecar(result.path).read_text(encoding="utf-8"))
-        assert payload["file_format"] == "jpeg"
-        assert payload["width"] == 3008 and payload["height"] == 2008
-        assert payload["acquisition"]["iso"] == result.settings.iso
-        assert s.state.scan_count == 1
-
-
-class TestJpegDimensions:
-    def test_reads_sof_without_decoding(self, tmp_path: Path) -> None:
-        import cv2
-
-        from filmscan_studio.core.rawio import jpeg_dimensions
-
-        buf = np.zeros((64, 96, 3), np.uint8)
-        path = tmp_path / "a.jpg"
-        path.write_bytes(cv2.imencode(".jpg", buf)[1].tobytes())
-        assert jpeg_dimensions(path) == (96, 64)
-
-    def test_returns_none_for_non_jpeg(self, tmp_path: Path) -> None:
-        from filmscan_studio.core.rawio import jpeg_dimensions
-
-        path = tmp_path / "b.nef"
-        path.write_bytes(b"II*\x00never a jpeg")
-        assert jpeg_dimensions(path) is None
+        assert s.state.last_error == "Čtení proudu selhalo"
 
 
 class TestLiveMeter:
-    def test_jpeg_is_linearised_before_metering(self) -> None:
-        """A mid-grey Live View JPEG must meter as its linear value, not 0.5.
+    def test_metering_is_raw_dn_no_gamma(self) -> None:
+        """The guard for the brief's rule: a linear frame meters as itself.
 
-        This is the guard for the brief's rule that metering happens on linear
-        data: if someone removes the gamma undo, this test fails.
+        There is no JPEG gamma to undo any more — if someone re-introduces a
+        display transform in the meter path, this fails.
         """
         meter = LiveMeter()
-        encoded = np.full((8, 8, 3), 0.5)
-        reading = meter.meter_raw_signal(meter.jpeg_to_linear(encoded), 0.0, 1.0)
-        assert reading.signal_p999 == pytest.approx(0.5**2.2)
-
-    def test_decode_rejects_garbage(self) -> None:
-        with pytest.raises(ValueError):
-            LiveMeter.decode_live_frame(LiveFrame(jpeg=b"not a jpeg"))
+        half = 32767.5
+        reading = meter.meter_frame(
+            LiveFrame(data=np.full((8, 8), 32768, np.uint16), width=8, height=8)
+        )
+        assert reading.signal_p999 == pytest.approx(half, rel=1e-3)
+        assert reading.highlight_utilisation == pytest.approx(0.5, abs=1e-3)
 
     def test_decode_reads_a_real_frame(self) -> None:
         with MockCamera(live_fps=500) as camera:
             camera.start_live_view()
             frame = camera.next_live_frame()
         img = LiveMeter.decode_live_frame(frame)
-        assert img.ndim == 3 and img.max() <= 1.0
+        assert img.ndim == 2 and img.dtype == np.float64
+
+    def test_normalized_frame_divides_by_the_frames_own_levels(self) -> None:
+        meter = LiveMeter()
+        frame = LiveFrame(
+            data=np.array([[0, 1000], [500, 1000]], np.uint16),
+            width=2, height=2, black_level=0.0, white_level=1000.0,
+        )
+        data, reading = meter.normalized_frame(frame)
+        assert data.max() == pytest.approx(1.0)
+        assert reading.white_level == 1.0
+        assert reading.signal_p999 <= 1.0
 
 
 class TestAutoExposure:
@@ -342,207 +419,141 @@ class TestAutoExposure:
         )
 
     def test_adds_light_when_under(self) -> None:
-        camera = MockCamera(settings=ExposureSettings(1 / 250, 100))
+        camera = MockCamera(settings=ExposureSettings(0.1, iso=None, gain=1.0))
         camera.connect()
-        camera.start_live_view()
-        # Scene so dark the meter asks for more than two stops.
         controller = AutoExposureController(camera, LiveMeter())
         result = controller.run(read=lambda: self._reading(0.05))
         assert result.achieved_ev_change > 0
         assert camera.shutter_history
 
     def test_removes_light_when_over(self) -> None:
-        camera = MockCamera(settings=ExposureSettings(1 / 30, 100))
+        camera = MockCamera(settings=ExposureSettings(4.0, iso=None, gain=1.0))
         camera.connect()
         controller = AutoExposureController(camera, LiveMeter())
         result = controller.run(read=lambda: self._reading(0.95))
         assert result.achieved_ev_change < 0
 
     def test_no_change_when_already_at_target(self) -> None:
-        camera = MockCamera(settings=ExposureSettings(1 / 60, 100))
+        camera = MockCamera(settings=ExposureSettings(1.0, iso=None, gain=1.0))
         camera.connect()
         target = 2.0 ** (-0.4)
         controller = AutoExposureController(camera, LiveMeter())
         result = controller.run(read=lambda: self._reading(target))
         assert result.achieved_ev_change == pytest.approx(0.0)
         assert camera.shutter_history == []
+        assert result.converged
 
     def test_converges_with_a_responsive_camera(self) -> None:
-        """With a camera whose signal tracks shutter, the loop must land on target."""
-        camera = MockCamera(scene_level=0.08, settings=ExposureSettings(1 / 1000, 100))
+        """With a camera whose signal tracks shutter*gain, the loop lands on target."""
+        camera = MockCamera(scene_level=0.08,
+                            settings=ExposureSettings(0.05, iso=None, gain=1.0))
         camera.connect()
         meter = LiveMeter()
-
-        state = {"last": None}
-
-        def read() -> MeterReading:
-            dn = camera.sensor_signal()
-            reading = meter.meter_raw_signal(np.array([[dn]]), 600.0, 16383.0)
-            state["last"] = reading
-            return reading
-
         controller = AutoExposureController(camera, meter, max_iterations=8)
-        result = controller.run(read=read)
+        result = controller.run(read=responsive_read(camera))
         assert result.reading.highlight_utilisation == pytest.approx(2.0**-0.4, abs=0.06)
 
-    def test_reports_lens_limit_not_a_bug(self) -> None:
-        """When even the slowest shutter is too fast, say so explicitly."""
-        camera = MockCamera(settings=ExposureSettings(min(D750_SHUTTERS), 100))
+    def test_gain_lock_solves_with_shutter_alone(self) -> None:
+        """Archival rule: locked, a dark scene must never raise the gain."""
+        camera = MockCamera(scene_level=0.02,
+                            settings=ExposureSettings(0.1, iso=None, gain=1.0))
         camera.connect()
-        controller = AutoExposureController(camera, LiveMeter())
-        result = controller.run(read=lambda: self._reading(0.001))
-        assert result.limited_by_lens
+        controller = AutoExposureController(camera, LiveMeter(), gain_lock=True,
+                                            max_iterations=6)
+        result = controller.run(read=responsive_read(camera))
+        assert camera.gain_history == []
+        assert result.settings.gain == pytest.approx(ARCHIVE_GAIN)
+
+    def test_unlocked_solves_clipped_scene_with_shutter_first(self) -> None:
+        """Unlocked loop on a clipped frame: the shutter (continuous down to
+        microseconds) absorbs it and gain stays untouched — gain is only the
+        residual the shutter range cannot reach."""
+        camera = MockCamera(settings=ExposureSettings(1.0, iso=None, gain=1.0))
+        camera.connect()
+        controller = AutoExposureController(camera, LiveMeter(), gain_lock=False)
+        result = controller.run(read=lambda: self._reading(0.999, clipped=True))
+        assert camera.gain_history == []
+        assert not result.limited_by_gain
+        assert camera.shutter_history and camera.shutter_history[-1] < 1.0
+
+    def test_pinned_at_slowest_with_lock_reports_lighting_not_a_bug(self) -> None:
+        """Even 1800 s too dark + lock: name the extreme and the residual.
+
+        utilisation 4e-4 (not 1e-5): a p999 below one ten-thousandth of range
+        is *at black* — required_ev_change rightly refuses to meter it and
+        the controller enters its blind big-step path instead.
+        """
+        camera = MockCamera(settings=ExposureSettings(1800.0, iso=None, gain=1.0))
+        camera.connect()
+        controller = AutoExposureController(camera, LiveMeter(), gain_lock=True)
+        result = controller.run(read=lambda: self._reading(4e-4))
         assert not result.converged
+        assert result.limited_by_lens
+        assert "1800" in result.limit_note and "tmavší" in result.limit_note
+        assert "gain uzamčen" in result.limit_note
 
     def test_on_step_previews_proposed_settings(self) -> None:
-        camera = MockCamera(settings=ExposureSettings(1 / 250, 100))
+        camera = MockCamera(settings=ExposureSettings(0.25, iso=None, gain=1.0))
         camera.connect()
         seen: list[ExposureSettings] = []
         controller = AutoExposureController(camera, LiveMeter(), max_iterations=2)
         controller.run(read=lambda: self._reading(0.02), on_step=seen.append)
-        assert seen and all(s.iso == 100 for s in seen)
+        assert seen and all(s.gain == ARCHIVE_GAIN for s in seen)
 
-    def test_iso_is_never_touched(self) -> None:
-        """Shutter is the default actuator; ISO costs noise on a studio scan."""
-        camera = MockCamera(settings=ExposureSettings(1 / 1000, 400))
+    def test_gain_is_never_touched_with_the_archival_lock(self) -> None:
+        """Shutter is the default actuator; gain costs noise on a studio scan."""
+        camera = MockCamera(settings=ExposureSettings(0.001, iso=None, gain=4.0))
         camera.connect()
-        controller = AutoExposureController(camera, LiveMeter())
+        controller = AutoExposureController(camera, LiveMeter(), gain_lock=True)
         controller.run(read=lambda: self._reading(0.01))
-        assert camera.iso_history == []
+        assert camera.gain_history == []
 
     def test_headroom_is_configurable(self) -> None:
-        camera = MockCamera(settings=ExposureSettings(1 / 60, 100))
+        camera = MockCamera(settings=ExposureSettings(1.0, iso=None, gain=1.0))
         camera.connect()
+        other = MockCamera(settings=ExposureSettings(1.0, iso=None, gain=1.0))
+        other.connect()
         tight = AutoExposureController(camera, LiveMeter(), headroom_ev=0.05)
-        loose = AutoExposureController(MockCamera(settings=ExposureSettings(1 / 60, 100)), LiveMeter(), headroom_ev=1.5)
-        loose.camera.connect()
+        loose = AutoExposureController(other, LiveMeter(), headroom_ev=1.5)
         a = tight.run(read=lambda: self._reading(0.5))
         b = loose.run(read=lambda: self._reading(0.5))
         assert a.achieved_ev_change > b.achieved_ev_change
 
     def test_clipping_is_surfaced(self) -> None:
-        camera = MockCamera(settings=ExposureSettings(1 / 60, 100))
+        camera = MockCamera(settings=ExposureSettings(1.0, iso=None, gain=1.0))
         camera.connect()
         controller = AutoExposureController(camera, LiveMeter())
         result = controller.run(read=lambda: self._reading(0.999, clipped=True))
         assert result.clipped
 
-
-class BodyMeterCamera(MockCamera):
-    """MockCamera plus the SDK backend's ``exposure_ev`` behaviour.
-
-    The D750's ExposureStatus cap reports ``log2(applied / correctly_exposed)``
-    and answered *exactly* in stops on the measured body (2026-09-15): -3.00
-    for three stops of shutter, +4.00 for four of ISO. Correct exposure here
-    means shutter*iso == ``reference`` — the same convention as
-    ``MockCamera.sensor_signal``'s reference term.
-    """
-
-    def __init__(self, reference: float = 1 / 60 * 100, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self._reference = reference
-
-    def exposure_ev(self) -> float:
-        s = self.get_settings()
-        return math.log2(s.shutter * s.iso / self._reference)
-
-
-class TestAutoExposureBodyMeter:
-    """The 2026-09 rewrite: the SDK's Live View stream is auto-brightness, so
-    the controller closes the loop on the body's own exposure meter instead —
-    and must therefore converge in ONE press, not one stop per click."""
-
-    def test_without_body_meter_falls_back_to_lv_path(self) -> None:
-        camera = MockCamera(settings=ExposureSettings(1 / 60, 100))
+    def test_clip_step_is_bigger_than_the_blind_residual(self) -> None:
+        """The meter cannot see past the rail: a clipped frame must move by
+        more than the 0.4 EV blind reading implies, or escaping a 5-stop
+        overexposure would take 12 iterations."""
+        camera = MockCamera(settings=ExposureSettings(60.0, iso=None, gain=1.0))
         camera.connect()
-        # MockCamera has no exposure_ev: run() without `read` must use LV
-        # metering and report no body_ev.
-        controller = AutoExposureController(camera, LiveMeter())
-        result = controller.run(read=lambda: TestAutoExposure._reading(0.05))
-        assert result.body_ev is None
+        controller = AutoExposureController(camera, LiveMeter(), max_iterations=1)
+        controller.run(read=lambda: self._reading(1.0, clipped=True))
+        applied = camera.shutter_history[0]
+        assert applied <= 60.0 / 2.5   # at least ~1.3 stops in one step
 
-    def test_one_press_solves_a_three_stop_move(self) -> None:
-        # 1/500 ISO 100 is 2.97 stops under correct -> must land on target in
-        # a single actuator write, shutter first, ISO untouched.
-        camera = BodyMeterCamera(settings=ExposureSettings(1 / 500, 100))
-        camera.connect()
-        controller = AutoExposureController(camera, LiveMeter())
-        result = controller.run()
-        assert result.converged
-        assert result.iterations == 1
-        assert abs(result.body_ev) <= 0.06
-        assert result.limited_by_lens is False and result.limit_note is None
-        # Quality policy: shutter ladder buys the light, ISO stays at floor.
-        assert camera.iso_history == [] or result.settings.iso == 100
-        assert result.settings.shutter > 1 / 500
 
-    def test_shutter_bottomed_out_raises_iso_instead_of_lying(self) -> None:
-        """The exact complaint of 2026-09: 'nejmenší dostupný čas' at 1/50
-        while the real fix was ISO. With the shutter already at the slowest
-        rung the controller must climb ISO and converge, no limit report."""
-        # Scene needs 3 stops more than 30 s ISO 100 delivers.
-        camera = BodyMeterCamera(reference=2 ** 3 * 30 * 100,
-                                 settings=ExposureSettings(
-                                     max(D750_SHUTTERS), 100))
-        camera.connect()
-        controller = AutoExposureController(camera, LiveMeter())
-        result = controller.run()
-        assert result.converged, result.limit_note
-        assert result.settings.iso > 100
-        assert result.settings.shutter == max(D750_SHUTTERS)
+def responsive_read(camera: MockCamera):
+    """Metering callback wired to the mock's own radiometry."""
+    def read() -> MeterReading:
+        return _reading_of_dn(camera.sensor_signal())
+    return read
 
-    def test_darkening_lowers_iso_before_shortening(self) -> None:
-        # 4 stops over: ISO 1600 -> 100 is exactly four stops, free quality.
-        camera = BodyMeterCamera(settings=ExposureSettings(1 / 60, 1600))
-        camera.connect()
-        controller = AutoExposureController(camera, LiveMeter())
-        result = controller.run()
-        assert result.converged, result.limit_note
-        assert result.settings.iso == 100
-        assert result.settings.shutter == pytest.approx(1 / 60)
 
-    def test_move_beyond_both_ladders_reports_real_extremes(self) -> None:
-        # Scene 19 stops dark; the ladders' full travel is 30 s (+9) at
-        # ISO 25600 (+8) = 17 EV — two EV short, and the note must say so.
-        camera = BodyMeterCamera(reference=2 ** 19 / 60 * 100,
-                                 settings=ExposureSettings(1 / 60, 100))
-        camera.connect()
-        controller = AutoExposureController(camera, LiveMeter())
-        result = controller.run()
-        assert not result.converged
-        assert result.limited_by_lens and result.limited_by_iso
-        assert "30" in result.limit_note and "25600" in result.limit_note
-        assert "tmavší" in result.limit_note
-
-    def test_straddle_converges_with_residual_note(self) -> None:
-        """Target between two neighbouring rungs: no finer step exists, so it
-        is honest convergence — the note reports the residue, no fake limit."""
-        # 1/60 ISO 100 correct; move +0.3 EV: no ladder pair lands within eps.
-        camera = BodyMeterCamera(reference=2 ** 3.0 / 60 * 100 * 2 ** 0.3,
-                                 settings=ExposureSettings(1 / 60, 100))
-        camera.connect()
-        controller = AutoExposureController(camera, LiveMeter())
-        result = controller.run()
-        # Either it landed exactly (some ladder pair hits it) or it converged
-        # as a straddle: never a limit report, always a note when imperfect.
-        assert result.converged, result.limit_note
-        assert not result.limited_by_lens and not result.limited_by_iso
-        if abs(result.body_ev or 0.0) > 0.06:
-            assert "jemnější krok" in (result.limit_note or "")
-
-    def test_stops_on_no_move_available_without_claiming_limits(self) -> None:
-        """Iteration-cap/dither residue must not be reported as a hardware
-        limit — the old bug was exactly this confident lie."""
-        camera = BodyMeterCamera(settings=ExposureSettings(1 / 60, 100))
-        camera.connect()
-        evs = iter([-8.0, 8.0, -7.0, 7.0])     # never converges: oscillates
-        controller = AutoExposureController(camera, LiveMeter(),
-                                            max_iterations=2)
-        controller._body_meter = lambda: (lambda: next(evs))
-        result = controller.run()
-        assert not result.converged
-        assert not result.limited_by_lens and not result.limited_by_iso
-        assert "zkus Auto Exposure znovu" in result.limit_note
+def _reading_of_dn(dn: float) -> MeterReading:
+    util = dn / 65535.0
+    return MeterReading(
+        black_level=0.0, white_level=1.0,
+        signal_min=util * 0.5, signal_median=util * 0.8,
+        signal_p999=util, signal_max=min(util * 1.01, 1.0),
+        clipped_fraction=util >= 1.0 and 0.01 or 0.0,
+        near_black_fraction=0.0,
+    )
 
 
 class TestFilmMetadataV2:
@@ -582,12 +593,12 @@ class TestFilmMetadataV2:
 
     def test_rig_defaults_subset(self):
         film = FilmMetadata(
-            film_id="F1", film_name="Fomapan 100", camera="D750",
+            film_id="F1", film_name="Fomapan 100", camera="TS2600MP-G2",
             digitising_light="CRS LED", mirrored=True, development="R09 8 min",
             content="hrady",
         )
         rig = film.rig_defaults()
-        assert rig["camera"] == "D750"
+        assert rig["camera"] == "TS2600MP-G2"
         assert rig["digitising_light"] == "CRS LED"
         assert rig["mirrored"] is True
         # The film's own identity and its development log never carry over.

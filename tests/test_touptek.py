@@ -1,0 +1,450 @@
+"""The Touptek backend against a scripted fake of the SDK handle.
+
+No camera is on hand, so the *contract with the SDK* is what is pinned here:
+which options are written in what order, that BINNING/ROI only ever change on
+a stopped stream, that frames are pulled at 16 bits into the sized buffer,
+that the permille/µs/0.1 °C unit exchanges are right, and that capture ends
+in a readable full-sensor TIFF. Every fake assertion is an INSTRUCTIONS §11
+hardware-checklist item in waiting: when the real camera contradicts one, the
+matching test must fail, not silently pass.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from filmscan_studio.capture import touptek
+from filmscan_studio.capture._toupcam import toupcam as sdk
+from filmscan_studio.capture.camera import CameraError, NotConnectedError
+from filmscan_studio.capture.touptek import (
+    EXPO_TIME_RANGE_US,
+    RAW_OPTIONS,
+    TouptekCamera,
+    audit_options,
+    configure_raw_stream,
+    even_roi,
+    gain_to_permille,
+    parse_gain_range,
+    sensor_from_device,
+    shutter_to_us,
+)
+from filmscan_studio.core.rawio import open_frame
+from filmscan_studio.core.zoom import (
+    NO_BINNING,
+    OVERVIEW_BINNING,
+    Roi,
+    SensorSize,
+)
+
+SENSOR = SensorSize(6224, 4168)
+
+
+def _const(name: str) -> int:
+    return getattr(sdk, f"TOUPCAM_OPTION_{name}")
+
+
+class FakeHcam:
+    """Records every call; answers plausibly; enforces stream-state rules."""
+
+    def __init__(self, *, options: dict[int, int] | None = None,
+                 size: tuple[int, int] = (2074, 1389),
+                 gain_range=(1000, 8000, 1000), refuse_options=()) -> None:
+        self.calls: list[tuple] = []
+        self.options = dict(options or {})
+        self.refused = set(refuse_options)
+        self._size = size
+        self._gain_range = gain_range
+        self._expo_us = 1_000_000
+        self._gain_permille = 1000
+        self._temperature = -52      # -5.2 °C in 0.1 units
+        self.stream_running = False
+        self.roi: tuple[int, int, int, int] | None = None
+        self.pulls: list[tuple] = []
+        self.waited: list[tuple] = []
+
+    # -- options ----------------------------------------------------------
+    def put_Option(self, opt: int, value: int) -> None:
+        if opt in self.refused:
+            raise sdk.HRESULTException(0x80004005)
+        self.calls.append(("put_Option", opt, value))
+        self.options[opt] = value
+        self._check_not_running(opt)
+
+    def get_Option(self, opt: int) -> int:
+        if opt not in self.options:
+            raise sdk.HRESULTException(0x8000FFFF)
+        return self.options[opt]
+
+    # -- exposure -----------------------------------------------------------
+    def put_ExpoTime(self, us: int) -> None:
+        self.calls.append(("put_ExpoTime", us))
+        self._expo_us = us
+
+    def get_ExpoTime(self) -> int:
+        return self._expo_us
+
+    def put_ExpoAGain(self, permille: int) -> None:
+        self.calls.append(("put_ExpoAGain", permille))
+        self._gain_permille = permille
+
+    def get_ExpoAGain(self) -> int:
+        return self._gain_permille
+
+    def get_ExpoAGainRange(self):
+        return self._gain_range
+
+    # -- geometry -----------------------------------------------------------
+    def put_Roi(self, x: int, y: int, w: int, h: int) -> None:
+        self.calls.append(("put_Roi", x, y, w, h))
+        self.roi = (x, y, w, h)
+        self._size = (w, h)
+        self._check_not_running("put_Roi")
+
+    def put_Size(self, w: int, h: int) -> None:
+        self.calls.append(("put_Size", w, h))
+        self._size = (w, h)
+
+    def get_Size(self):
+        return self._size
+
+    # -- stream --------------------------------------------------------------
+    def StartPullModeWithCallback(self, fun, ctx) -> None:
+        self.calls.append(("Start",))
+        self.stream_running = True
+        self._callback = fun
+
+    def Stop(self) -> None:
+        self.calls.append(("Stop",))
+        self.stream_running = False
+
+    def PullImageV4(self, buf, width, bits, pitch, info) -> None:
+        self.pulls.append((buf.shape, bits, width, pitch))
+        buf[:] = 4242
+
+    def WaitImageV4(self, wait_ms, buf, width, bits, pitch, info) -> None:
+        self.waited.append((wait_ms, buf.shape, bits))
+        buf[:] = 999
+
+    def Snap(self, flag: int) -> None:
+        self.calls.append(("Snap", flag))
+
+    def fire_frame(self) -> None:
+        """Simulate one SDK-thread TOUPCAM_EVENT_IMAGE callback."""
+        self._callback(sdk.TOUPCAM_EVENT_IMAGE, None)
+
+    # -- misc ------------------------------------------------------------------
+    def get_Temperature(self) -> int:
+        return self._temperature
+
+    def Close(self) -> None:
+        self.calls.append(("Close",))
+
+    # -- invariants -----------------------------------------------------------
+    def _check_not_running(self, what: object) -> None:
+        # The SDK refuses geometry changes on a running stream; the backend
+        # must never attempt one (E_WRONG_THREAD on real hardware).
+        if self.stream_running:
+            raise AssertionError(
+                f"volání {what} na běžícím proudu — "
+                "SDK by vrátil E_WRONG_THREAD")
+
+
+class FakeDevice:
+    """EnumV2 record shape: dev.model.{name,res,still,preview,flag}, dev.id."""
+
+    class _Res:
+        def __init__(self, width, height):
+            self.width, self.height = width, height
+
+    class _Model:
+        def __init__(self, name, res, still, preview, flag):
+            self.name, self.res = name, res
+            self.still, self.preview, self.flag = still, preview, flag
+
+    def __init__(self, dev_id="usb:1", name=b"ATR2600M", flag=sdk.TOUPCAM_FLAG_TEC):
+        self.id = dev_id
+        self.displayname = name
+        self.model = FakeDevice._Model(
+            name,
+            [FakeDevice._Res(6224, 4168), FakeDevice._Res(3112, 2084)],
+            still=2, preview=0, flag=flag,
+        )
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    """Patch EnumV2/Open so TouptekCamera() talks to a FakeHcam.
+
+    TECTARGET starts readable: the backend probes cooling by asking for it,
+    so a handle without it would (correctly) report an uncooled camera.
+    """
+    hcam = FakeHcam(options={_const("TECTARGET"): -50})
+    monkeypatch.setattr(sdk.Toupcam, "EnumV2",
+                        staticmethod(lambda: [FakeDevice()]))
+    monkeypatch.setattr(sdk.Toupcam, "Open", staticmethod(lambda _id: hcam))
+    return hcam
+
+
+@pytest.fixture
+def camera(fake):
+    cam = TouptekCamera()
+    cam.connect()
+    return cam
+
+
+class TestConnect:
+    def test_raw_options_all_written_and_verified(self, fake, camera) -> None:
+        written = {c[1]: c[2] for c in fake.calls if c[0] == "put_Option"}
+        for name, wanted, _label in RAW_OPTIONS:
+            assert written[_const(name)] == wanted, name
+        assert audit_options(fake) == []
+
+    def test_refused_option_reported_not_fatal(self, monkeypatch) -> None:
+        hcam = FakeHcam(refuse_options={_const("LINEAR")})
+        monkeypatch.setattr(sdk.Toupcam, "EnumV2",
+                            staticmethod(lambda: [FakeDevice()]))
+        monkeypatch.setattr(sdk.Toupcam, "Open", staticmethod(lambda _id: hcam))
+        cam = TouptekCamera()
+        info = cam.connect()               # must not raise
+        assert info.model == "ATR2600M"
+
+    def test_info_fields(self, camera) -> None:
+        info = camera.info
+        assert info.manufacturer == "Touptek"
+        assert info.shutter_choices == ()             # continuous
+        assert info.gain_range == (1.0, 8.0)          # permille / 1000
+        assert (info.sensor_width, info.sensor_height) == (6224, 4168)
+
+    def test_no_camera_raises_with_power_hint(self, monkeypatch) -> None:
+        monkeypatch.setattr(sdk.Toupcam, "EnumV2", staticmethod(lambda: []))
+        monkeypatch.setattr(sdk.Toupcam, "Open", staticmethod(lambda _id: None))
+        with pytest.raises(CameraError, match="11"):
+            TouptekCamera().connect()
+
+    def test_enumerate_reports_cooling_flag(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            sdk.Toupcam, "EnumV2",
+            staticmethod(lambda: [FakeDevice(),
+                                  FakeDevice("usb:2", b"GM1", flag=0)]))
+        found = TouptekCamera.enumerate()
+        assert found[0]["cooling"] is True and found[1]["cooling"] is False
+
+    def test_sensor_from_enumeration_picks_largest_still(self) -> None:
+        assert sensor_from_device(FakeDevice()) == SENSOR
+
+    def test_sensor_fallback_on_empty_res_list(self) -> None:
+        dev = FakeDevice()
+        dev.model.res = []
+        assert sensor_from_device(dev) == touptek.DEFAULT_SENSOR
+
+
+class TestExposureUnits:
+    def test_shutter_exchanged_in_microseconds(self, fake, camera) -> None:
+        applied = camera.set_shutter(2.5)
+        assert ("put_ExpoTime", 2_500_000) in fake.calls
+        assert applied == pytest.approx(2.5)
+        assert camera.get_settings().shutter == pytest.approx(2.5)
+
+    def test_shutter_clamped_to_backend_range(self, fake, camera) -> None:
+        assert camera.set_shutter(1e-9) == EXPO_TIME_RANGE_US[0] / 1e6
+        assert camera.set_shutter(1e9) == EXPO_TIME_RANGE_US[1] / 1e6
+
+    def test_gain_exchanged_in_permille(self, fake, camera) -> None:
+        applied = camera.set_gain(2.5)
+        assert ("put_ExpoAGain", 2500) in fake.calls
+        assert applied == pytest.approx(2.5)
+
+    def test_gain_clamped_to_reported_range(self, fake, camera) -> None:
+        assert camera.set_gain(0.5) == pytest.approx(1.0)
+        assert camera.set_gain(99.0) == pytest.approx(8.0)
+
+    def test_gain_helpers(self) -> None:
+        assert gain_to_permille(1.0) == 1000
+        assert gain_to_permille(1.2345) == 1234        # SDK ladder is integer
+        with pytest.raises(ValueError):
+            gain_to_permille(0.0)
+        assert parse_gain_range((1000, 8000, 1000)) == (1.0, 8.0)
+        assert parse_gain_range((0, 0, 0)) == (1.0, 1.0)   # broken read
+        assert shutter_to_us(0.5) == 500_000
+
+
+class TestStreamModes:
+    def test_overview_writes_binning_then_full_roi(self, fake, camera) -> None:
+        """The ROI-off idiom is put_Roi over the full sensor, and the buffer
+        is sized from get_Size *after* — hardware item §11: verify the camera
+        reports the binned size there."""
+        fake.calls.clear()               # connect wrote the RAW options first
+        camera.start_live_view()
+        seq = [c for c in fake.calls
+               if c[0] in ("put_Option", "put_Roi", "Start")]
+        assert seq[0] == ("put_Option", _const("BINNING"), OVERVIEW_BINNING)
+        assert ("put_Roi", 0, 0, 6224, 4168) in fake.calls
+        assert seq[-1] == ("Start",)
+
+    def test_roi_mode_uses_no_binning_and_even_window(self, fake, camera) -> None:
+        """A pending ROI written before the stream starts reaches the SDK only
+        when the stream comes up — the backend configures geometry at start."""
+        camera.set_live_view_roi((1001, 999, 1201, 1201))  # odd -> rounded
+        camera.start_live_view()
+        assert fake.options[_const("BINNING")] == NO_BINNING
+        assert fake.roi == (1000, 998, 1200, 1200)
+
+    def test_mode_change_stops_before_reconfigures(self, fake, camera) -> None:
+        camera.start_live_view()
+        fake.calls.clear()
+        camera.set_live_view_roi((2000, 1500, 1200, 1200))
+        kinds = [c[0] for c in fake.calls]
+        assert kinds.index("Stop") < kinds.index("put_Option")
+        assert kinds.index("put_Roi") < kinds.index("Start")
+        # And the invariant checker inside FakeHcam proved nothing ran on a
+        # live stream (it would have raised mid-call).
+
+    def test_frames_pulled_at_16_bits_into_sized_buffer(self, fake, camera) -> None:
+        camera.start_live_view()
+        fake.fire_frame()
+        frame = camera.next_live_frame()
+        assert fake.pulls and fake.pulls[-1][1] == 16
+        buf_shape, _bits, width, _pitch = fake.pulls[-1]
+        assert buf_shape == (frame.height, frame.width)
+        assert width == 0                        # 0 = full buffer width
+        assert (frame.width, frame.height) == fake._size
+        assert frame.data.dtype == np.uint16
+        assert frame.white_level == 65535.0
+
+    def test_stale_frames_dropped_newest_kept(self, fake, camera) -> None:
+        camera.start_live_view()
+        fake._size = fake._size          # same size; contents differ per pull
+        fake.fire_frame()
+        fake.fire_frame()
+        _data, size = camera._frames.get_nowait()   # queue maxsize=1
+        assert size == fake._size
+
+    def test_silent_stream_times_out_as_camera_error(self, camera, monkeypatch) -> None:
+        monkeypatch.setattr(touptek, "FRAME_TIMEOUT_S", 0.01)
+        camera.start_live_view()
+        with pytest.raises(CameraError, match="přestal"):
+            camera.next_live_frame()
+
+    def test_non_image_events_ignored(self, fake, camera) -> None:
+        camera.start_live_view()
+        fake._callback(0x0008, None)     # not TOUPCAM_EVENT_IMAGE
+        assert fake.pulls == []
+
+
+class TestCapture:
+    def test_capture_writes_full_sensor_tiff(self, fake, camera, tmp_path) -> None:
+        fake._size = (6224, 4168)        # get_Size after put_Size on hardware
+        camera.set_shutter(4.0)
+        camera.set_gain(1.0)
+        result = camera.capture(tmp_path, "frame001")
+        assert result.path == tmp_path / "frame001.tif"
+        frame = open_frame(result.path)
+        assert (frame.width, frame.height) == (6224, 4168)
+        assert frame.data.dtype == np.uint16
+        assert int(frame.data.max()) == 999   # what WaitImageV4 filled
+        assert result.bit_depth == 16
+        assert result.sensor_temperature_c == pytest.approx(-5.2)
+
+    def test_capture_reconfigures_to_full_1to1(self, fake, camera, tmp_path) -> None:
+        camera.start_live_view()
+        camera.set_live_view_roi((1000, 1000, 1200, 1200))
+        fake.calls.clear()
+        camera.capture(tmp_path, "f")
+        kinds = [c[0] for c in fake.calls]
+        assert kinds[0] == "Stop"                       # stream down first
+        assert ("put_Option", _const("BINNING"), NO_BINNING) in fake.calls
+        assert ("put_Roi", 0, 0, 6224, 4168) in fake.calls
+        assert ("put_Size", 6224, 4168) in fake.calls
+        assert ("Snap", 0xFFFFFFFF) in fake.calls
+        assert fake.waited and fake.waited[-1][0] == 0  # exposure-aware timeout
+        assert fake.waited[-1][2] == 16                 # 16-bit pull
+
+    def test_capture_restores_live_view_mode(self, fake, camera, tmp_path) -> None:
+        camera.start_live_view()
+        camera.set_live_view_roi((2000, 1500, 1200, 1200))
+        camera.capture(tmp_path, "f", keep_live_view=True)
+        assert camera._binning == NO_BINNING
+        assert camera._roi == Roi(2000, 1500, 1200, 1200)
+        assert fake.stream_running is True
+        assert camera._live_view is True
+
+    def test_capture_without_keep_leaves_stream_stopped(
+        self, fake, camera, tmp_path
+    ) -> None:
+        camera.start_live_view()
+        camera.capture(tmp_path, "f", keep_live_view=False)
+        assert fake.stream_running is False
+
+    def test_wait_timeout_surfaces_as_camera_error(
+        self, fake, camera, tmp_path
+    ) -> None:
+        def refuse(*_args):
+            raise sdk.HRESULTException(0x80040000)
+        fake.WaitImageV4 = refuse
+        camera.start_live_view()
+        with pytest.raises(CameraError, match="exposice"):
+            camera.capture(tmp_path, "f")
+
+    def test_settings_embedded_in_acquisition(self, fake, camera, tmp_path) -> None:
+        camera.set_shutter(8.0)
+        fake._size = (8, 8)
+        camera._sensor = SensorSize(8, 8)
+        result = camera.capture(tmp_path, "f")
+        assert result.settings.shutter == pytest.approx(8.0)
+
+
+class TestCoolingUnits:
+    def test_temperature_is_decidegrees(self, camera) -> None:
+        assert camera.get_temperature_c() == pytest.approx(-5.2)
+
+    def test_target_exchanged_in_tenths(self, fake, camera) -> None:
+        fake.options[_const("TECTARGET")] = -50
+        assert camera.get_target_temperature_c() == pytest.approx(-5.0)
+        assert camera.set_target_temperature_c(-12.3) == pytest.approx(-12.3)
+        assert ("put_Option", _const("TECTARGET"), -123) in fake.calls
+
+    def test_tec_toggle(self, fake, camera) -> None:
+        camera.set_tec_enabled(False)
+        assert ("put_Option", _const("TEC"), 0) in fake.calls
+        camera.set_tec_enabled(True)
+        assert ("put_Option", _const("TEC"), 1) in fake.calls
+
+    def test_camera_without_tec_option_reports_no_cooling(self, monkeypatch) -> None:
+        hcam = FakeHcam()                        # TECTARGET absent -> get raises
+        monkeypatch.setattr(sdk.Toupcam, "EnumV2",
+                            staticmethod(lambda: [FakeDevice()]))
+        monkeypatch.setattr(sdk.Toupcam, "Open", staticmethod(lambda _id: hcam))
+        cam = TouptekCamera()
+        cam.connect()
+        assert cam.capabilities().cooling is False
+        assert cam.get_temperature_c() is None
+        with pytest.raises(CameraError):
+            cam.set_tec_enabled(True)
+
+
+class TestHelpers:
+    def test_even_roi_rounds_down_and_clamps(self) -> None:
+        roi = even_roi(Roi(101, 203, 1203, 1203), SENSOR)
+        assert (roi.x, roi.y) == (100, 202)
+        assert (roi.width, roi.height) == (1202, 1202)
+        assert roi.x + roi.width <= SENSOR.width
+
+    def test_even_roi_floors_at_min(self) -> None:
+        roi = even_roi(Roi(0, 0, 4, 4), SENSOR)
+        assert roi.width >= 64 and roi.width % 2 == 0
+
+    def test_disconnect_closes_and_refuses(self, fake) -> None:
+        cam = TouptekCamera()
+        cam.connect()
+        cam.disconnect()
+        assert ("Close",) in fake.calls
+        with pytest.raises(NotConnectedError):
+            cam.get_settings()
+
+    def test_configure_raw_stream_survives_refusals(self) -> None:
+        hcam = FakeHcam(refuse_options={_const("RGB")})
+        notes = configure_raw_stream(hcam)
+        assert any("RGB" in n or "Grey" in n for n in notes)
+        problems = audit_options(hcam)
+        assert any("nejde ověřit" in p or "hlásí" in p for p in problems)

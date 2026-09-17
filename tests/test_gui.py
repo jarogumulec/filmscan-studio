@@ -1,9 +1,10 @@
 """GUI tests against MockCamera, offscreen.
 
 These are contract tests for the brief's hard rules, not pixel tests: the two
-preview modes must differ in the image but *not* in the histogram, captures must
-leave raw bytes to the session (never the GUI writing files), and no camera call
-may run on the UI thread.
+preview modes must differ in the image but *not* in the histogram, the zoom
+selector must reconfigure the *stream* (binned overview vs hardware ROI), the
+Capture button must refuse a non-archival gain, and no camera call may run on
+the UI thread.
 """
 
 from __future__ import annotations
@@ -13,11 +14,13 @@ import pytest
 
 pytest.importorskip("pytestqt")
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
 
+from filmscan_studio.capture.camera import LiveFrame  # noqa: E402
 from filmscan_studio.capture.mock import MockCamera  # noqa: E402
 from filmscan_studio.core.models import FilmMetadata  # noqa: E402
+from filmscan_studio.core.zoom import FIT, NO_BINNING, OVERVIEW_BINNING  # noqa: E402
 from filmscan_studio.gui.capture_window import CaptureWindow  # noqa: E402
 from filmscan_studio.gui.imageutil import to_qimage  # noqa: E402
 from filmscan_studio.gui.liveview import LiveViewWorker  # noqa: E402
@@ -38,6 +41,8 @@ def window(qtbot, camera) -> CaptureWindow:
     qtbot.addWidget(w)
     # The window started its own Live View worker in the constructor; wait for
     # it to deliver a real frame rather than injecting one behind its back.
+    # (qtbot.waitUntil pumps the event loop, which is what delivers queued
+    # cross-thread signals here — QTest.qWait does not, learned the hard way.)
     qtbot.waitUntil(lambda: w._last_linear is not None, timeout=5000)
     return w
 
@@ -46,45 +51,51 @@ class TestModes:
     def test_modes_show_different_images(self, window, qtbot):
         raw_display = window._display_for(window._last_linear).copy()
         window.mode_positive.setChecked(True)
-        qtbot.wait(10)
         positive_display = window._display_for(window._last_linear)
-        # A negative inverted is not the same picture as the raw mosaic view.
-        assert not np.allclose(raw_display, positive_display)
+        # The fast positive renders 3-channel (the mono frame repeats), the
+        # raw view stays 2-D — and the picture itself differs too: a negative
+        # with the filmic curve is not the gamma-only raw view.
+        assert positive_display.ndim == 3 and raw_display.ndim == 2
+        assert not np.allclose(raw_display, positive_display[..., 0])
 
-    def test_histogram_stays_linear_in_working_positive(self, window, qtbot):
-        window.mode_raw.setChecked(True)
-        qtbot.wait(10)
+    def test_histogram_stays_linear_across_modes(self, window):
+        image = window._last_linear
+        reading = window._last_reading
+        window._set_mode(raw_view=True)
+        window._update_histogram(image, reading)
         raw_hist = window.histogram._hist
-        window.mode_positive.setChecked(True)
-        qtbot.wait(10)
+        window._set_mode(raw_view=False)
+        window._update_histogram(image, reading)
         positive_hist = window.histogram._hist
-        # The brief: histogram is always linear sensor data. The frame metered
-        # is the same frame, so the histogram must be identical.
+        # The brief: histogram is always linear sensor data. The frame
+        # metered is the same frame, so the histogram must be identical.
         assert np.array_equal(raw_hist.counts, positive_hist.counts)
 
-    def test_curve_overlay_only_in_positive(self, window, qtbot):
+    def test_curve_overlay_only_in_positive(self, window):
+        image, reading = window._last_linear, window._last_reading
+        window._set_mode(raw_view=True)
+        window._update_histogram(image, reading)
         assert window.histogram._curve is None
-        window.mode_positive.setChecked(True)
-        qtbot.wait(10)
+        assert "RAW View" in window.histogram_label.text()
+        window._set_mode(raw_view=False)
+        window._update_histogram(image, reading)
         assert window.histogram._curve is not None
-        window.mode_raw.setChecked(True)
-        qtbot.wait(10)
-        assert window.histogram._curve is None
+        assert "křivka" in window.histogram_label.text()
 
-    def test_mode_checkboxes_are_mutually_exclusive(self, window, qtbot):
+    def test_mode_checkboxes_are_mutually_exclusive(self, window):
         window.mode_positive.setChecked(True)
-        qtbot.wait(10)
         assert not window.mode_raw.isChecked()
         # Unchecking the active mode must not leave the app with no mode.
         window.mode_positive.setChecked(False)
-        qtbot.wait(10)
         assert window.mode_raw.isChecked()
 
-    def test_filmic_panel_disabled_in_raw_view(self, window, qtbot):
+    def test_filmic_panel_disabled_in_raw_view(self, window):
         assert not window.filmic.isEnabled()
         window.mode_positive.setChecked(True)
-        qtbot.wait(10)
         assert window.filmic.isEnabled()
+
+    def test_meter_label_reports_utilisation(self, window):
+        assert "plného rozsahu" in window.meter_label.text()
 
 
 class TestCaptureWorkflow:
@@ -92,14 +103,12 @@ class TestCaptureWorkflow:
         assert not window.btn_capture.isEnabled()
         assert not window.btn_dark.isEnabled()
 
-    def test_session_startenables_workflow(self, window, tmp_path, qtbot):
+    def test_session_start_enables_workflow(self, window, tmp_path, qtbot):
         from filmscan_studio.capture.session import CaptureSession, SessionPaths
 
         film = FilmMetadata(film_id="HP5_001", operator="JG")
         paths = SessionPaths.create(tmp_path, film.film_id)
-        window.session = CaptureSession(
-            camera=window.camera, film=film, paths=paths, frame_reader=_npy_reader
-        )
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
         window._refresh_buttons()
         assert window.btn_capture.isEnabled()
 
@@ -114,13 +123,28 @@ class TestCaptureWorkflow:
         assert len(sidecars) == 5
         assert "3) Snímání" in window.stage_label.text()
 
+    def test_scan_triggers_post_capture_audit(self, window, tmp_path, qtbot):
+        """The linear stream makes the TIFF audit a confirmation, but it still
+        runs and its verdict must reach the log."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="HP5_002", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window._capture(scan=True)
+        qtbot.waitUntil(lambda: window._last_audit is not None, timeout=15000)
+        # Verdict wording follows the mock's exposure state (the default
+        # shutter underexposes scene 0.3); any verdict proves the audit ran.
+        assert "EV" in window._last_audit
+        assert "náhled" in window.log_view.text()   # preview JPEG was rendered
+
     def test_capture_button_stays_disabled_while_busy(self, window, tmp_path, qtbot):
         from filmscan_studio.capture.session import CaptureSession, SessionPaths
 
         film = FilmMetadata(film_id="X_1")
         paths = SessionPaths.create(tmp_path, film.film_id)
         window.session = CaptureSession(
-            camera=SlowCaptureCamera(), film=film, paths=paths, frame_reader=_npy_reader
+            camera=SlowCaptureCamera(), film=film, paths=paths
         )
         window._refresh_buttons()
         window._capture(scan=True)
@@ -150,7 +174,7 @@ class TestConnect:
         assert w.info == camera.info  # MockCamera.info is a property, not identity-stable
         assert w.btn_autoexposure.isEnabled()
 
-    def test_connect_failure_notifies(self, qtbot, monkeypatch):
+    def test_connect_failure_names_the_power_hint(self, qtbot, monkeypatch):
         w = CaptureWindow()
         qtbot.addWidget(w)
         w._connecting = True
@@ -159,21 +183,23 @@ class TestConnect:
             "filmscan_studio.gui.capture_window.QMessageBox.critical",
             staticmethod(lambda *a, **k: shown.setdefault("shown", a[2])),
         )
-        w._on_connect_failed("Cannot allocate USB device")
-        assert "USB" in shown["shown"]
+        w._on_connect_failed("Nenalezena žádná kamera")
+        assert "Nenalezena" in shown["shown"]
+        # The #1 cause on this camera is a missing power supply — say so.
+        assert "11–14 V" in shown["shown"]
         assert not w._connecting
 
 
-class TestZoom:
+class TestZoomView:
+    """Pure widget geometry — the stream wiring lives in TestStreamModeWiring."""
+
     def test_zoom_ladder_is_sensor_pixels(self):
-        # 100% = one screen pixel per *sensor* pixel (of the 6016x4016 NEF),
-        # not per preview-window pixel: the brief's old 0.25/1/2/4 ladder
-        # scaled the 640px stream and is intentionally gone.
-        from filmscan_studio.core.zoom import FIT
+        # 100% = one screen pixel per *sensor* pixel (of the 6224×4168 TIFF),
+        # not per stream pixel: the sub-1 ladders that scaled the old 640px
+        # JPEG preview are intentionally gone with the D750.
+        assert ZOOM_LEVELS == (FIT, 1.0, 2.0, 4.0)
 
-        assert ZOOM_LEVELS == (FIT, 0.125, 0.25, 0.5, 1.0, 2.0)
-
-    def test_set_zoom_clamps_and_emits(self, qtbot):
+    def test_set_zoom_rejects_off_ladder_and_emits(self, qtbot):
         view = ZoomView()
         qtbot.addWidget(view)
         view.resize(200, 200)
@@ -184,6 +210,17 @@ class TestZoom:
         assert view.zoom() == 2.0
         with pytest.raises(ValueError):
             view.set_zoom(3.0)
+
+    def test_center_uv_reports_stream_pixels(self, qtbot):
+        """The centre lives in sensor-scaled coords internally; the window
+        needs the stream-pixel grid to aim a hardware ROI."""
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.set_source_scale(3.0)
+        view.set_image(np.zeros((100, 100)))   # centre = 150,150 scaled px
+        cx, cy = view.center_uv()
+        assert (cx, cy) == pytest.approx((50.0, 50.0))
 
     def test_click_recenters_on_release(self, qtbot):
         view = ZoomView()
@@ -216,8 +253,8 @@ class TestZoom:
         assert view._center == before  # an AE drag must not pan
 
     def test_plain_drag_pans_when_zoomed(self, qtbot):
-        """2026-09 brief: zoomed in, drag = move around the picture (focus the
-        point of interest), not an AE rectangle. Shift is the AE modifier."""
+        """Zoomed in, drag = move around the picture (focus the point of
+        interest), not an AE rectangle. Shift is the AE modifier."""
         view = ZoomView()
         qtbot.addWidget(view)
         view.resize(200, 200)
@@ -247,9 +284,7 @@ class TestZoom:
         assert view.ae_rect() is not None
 
     def test_zoomed_view_fills_the_widget(self, qtbot):
-        """The 2026-09 complaint: zoomed frames drew from the top-left corner
-        without filling the view. The crop destination must cover the widget —
-        and since the same month's integer rule, at a whole multiple only: a
+        """Zoomed frames must fill the view, and at a whole multiple only: a
         requested 0.5× of a 1:1 stream clamps UP to ×1 and the view pans, it
         never shrinks the stream below its native size."""
         view = ZoomView()
@@ -258,7 +293,7 @@ class TestZoom:
         view.show()
         view.set_image(np.zeros((400, 400)))
         view.set_source_scale(1.0)
-        view.set_zoom(0.5)
+        view.set_zoom(1.0)
         assert view.source_zoom() == 1.0
         crop, dest = view._crop_rect()
         assert dest.width() >= view.width() - 1
@@ -271,12 +306,14 @@ class TestZoom:
         qtbot.addWidget(view)
         view.resize(600, 400)
         view.show()
-        view.set_image(np.zeros((424, 640)))
-        view.set_source_scale(4.0)          # a body-cropped stream
-        view.set_zoom(0.5)                  # 0.5 * 4 = 2.0 exactly
-        assert view.source_zoom() == 2.0
-        view.set_zoom(0.25)                 # 0.25 * 4 = 1.0
-        assert view.source_zoom() == 1.0
+        view.set_image(np.zeros((416, 622)))
+        view.set_source_scale(3.0)          # a binned overview stream
+        view.set_zoom(1.0)                  # 1.0 * 3 = 3.0 screen px per stream px
+        assert view.source_zoom() == 3.0
+        view.set_zoom(2.0)                  # 2.0 * 3 = 6.0
+        assert view.source_zoom() == 6.0
+        view.set_zoom(4.0)                  # 12.0 — the ROI level shown over
+        assert view.source_zoom() == 12.0   # the overview interpolates ×4
 
     def test_right_click_clears_ae_rect(self, qtbot):
         view = ZoomView()
@@ -291,55 +328,75 @@ class TestZoom:
         view.mousePressEvent(_mouse_event(5, 5, Qt.MouseButton.RightButton))
         assert view.ae_rect() is None
 
-    def test_source_scale_shows_in_detail_note(self, qtbot):
+    def test_detail_note_set(self, qtbot):
         view = ZoomView()
         qtbot.addWidget(view)
-        view.set_detail_note("stream 640×424")
-        assert view._detail_note == "stream 640×424"
+        view.set_detail_note("stream 2074×1389")
+        assert view._detail_note == "stream 2074×1389"
 
 
+class TestStreamModeWiring:
+    """Selecting a zoom level must reconfigure the *stream* (binning / ROI)."""
 
-class TestBodyZoomWiring:
-    """Selecting a zoom level must ask the *body* for a zoomed stream."""
+    def test_low_zooms_keep_the_binned_overview(self, window):
+        # Below the honesty limit (one overview px = 3×3 sensor px) the
+        # overview already shows every real detail; no stream request is made.
+        for level in (1.0, 2.0, FIT):
+            window.zoom_select.setCurrentIndex(window.zoom_select.findData(level))
+        assert window.camera.stream_history == []
+        assert window._roi_applied is None
+        assert "overview" in window.zoom_note.text()
 
-    def test_zoom_selection_requests_body_crop(self, window, qtbot):
-        window.zoom_select.setCurrentIndex(window.zoom_select.findData(1.0))
-        qtbot.waitUntil(lambda: window.camera.live_view_zoom_rate != 0, timeout=2000)
-        # 100% sensor from a 640px whole-frame stream: a crop is the only way
-        # to any real detail; Whole is not acceptable any more.
-        assert window.camera.live_view_zoom_rate != 0
-        assert window.camera.live_view_zoom_history  # it actually reached the "camera"
+    def test_zoom_4_switches_to_a_hardware_roi(self, window):
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(4.0))
+        assert window._roi_applied is not None
+        assert window._stream_binned is False
+        binning, roi = window.camera.stream_history[-1]
+        assert binning == NO_BINNING
+        assert roi is not None and roi.width == 1200
+        x0, y0, w, h = window._roi_applied
+        assert (w, h) == (1200, 1200)
+        assert (x0, y0) == (roi.x, roi.y)
+        assert "ROI" in window.zoom_note.text() and "1:1" in window.zoom_note.text()
 
-    def test_fit_returns_to_whole_frame(self, window, qtbot):
-        window.zoom_select.setCurrentIndex(window.zoom_select.findData(1.0))
-        qtbot.waitUntil(lambda: window.camera.live_view_zoom_rate != 0, timeout=2000)
-        window.zoom_select.setCurrentIndex(window.zoom_select.findData(0.0))
-        qtbot.waitUntil(lambda: window.camera.live_view_zoom_rate == 0, timeout=2000)
-
-    def test_zoom_note_discloses_interpolation(self, window, qtbot):
-        window.zoom_select.setCurrentIndex(window.zoom_select.findData(1.0))
-        qtbot.wait(50)
+    def test_roi_frames_arrive_at_full_scale(self, window, qtbot):
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(4.0))
+        qtbot.waitUntil(lambda: window._stream_size == (1200, 1200), timeout=5000)
+        assert window.view.source_scale() == 1.0
+        # The note is recomputed per frame: ×4 of a 1:1 ROI is ×4 display,
+        # not the stale ×12 of the overview it replaced.
+        qtbot.waitUntil(lambda: "zobrazení ×4" in window.zoom_note.text(), timeout=3000)
         assert "interpolace" in window.zoom_note.text()
 
-    def test_no_body_zoom_without_capability(self, qtbot, camera):
-        from dataclasses import replace
+    def test_fit_returns_to_the_overview(self, window, qtbot):
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(4.0))
+        qtbot.waitUntil(lambda: window._stream_size == (1200, 1200), timeout=5000)
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(FIT))
+        assert window.camera.stream_history[-1] == (OVERVIEW_BINNING, None)
+        assert window._roi_applied is None and window._stream_binned
+        qtbot.waitUntil(lambda: window._stream_size[0] > 1200, timeout=5000)
 
-        base_caps = camera.capabilities()
-        camera.capabilities = lambda: replace(base_caps, live_view_zoom=False)
-        w = CaptureWindow(camera=camera)
-        qtbot.addWidget(w)
-        # A backend without the capability (gphoto2) must never be sent
-        # set_live_view_zoom, and must be called out in the log.
-        w.zoom_select.setCurrentIndex(w.zoom_select.findData(1.0))
-        qtbot.wait(50)
-        assert camera.live_view_zoom_history == []
-        assert "interpolovaný" in w.log_view.text()
+    def test_stream_switch_clears_the_ae_rect(self, window):
+        # The red rect is in *stream* px; the new stream delivers different
+        # pixels, so keeping it would meter the wrong area. Drawn as a real
+        # Shift-drag on the live frame: the clear must propagate back to the
+        # window through the view's own signal, not just reset one side.
+        shift = Qt.KeyboardModifier.ShiftModifier
+        window.view.mousePressEvent(_mouse_event(20, 20, modifiers=shift))
+        window.view.mouseMoveEvent(_mouse_event(90, 70, modifiers=shift))
+        window.view.mouseReleaseEvent(_mouse_event(90, 70, modifiers=shift))
+        assert window._ae_rect is not None
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(4.0))
+        assert window.view.ae_rect() is None
+        assert window._ae_rect is None
+
+    def test_zoom_note_discloses_interpolation(self, window):
+        window.zoom_select.setCurrentIndex(window.zoom_select.findData(4.0))
+        assert "interpolace" in window.zoom_note.text()
 
 
 class TestAeRectMetering:
     def test_ae_rect_reaches_window_state(self, window):
-        from PySide6.QtCore import QRect
-
         window._on_ae_rect(QRect(10, 20, 100, 50))
         assert window._ae_rect == (10, 20, 110, 70)
         window._on_ae_rect(None)
@@ -348,19 +405,15 @@ class TestAeRectMetering:
     def test_meter_source_meters_only_the_rect(self, window):
         # A frame that is dark everywhere except the rect: whole-frame and
         # rect metering must disagree, proving the crop is applied.
-        import cv2
-
+        data = np.zeros((200, 200), dtype=np.uint16)
         # Bright patch must be < 0.1% of the frame or p99.9 of the whole
         # frame would hit it too and the test would prove nothing.
-        img = np.zeros((200, 200, 3), dtype=np.uint8)
-        img[100:105, 100:105] = 250
-        ok, buf = cv2.imencode(".jpg", img)
-        assert ok
-        from filmscan_studio.capture.camera import LiveFrame
+        data[100:105, 100:105] = 65000
 
         class RectCamera:
             def next_live_frame(self):
-                return LiveFrame(jpeg=buf.tobytes())
+                return LiveFrame(data=data, width=200, height=200,
+                                 black_level=0.0, white_level=65535.0)
 
             def disconnect(self):  # window teardown calls it
                 pass
@@ -376,180 +429,129 @@ class TestAeRectMetering:
 
 
 class TestExposureControls:
-    def test_iso_select_applies_to_camera(self, window, qtbot):
-        index = window.iso_select.findData(400)
-        assert index >= 0
-        window.iso_select.setCurrentIndex(index)
-        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 400, timeout=2000)
+    def test_gain_spin_applies_to_camera(self, window):
+        window.gain_spin.setValue(4.0)
+        window.gain_spin.editingFinished.emit()
+        assert window.camera.get_settings().gain == pytest.approx(4.0)
+        assert not window.btn_gain_base.isChecked()
 
-    def test_iso_base_button_pins_archival_iso_100(self, window, qtbot):
-        # 2026-09 archival rule: the button pins ISO 100 (the D750's native
-        # base — the scan is one transmission measurement), it no longer drops
-        # to the body's *lowest offered* rung (50 was a Lo extension).
-        window.iso_select.setCurrentIndex(window.iso_select.findData(1600))
-        qtbot.wait(10)
-        window.btn_iso_low.click()
-        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 100, timeout=2000)
+    def test_gain_base_button_pins_archival_gain(self, window):
+        # Archival rule carried to the Touptek: the scan is one transmission
+        # measurement at the sensor's noise floor — gain 1.00×, exposure in time.
+        window.camera.set_gain(4.0)
+        window._refresh_settings()
+        assert not window.btn_gain_base.isChecked()
+        window.btn_gain_base.setChecked(True)
+        assert window.camera.get_settings().gain == pytest.approx(1.0)
 
-    def test_capture_blocked_until_iso_100(self, window, qtbot):
-        # "ifo při iso 100 a nastavuj jen expozici": at any other sensitivity
+    def test_capture_blocked_until_gain_base(self, window):
+        # "při gain 1.00 a nastavuj jen expozici": at any other sensitivity
         # the Capture button is grey and _capture_block_reason says why.
-        window.session = None  # block reason must still speak about ISO path
-        window.iso_select.setCurrentIndex(window.iso_select.findData(400))
-        qtbot.wait(10)
-        assert window._capture_block_reason() is not None
-        assert "ISO 100" in window._capture_block_reason()
+        window.camera.set_gain(4.0)
+        window._refresh_settings()   # syncs widgets -> the base button unchecks
+        window._refresh_buttons()
+        reason = window._capture_block_reason()
+        assert reason is not None and "gain 1.00" in reason and "4.00" in reason
         assert not window.btn_capture.isEnabled()
-        window.btn_iso_low.click()
-        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 100, timeout=2000)
+        window.btn_gain_base.setChecked(True)
         assert window._capture_block_reason() is None
 
-    def test_shutter_text_edit_snaps_to_ladder(self, window, qtbot):
+    def test_shutter_text_edit_applies(self, window):
         window.shutter_edit.setEditText("1/125")
         window.shutter_edit.lineEdit().editingFinished.emit()
-        qtbot.waitUntil(lambda: window.camera.get_settings().shutter == 1 / 125,
-                        timeout=2000)
+        assert window.camera.get_settings().shutter == pytest.approx(1 / 125)
 
-    def test_refresh_does_not_reapply(self, window, qtbot):
+    def test_unparseable_shutter_text_is_rejected(self, window):
+        # The mock accepts any shutter (the real backend clamps to its range);
+        # what must hold everywhere is that garbage never reaches the camera.
+        before = window.camera.get_settings().shutter
+        window.shutter_edit.setEditText("pátý přes devátou")
+        window.shutter_edit.lineEdit().editingFinished.emit()
+        assert window.camera.get_settings().shutter == pytest.approx(before)
+        assert "nejde pochopit" in window.statusBar().currentMessage()
+
+    def test_refresh_does_not_reapply(self, window):
         window._refresh_settings()
-        before = list(window.camera.iso_history)
+        before_shutter = list(window.camera.shutter_history)
+        before_gain = list(window.camera.gain_history)
         window._refresh_settings()
-        assert window.camera.iso_history == before
+        assert window.camera.shutter_history == before_shutter
+        assert window.camera.gain_history == before_gain
+
 
 class TestHistogramFollowsAeRect:
     def test_histogram_uses_only_the_rect(self, window):
-        """2026-09 brief: histogram must describe the same area AE meters —
-        bright film borders may not fake a blown/clipped report."""
+        """Histogram must describe the same area AE meters — bright film
+        borders may not fake a blown/clipped report."""
         from filmscan_studio.core.exposure import measure
 
-        img = np.zeros((200, 200, 3), dtype=np.float64)
-        img[:, :] = 0.05                      # dark film base
-        img[10:14, 10:14] = 2.5               # blown patch, 0.08% of frame
-        from filmscan_studio.gui.liveview import luminance
-        reading = measure(luminance(img), 0.0, 1.0)
+        img = np.full((200, 200), 0.05)          # dark film base
+        img[10:14, 10:14] = 2.5                  # blown patch, 0.08% of frame
+        reading = measure(img, 0.0, 1.0)
 
         window._ae_rect = None
-        window._update_histogram(reading, img)
+        window._update_histogram(img, reading)
         hist_whole = window.histogram._hist
 
-        window._ae_rect = (60, 60, 160, 160)  # away from the blown corner
-        returned = window._update_histogram(reading, img)
+        window._ae_rect = (60, 60, 160, 160)     # away from the blown corner
+        returned = window._update_histogram(img, reading)
         hist_rect = window.histogram._hist
 
         assert hist_whole.clipped_high > 0
         assert hist_rect.clipped_high == 0
         assert hist_rect.total < hist_whole.total
-        # The returned reading follows the rect too (p99.9 inside is 0.05).
+        # The returned reading follows the rect too (p99.9 inside is 0.05),
+        # and says so — the operator must know which area the numbers lie about.
         assert returned.signal_p999 < 0.2
+        assert "AE výřez" in window.histogram_label.text()
 
     def test_stale_rect_outside_frame_falls_back_to_whole(self, window):
         from filmscan_studio.core.exposure import measure
-        from filmscan_studio.gui.liveview import luminance
-        img = np.full((100, 100, 3), 0.4)
-        reading = measure(luminance(img), 0.0, 1.0)
+
+        img = np.full((100, 100), 0.4)
+        reading = measure(img, 0.0, 1.0)
         window._ae_rect = (500, 500, 700, 700)
-        window._update_histogram(reading, img)
+        window._update_histogram(img, reading)
         assert window.histogram._hist.total == 100 * 100
 
 
-class TestHistogramPredictsNef:
-    """2026-09 brief: the D750's LV stream is auto-brightness, so its own
-    histogram is decorative — with a body meter the histogram must show how
-    the NEF will land, not how the preview looks."""
+class TestCoolingPanel:
+    def test_panel_visible_and_settled_for_cooled_camera(self, window):
+        assert window.cool_box.isVisibleTo(window)
+        assert window._temp_timer.isActive()
+        window._poll_temperature()
+        assert "°C" in window.temp_label.text()
+        # Mock starts settled at the setpoint: the semaphore is green.
+        assert "u cíle" in window.cool_note.text()
 
-    @staticmethod
-    def _frame():
-        from filmscan_studio.core.exposure import measure
-        from filmscan_studio.gui.liveview import luminance
-        img = np.full((100, 100, 3), 0.4)     # bright auto-brightness preview
-        return img, measure(luminance(img), 0.0, 1.0)
+    def test_warm_camera_reports_off_target(self, qtbot):
+        cam = MockCamera(scene_level=0.3, temperature_c=20.0)   # target −5
+        cam.connect()
+        w = CaptureWindow(camera=cam)
+        qtbot.addWidget(w)
+        w._poll_temperature()
+        assert "mimo cíl o 25.0" in w.cool_note.text()
 
-    def test_body_ev_shifts_histogram_toward_capture(self, window):
-        img, reading = self._frame()
-        window._ae_rect = None
-        window._body_ev = None
-        window._update_histogram(reading, img)
+    def test_target_spin_reaches_the_camera(self, window):
+        window.target_spin.setValue(-12.0)
+        window.target_spin.editingFinished.emit()
+        assert window.camera.target_history[-1] == pytest.approx(-12.0)
 
-        window._body_ev = -2.0        # capture will be 2 stops under preview
-        predicted = window._update_histogram(reading, img)
-        assert predicted.signal_p999 == pytest.approx(0.4 / 4, rel=0.01)
-        # Label must name what it describes — the user must never wonder
-        # whether this is the preview or the prediction.
-        assert "predikce NEFu" in window.histogram_label.text()
-        assert "-2.00" in window.histogram_label.text()
+    def test_tec_toggle_reaches_the_camera(self, window):
+        # The checkbox starts unchecked (the backend protocol has no TEC-state
+        # readback) — first toggle on, then off, each must reach the camera.
+        window.tec_check.setChecked(True)
+        assert window.camera.tec_enabled is True
+        window.tec_check.setChecked(False)
+        assert window.camera.tec_enabled is False
 
-    def test_toggle_switches_back_to_preview_metering(self, window):
-        img, reading = self._frame()
-        window._ae_rect = None
-        window._body_ev = -2.0
-        window._update_histogram(reading, img)
-        window.hist_predict.setChecked(False)
-        after = window._update_histogram(reading, img)
-        assert after.signal_p999 == pytest.approx(0.4, rel=0.01)
-        assert "predikce" not in window.histogram_label.text()
-        window.hist_predict.setChecked(True)
-
-    def test_no_body_ev_keeps_plain_preview(self, window):
-        # MockCamera has no exposure_ev -> worker emits None -> label honest.
-        img, reading = self._frame()
-        window._ae_rect = None
-        window._body_ev = None
-        window._update_histogram(reading, img)
-        assert "predikce" not in window.histogram_label.text()
-
-
-class TestRawMediaGuard:
-    """The 1 MB 'NEF' complaint: body at Compression Level != RAW answers
-    stills with JPEG; the GUI must detect it and offer the verified fix."""
-
-    STRINGS = ["JPEG Basic", "JPEG Normal", "JPEG Fine", "RAW",
-               "RAW + JPEG Basic"]
-
-    def test_button_shown_when_body_sends_jpeg(self, window, monkeypatch):
-        state = {"compression": 0, "settable": True}
-
-        def media_settings():
-            return {"compression": {"current": state["compression"],
-                                    "strings": self.STRINGS,
-                                    "settable": state["settable"]},
-                    "size": {"current": 2, "strings": ["L(6016*4016)", "S"],
-                             "settable": False}}
-
-        def set_media(compression=None, size=None):
-            if compression is not None:
-                state["compression"] = compression
-            return media_settings()
-
-        monkeypatch.setattr(window.camera, "media_settings", media_settings,
-                            raising=False)
-        monkeypatch.setattr(window.camera, "set_media", set_media,
-                            raising=False)
-        window._check_media_settings()
-        assert window.btn_raw_media.isVisibleTo(window)
-
-        window._fix_raw_media()          # the button's handler, no dialog path
-        assert state["compression"] == self.STRINGS.index("RAW")
-        assert not window.btn_raw_media.isVisibleTo(window)
-
-    def test_raw_size_not_demanded(self, window, monkeypatch):
-        """Measured: with RAW selected the body drops Image Size OP_SET —
-        size configures only the JPEG companion. Demanding L would nag
-        forever; RAW alone must satisfy the guard."""
-        def media_settings():
-            return {"compression": {"current": 3, "strings": self.STRINGS,
-                                    "settable": True},
-                    "size": {"current": 2, "strings": ["L(6016*4016)", "S"],
-                             "settable": False}}
-
-        monkeypatch.setattr(window.camera, "media_settings", media_settings,
-                            raising=False)
-        window._check_media_settings()
-        assert not window.btn_raw_media.isVisibleTo(window)
-
-    def test_backend_without_caps_is_skipped(self, window):
-        # MockCamera has no media caps: no crash, no nag.
-        window._check_media_settings()
-        assert not window.btn_raw_media.isVisibleTo(window)
+    def test_uncooled_camera_hides_the_panel(self, qtbot):
+        cam = MockCamera(scene_level=0.3, cooling=False)
+        cam.connect()
+        w = CaptureWindow(camera=cam)
+        qtbot.addWidget(w)
+        assert not w.cool_box.isVisibleTo(w)
+        assert not w._temp_timer.isActive()
 
 
 class TestNegativeQuickToggle:
@@ -573,7 +575,7 @@ class TestNegativeQuickToggle:
         assert not window.neg_toggle.isChecked()
 
 
-class TestAutoExposureStaysClickable:
+class TestAutoExposure:
     def test_failed_run_re_enables_buttons_without_session(self, window):
         """2026-09 bug: after 1–2 AE runs the button greyed out forever —
         end-of-run un-busy checked for a film session AE never needed."""
@@ -583,29 +585,58 @@ class TestAutoExposureStaysClickable:
         # Captures still require the session:
         assert not window.btn_capture.isEnabled()
 
-    def test_ae_pause_leaves_live_view_on(self, window, qtbot):
+    def test_ae_keeps_stream_up_and_solves_with_shutter_only(self, window, qtbot,
+                                                             monkeypatch):
         """AE keeps polling after the worker stops — the worker's teardown
-        must not switch the body's Live View off (-127 source)."""
+        must not stop the stream it is metering from. And with the archival
+        gain button checked the solve is shutter-only."""
+        monkeypatch.setattr(
+            "filmscan_studio.gui.capture_window.QMessageBox.warning",
+            staticmethod(lambda *a, **k: None),   # never hang on a modal dialog
+        )
         calls: list[str] = []
         window.camera.stop_live_view = lambda: calls.append("stop")
         assert window._worker is not None and window._worker.running
         window._auto_exposure()
         # worker.stop() joins the thread, so its finally has run by now:
-        assert calls == []          # AE left the body in Live View
-        # A normally-stopped worker still turns it off:
-        window._worker = None       # the AE-restarted worker; stop fresh one
-        window.start_live_view()
-        w = window._worker
+        assert calls == []          # AE left the stream up
+        qtbot.waitUntil(lambda: not window._camera_queue.busy, timeout=15000)
+        qtbot.wait(200)             # deliver the queued result callback
+        assert window.camera.gain_history == []   # gain lock held
+        assert window.camera.shutter_history      # the shutter did the work
+        assert "converged=True" in window.log_view.text()
+        assert window.btn_autoexposure.isEnabled()
+        # A normally-stopped worker does turn the stream off:
+        w = window._worker          # the worker AE's resume restarted
+        assert w is not None and w.running
         w.leave_live_view = False
         w.stop()
+        window._worker = None
         assert calls == ["stop"]
-        # Let the queued AE finish while the mock is still connected, then
-        # close — otherwise it completes against a dead camera in teardown
-        # and reports a phantom error.
-        qtbot.waitUntil(lambda: not window._camera_queue.busy, timeout=10000)
-        qtbot.wait(200)           # deliver the result callbacks
         window.close()
         window._camera_queue.stop(wait_ms=8000)
+
+
+class TestExportWarning:
+    def test_temperature_unmatched_scans_are_listed(self, window, tmp_path,
+                                                    monkeypatch):
+        """INSTRUCTIONS §7: the export still happens, but scans whose darks
+        sit at another temperature must be listed by frame number."""
+        from pathlib import Path
+
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="T_1")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window.session.export_project = lambda: (Path("t.zip"), [3, 7])
+        shown = {}
+        monkeypatch.setattr(
+            "filmscan_studio.gui.capture_window.QMessageBox.warning",
+            staticmethod(lambda *a, **k: shown.setdefault("text", a[2])),
+        )
+        window._export_project()
+        assert "3, 7" in shown["text"]
 
 
 class TestHistogramWidget:
@@ -632,53 +663,33 @@ class TestImageUtil:
 
 
 class TestLiveWorker:
-    def test_delivers_frames_off_ui_thread(self, qtbot, camera):
+    def test_delivers_linear_frames_off_ui_thread(self, qtbot, camera):
         worker = LiveViewWorker(camera, max_fps=30.0)
-        worker.setObjectName("worker-under-test")  # noqa: keep a strong ref below
         with qtbot.waitSignal(worker.frameReady, timeout=5000) as blocker:
             worker.start()
         worker.stop()
-        del worker
-        image, reading, body_ev = blocker.args
-        assert image.ndim == 3 and image.shape[2] == 3
+        image, reading = blocker.args
+        # The TS2600MP-G2 stream is linear mono — 2-D, normalised 0..1, with
+        # its meter reading always emitted together (one honest path).
+        assert image.ndim == 2
+        assert image.dtype == np.float64
         assert 0.0 <= float(image.min()) and float(image.max()) <= 1.0
         assert reading.signal_p999 > 0.0
-        # MockCamera has no body meter: the third slot must be None, not a
-        # fabricated zero (zero would make the histogram predict a lie).
-        assert body_ev is None
 
-    def test_body_ev_fn_is_throttled_and_delivered(self, qtbot, camera):
-        calls = []
-
-        def meter():
-            calls.append(1)
-            return -1.5
-
-        worker = LiveViewWorker(camera, max_fps=30.0, body_ev_fn=meter)
-        with qtbot.waitSignal(worker.frameReady, timeout=5000) as blocker:
+    def test_leave_live_view_keeps_the_stream_up(self, qtbot, camera):
+        worker = LiveViewWorker(camera, max_fps=30.0)
+        worker.leave_live_view = True
+        with qtbot.waitSignal(worker.frameReady, timeout=5000):
             worker.start()
         worker.stop()
-        image, reading, body_ev = blocker.args
-        assert body_ev == -1.5
-        assert calls and reading is not None and image is not None
+        assert camera._live_view          # AE can keep polling after teardown
 
-
-def _npy_reader(path):
-    """Reader for MockCamera's .npy output (same injectable as session tests)."""
-    from filmscan_studio.core.rawio import RawFrame
-    from filmscan_studio.core.models import AcquisitionMetadata
-
-    data = np.load(path)
-    return RawFrame(
-        path=path,
-        data=data,
-        black_level=600.0,
-        white_level=16383.0,
-        color_desc="BGGR",
-        width=data.shape[1],
-        height=data.shape[0],
-        acquisition=AcquisitionMetadata(exposure_time=1.0, iso=100),
-    )
+    def test_normal_stop_closes_the_stream(self, qtbot, camera):
+        worker = LiveViewWorker(camera, max_fps=30.0)
+        with qtbot.waitSignal(worker.frameReady, timeout=5000):
+            worker.start()
+        worker.stop()
+        assert not camera._live_view
 
 
 class SlowCaptureCamera(MockCamera):

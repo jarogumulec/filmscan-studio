@@ -1,8 +1,8 @@
-"""Developer pipeline tests, including a real-raw round trip when a NEF is present.
+"""Developer pipeline tests for the mono 16-bit pipeline.
 
-The synthetic tests prove the maths. The optional real-file test proves the
-calibration-then-demosaic path actually runs against LibRaw and a D750 NEF, and it
-is skipped rather than failed when no file is available so CI stays green.
+The synthetic tests prove the maths; everything reads and writes the same
+uint16 mono TIFFs the Touptek backend archives (the colour/LibRaw path went
+with the D750 — the IMX571 is mono, its raw data *is* the image).
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from filmscan_studio.developer.pipeline import (
 )
 
 BLACK, WHITE = 600.0, 16383.0
-REAL_NEF = Path("/tmp/fs_probe/bind_shot.NEF")
 
 
 def make_negative_frame(n: int = 160, seed: int = 0) -> RawFrame:
@@ -291,66 +290,29 @@ class TestExport:
         assert json.loads(json.dumps(sidecar_for(result)))["calibration"] == []
 
 
-class TestColourDevelop:
-    """Colour path: calibration in the mosaic, LibRaw doing the interpolation."""
+class TestMonoDeterminism:
+    """The colour develop path died with the D750; what survives of its
+    promises is byte-exact reproducibility of the mono render."""
 
-    def _colour_source(self) -> RawFrame:
-        frame = make_negative_frame(n=256, seed=2)
-        frame.data.astype(np.uint16)
-        return frame
-
-    def test_real_nef_when_available(self) -> None:
-        if not REAL_NEF.exists():
-            pytest.skip("no test NEF present")
-        result = DeveloperPipeline().develop_colour(REAL_NEF, DeveloperParams(half_size=True))
-        assert result.image.ndim == 3 and result.image.shape[2] == 3
-        assert result.image.min() >= 0.0 and result.image.max() <= 1.0
-
-    def test_calibration_changes_the_colour_output(self) -> None:
-        """A dark really does reach LibRaw's input on the colour path.
-
-        The direction is *upwards*: removing dark current lowers the linear
-        signal, and a negative is inverted, so lowering what is already a
-        transmittance raises the positive. Asserting the naive "dark subtracts,
-        therefore darker" would encode the wrong physics.
-        """
-        if not REAL_NEF.exists():
-            pytest.skip("no test NEF present")
-        params = DeveloperParams(half_size=True)
-        plain = DeveloperPipeline().develop_colour(REAL_NEF, params).image
-        dark_data = np.full((4032, 6032), 800.0)
-        calibrated = DeveloperPipeline(
-            dark=CalibrationStack(shutter=1 / 15, iso=100, data=dark_data, frame_count=1)
-        ).develop_colour(REAL_NEF, params).image
-        assert not np.array_equal(calibrated, plain)
-        assert calibrated.mean() > plain.mean()
-
-    def test_deterministic(self) -> None:
-        if not REAL_NEF.exists():
-            pytest.skip("no test NEF present")
+    def test_two_runs_produce_identical_uint16(self) -> None:
+        frame = make_negative_frame(n=96)
         pipeline = DeveloperPipeline()
-        params = DeveloperParams(half_size=True)
-        a = pipeline.develop_colour(REAL_NEF, params).as_uint16()
-        b = pipeline.develop_colour(REAL_NEF, params).as_uint16()
+        params = DeveloperParams()
+        a = pipeline.develop(frame, params).as_uint16()
+        b = pipeline.develop(frame, params).as_uint16()
         assert np.array_equal(a, b)
 
-    def test_source_nef_is_never_modified(self) -> None:
-        if not REAL_NEF.exists():
-            pytest.skip("no test NEF present")
-        before = REAL_NEF.read_bytes()
-        DeveloperPipeline().develop_colour(REAL_NEF, DeveloperParams(half_size=True))
-        assert REAL_NEF.read_bytes() == before
+    def test_source_file_is_never_modified(self, tmp_path: Path) -> None:
+        from filmscan_studio.core.rawio import write_frame
 
-    def test_base_level_measured_once_for_all_channels(self) -> None:
-        """A per-channel base would shift colour as the base is raised."""
-        rgb = np.dstack([np.full((64, 64), 0.9)] * 3)
-        from filmscan_studio.developer.pipeline import _positive_rgb
+        path = tmp_path / "src.tif"
+        write_frame(path, make_negative_frame(n=48).data)
+        before = path.read_bytes()
+        from filmscan_studio.core.rawio import open_frame
 
-        out = _positive_rgb(rgb, PositiveParams(base_level=0.9))
-        # All channels identical in, identical out: no cast introduced.
-        assert np.allclose(out[:, :, 0], out[:, :, 1]) and np.allclose(
-            out[:, :, 1], out[:, :, 2]
-        )
+        frame = open_frame(path)
+        DeveloperPipeline().develop(frame, DeveloperParams())
+        assert path.read_bytes() == before
 
 
 class TestSlidePath:
