@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtGui import QImage
 
-from filmscan_studio.core.exposure import D750_WHITE_LEVEL
+from filmscan_studio.core.exposure import WHITE_LEVEL_16BIT
 from filmscan_studio.core.positive import (
     PositiveParams,
     to_raw_view,
@@ -44,7 +44,7 @@ def preview(
     params: PositiveParams,
     raw_view: bool,
     black_level: float = 0.0,
-    white_level: float = D750_WHITE_LEVEL,
+    white_level: float = WHITE_LEVEL_16BIT,
 ) -> np.ndarray:
     """Display-referred image for one of the two modes.
 

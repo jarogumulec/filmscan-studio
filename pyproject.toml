@@ -8,14 +8,11 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "cffi>=2.1.1",
-    "exifread>=3.5.1",
-    "gphoto2>=2.6.4",
     "numpy>=2.5.3",
     "opencv-python>=5.0.0.93",
     "pydantic>=2.13.5",
     "pyside6>=6.11.2",
-    "rawpy>=0.27.1",
+    "tifffile>=2025.6.11",
 ]
 
 [build-system]

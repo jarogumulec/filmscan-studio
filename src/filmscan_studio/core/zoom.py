@@ -1,259 +1,167 @@
-"""Zoom in *sensor pixel* terms, plus an honest account of what Live View shows.
+"""Zoom and framing on a sensor with hardware binning and ROI.
 
-100 % here means one screen pixel per sensor pixel of a full-resolution frame —
-the D750's NEF is 6016x4016 — and **not** one pixel per pixel of the small Live
-View JPEG the body sends over USB. That distinction is the entire module. The
-previous ladder fitted the 640 px preview to the window and called the result
-100 %, which made "Fit" and "100 %" meaningless next to the real frame.
+The IMX571 (6224x4168) reframes its own stream, so there is no body-side zoom
+rate table to query and no crop-factor guessing:
 
-The body cannot send more pixels than it does (640x424 whole-frame, measured),
-but ``LiveViewImageZoomRate`` reframes the stream: at a zoomed rate the same 640
-pixels stand for a crop of the sensor, so each of them is worth fewer sensor
-pixels and the detail on screen genuinely improves. What this module computes is
-therefore two separate numbers that the UI must never conflate:
+* **Overview** — 3x3 average binning of the whole sensor
+  (``6224/3 x 4168/3 = 2074x1389``). Continuous, low USB load, and *linear*
+  (binning averages DN, it does not auto-brighten), so it meters honestly.
+* **Zoom** — no binning plus a hardware ``ROI`` window: the sensor transmits
+  only real pixels 1:1 around the point of interest, so fps stays high because
+  the window is small, not because detail was thrown away.
 
-``sensor_px_per_lv_px``
-    real detail — how many sensor pixels one delivered pixel represents.
-    Set by the body-side zoom rate, never by the app.
-
-``interpolation``
-    how much the app has to upscale to honour the requested display scale.
-    Zero is honest, anything above zero is stated rather than hidden.
-
-``FIT`` displays the whole frame whatever its pixel count, so its scale depends
-on the widget size and is resolved by the view, not here.
+Mapping between the two is exact linear arithmetic: an overview pixel
+``(u, v)`` is sensor pixel ``(3u, 3v)`` (offsets omitted — the overview always
+starts at the sensor origin), and a zoom ROI at ``(x0, y0)`` shows overview
+coordinates ``(x0/3, y0/3)`` at its own origin.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
-#: Sentinel zoom meaning "scale to fit the widget".
+#: Sentinel zoom meaning "fit the whole frame to the widget".
 FIT = 0.0
 
-#: Display scales offered in the UI, in screen pixels per *sensor* pixel.
-#: 1.0 is a true 1:1 readout of the 6016x4016 frame.
-ZOOM_LEVELS: tuple[float, ...] = (FIT, 0.125, 0.25, 0.5, 1.0, 2.0)
+#: Display zoom steps offered by the zoom combobox (multiples of screen px
+#: per stream px). FIT first, then pixel-snapped magnifications.
+ZOOM_LEVELS = (FIT, 1.0, 2.0, 4.0)
 
-#: Labels for :data:`ZOOM_LEVELS`. Percentages are of the sensor's pixel grid,
-#: which is what the operator is actually judging focus against.
-ZOOM_LABELS: dict[float, str] = {
-    FIT: "Fit (celý frame)",
-    0.125: "12,5 % sensoru",
-    0.25: "25 % sensoru",
-    0.5: "50 % sensoru",
-    1.0: "100 % — 1:1 pixel NEFu",
+ZOOM_LABELS = {
+    FIT: "Vejít se",
+    1.0: "100 % — 1:1 px proudu",
     2.0: "200 %",
+    4.0: "400 %",
 }
 
-#: ``LiveViewImageZoomRate`` element values (eNkMAIDLiveViewImageZoomRate).
-#: The SDK enum runs 0..8; 7 (13 %) and 8 (17 %) were confirmed present on the
-#: D750 (2026-09 SDK notes) after the original ladder stopped at 200 %.
-ZOOM_ALL, ZOOM_25, ZOOM_33, ZOOM_50, ZOOM_66, ZOOM_100, ZOOM_200, ZOOM_13, ZOOM_17 = range(9)
+#: The overview binning value for TOUPCAM_OPTION_BINNING: 0x83 = 3x3 average,
+#: bit depth unchanged. 0x01 = no binning (zoom mode).
+OVERVIEW_BINNING = 0x83
+NO_BINNING = 0x01
+#: Linear scale between overview and sensor coordinates.
+OVERVIEW_SCALE = 3.0
 
-#: Sensor pixels represented by one delivered Live View pixel, per rate.
-#:
-#: ``None`` marks Whole-frame, where the factor is the frame width ratio
-#: (6016 / 640 ≈ 9.4) and is computed from the actual sizes instead.
-#:
-#: The numbers encode Nikon's documented reading of the percentages as
-#: magnification relative to the sensor's own pixel grid (100 % = 1:1): a rate
-#: showing X % of the frame's width represents 1/X of the whole-frame factor.
-#: On the D750 the LV JPEG stays 640 px wide at every rate (measured — see
-#: ``sdk_probe_results.json``), so this table *is* the crop model. The deepest
-#: rates have not been verified against a ruler on hardware: run
-#: ``scripts/probe.sh`` and compare its ``crop_factor`` measurements, then
-#: correct this table. Until then the UI prints the assumed figure. The 13 %
-#: and 17 % rows are unverified hypotheses like the rest — the *enum values*
-#: are confirmed, their crop factors are read from the documented meaning.
-BODY_ZOOM_SENSOR_PX_PER_LV_PX: dict[int, float | None] = {
-    ZOOM_ALL: None,
-    ZOOM_25: 4.0,
-    ZOOM_33: 3.0,
-    ZOOM_50: 2.0,
-    ZOOM_66: 1.5,
-    ZOOM_100: 1.0,
-    ZOOM_200: 0.5,
-    # Same reading as the rows above (factor = 1 / magnification): these sit
-    # *shallower* than 25 % — ~7.7 / ~5.9 sensor px per delivered px.
-    ZOOM_13: 1.0 / 0.13,
-    ZOOM_17: 1.0 / 0.17,
-}
+#: Default zoom window (sensor px) when the camera switches to ROI mode. A
+#: ~1.2 Mpx window keeps high fps at 16-bit on USB3 while leaving room to pan.
+ZOOM_ROI_SIZE = 1200
+#: Hard floor for an ROI window the SDK accepts on any axis.
+MIN_ROI_PX = 64
 
-#: Above this interpolation the requested scale is better served by a real
-#: capture than by upscaling Live View; the UI says so instead of pretending.
-HONEST_INTERPOLATION_LIMIT = 2.0
 
-#: Below this display scale a body-side crop is never requested. Measured
-#: 2026-09-15 on the D750: every zoomed rate delivers 640x480 — at the
-#: shallowest crop the visible area is ~43 % x 48 % of the frame, a crop the
-#: operator read as "výřez je čtverec a je oříznutý — nedělej ořez". Body
-#: crops buy real detail only where the operator inspects pixels (>= 1:1);
-#: an overview must show the whole frame even if that means interpolating.
-MIN_ZOOM_FOR_BODY_CROP = 1.0
+@dataclass(frozen=True)
+class Roi:
+    """A sensor-pixel window: origin (x, y) and size, full-res coordinates."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+
+    def __post_init__(self) -> None:
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("ROI size must be positive")
+        if self.x < 0 or self.y < 0:
+            raise ValueError("ROI origin must be non-negative")
+
+    @property
+    def center(self) -> tuple[int, int]:
+        return (self.x + self.width // 2, self.y + self.height // 2)
+
+    def clamped(self, sensor: "SensorSize") -> "Roi":
+        """Slide the window fully inside the sensor (shrinking only if needed)."""
+        width = min(self.width, sensor.width)
+        height = min(self.height, sensor.height)
+        x = max(0, min(self.x, sensor.width - width))
+        y = max(0, min(self.y, sensor.height - height))
+        return Roi(x, y, width, height)
 
 
 @dataclass(frozen=True)
 class SensorSize:
-    """Full-resolution frame geometry, i.e. the NEF, not the Live View stream."""
+    """Full-resolution sensor geometry — what 1:1 zoom measures against."""
 
-    width: int = 6016
-    height: int = 4016
+    width: int = 6224
+    height: int = 4168
 
     def __post_init__(self) -> None:
         if self.width <= 0 or self.height <= 0:
-            raise ValueError("sensor dimensions must be positive")
+            raise ValueError("sensor size must be positive")
 
-    def fit_scale(self, widget_width: int, widget_height: int) -> float:
-        """Screen pixels per sensor pixel that fits the whole frame."""
-        if widget_width <= 0 or widget_height <= 0:
+    def fit_scale(self, widget_w: int, widget_h: int) -> float:
+        if widget_w <= 0 or widget_h <= 0:
             return 1.0
-        return min(widget_width / self.width, widget_height / self.height)
+        return min(widget_w / self.width, widget_h / self.height)
 
 
 @dataclass(frozen=True)
 class StreamDetail:
-    """What the delivered stream is actually worth at one body-side zoom rate."""
+    """What the Live View stream currently delivers, in sensor terms."""
 
-    rate: int
-    lv_width: int
-    lv_height: int
+    binned: bool
+    roi: Roi | None
+    #: Sensor pixels one delivered stream pixel stands for (3.0 binned,
+    #: 1.0 ROI). Display magnification beyond this interpolates.
     sensor_px_per_lv_px: float
-    #: Fraction of the frame width the body is currently showing (1.0 = whole).
-    crop_fraction: float
 
-    def sensor_span(self) -> int:
-        """Sensor pixels covered horizontally by the delivered frame."""
-        return int(round(self.lv_width * self.sensor_px_per_lv_px))
-
-    def interpolation_at(self, screen_px_per_sensor_px: float) -> float:
-        """How many screen pixels one delivered pixel is stretched onto.
-
-        ``1.0`` means the delivered pixels land one per screen pixel: no
-        invention of detail. Below 1 the stream is downsampled (Fit), which is
-        lossy but never fabricates grain.
-        """
-        if screen_px_per_sensor_px <= 0:
-            return 0.0
-        return screen_px_per_sensor_px * self.sensor_px_per_lv_px
+    @property
+    def is_overview(self) -> bool:
+        return self.binned
 
     def summary(self) -> str:
-        interp = self.sensor_px_per_lv_px
-        crop = f" · výřez {self.crop_fraction:.0%} šířky" if self.crop_fraction < 0.99 else ""
-        return (
-            f"stream {self.lv_width}×{self.lv_height} px · "
-            f"1 pixel proudu = {interp:.2f} px senzoru{crop}"
-        )
+        if self.binned:
+            return f"overview 3x3 binnig {OVERVIEW_SCALE:g}:1 px proudu"
+        assert self.roi is not None
+        return (f"ROI {self.roi.width}x{self.roi.height} px "
+                f"na [{self.roi.x}, {self.roi.y}] — 1:1 bez binningu")
 
 
-def detail_for(
-    rate: int,
-    lv_width: int,
-    lv_height: int,
-    sensor: SensorSize = SensorSize(),
-) -> StreamDetail:
-    """Real detail of the stream at one body-side zoom rate.
+def overview_detail() -> StreamDetail:
+    return StreamDetail(binned=True, roi=None,
+                        sensor_px_per_lv_px=OVERVIEW_SCALE)
 
-    An unknown rate is treated as whole-frame rather than guessed at, because
-    over-claiming detail is the failure mode that would mislead focusing.
+
+def roi_detail(roi: Roi) -> StreamDetail:
+    return StreamDetail(binned=False, roi=roi, sensor_px_per_lv_px=1.0)
+
+
+def overview_to_sensor(u: float, v: float) -> tuple[float, float]:
+    """Overview stream coordinates -> full-resolution sensor coordinates."""
+    return (u * OVERVIEW_SCALE, v * OVERVIEW_SCALE)
+
+
+def roi_for_center(sensor_x: int, sensor_y: int, sensor: SensorSize,
+                   size: int = ZOOM_ROI_SIZE) -> Roi:
+    """ROI window of ``size`` px centred on a sensor point, clamped inside."""
+    half = size // 2
+    return Roi(sensor_x - half, sensor_y - half, size, size).clamped(sensor)
+
+
+def stream_plan(zoom: float,
+                sensor: SensorSize,
+                center_uv: tuple[float, float] | None = None,
+                roi_size: int = ZOOM_ROI_SIZE) -> StreamDetail | None:
+    """What the stream should be for this view: ``None`` = binned overview,
+    otherwise a concrete hardware ROI.
+
+    Rule: keep the binned overview while it is honest on screen — one
+    overview pixel stands for 3x3 sensor pixels, so displaying it at up to
+    ``OVERVIEW_SCALE``x still shows one real sensor pixel per screen pixel.
+    Past that the only honest detail is 1:1 sensor data, i.e. a hardware ROI.
+    ``center_uv`` is the current view center in *overview* coordinates (what
+    the widget knows); it maps linearly onto the sensor.
     """
-    whole = sensor.width / max(lv_width, 1)
-    factor = BODY_ZOOM_SENSOR_PX_PER_LV_PX.get(rate, None)
-    if factor is None:
-        return StreamDetail(rate, lv_width, lv_height, whole, 1.0)
-    return StreamDetail(
-        rate=rate,
-        lv_width=lv_width,
-        lv_height=lv_height,
-        sensor_px_per_lv_px=factor,
-        crop_fraction=min(1.0, factor / whole) if whole else 1.0,
-    )
+    if zoom == FIT or zoom < OVERVIEW_SCALE:
+        return None
+    if center_uv is None:
+        center_uv = (sensor.width / OVERVIEW_SCALE / 2,
+                     sensor.height / OVERVIEW_SCALE / 2)
+    sx, sy = overview_to_sensor(*center_uv)
+    return roi_detail(roi_for_center(int(sx), int(sy), sensor, size=roi_size))
 
 
-def choose_body_rate(
-    zoom: float,
-    widget_width: int,
-    widget_height: int,
-    lv_width: int,
-    lv_height: int,
-    sensor: SensorSize = SensorSize(),
-    available_rates: tuple[int, ...] | None = None,
-) -> int:
-    """Which body-side zoom rate serves ``zoom`` with the least crop.
-
-    Small display scales (Fit and the low percentages) want the whole frame —
-    cropping away 75 % of it to sharpen a fit-to-window overview would be
-    worse, not better. Once the requested scale implies more than
-    :data:`HONEST_INTERPOLATION_LIMIT` upscaling from the whole-frame stream,
-    the crop is what buys the detail and is worth taking: pick the shallowest
-    rate that keeps interpolation at or under that limit, so the visible crop
-    stays as large as possible.
-    """
-    rates = available_rates or tuple(BODY_ZOOM_SENSOR_PX_PER_LV_PX)
+def display_scale(zoom: float, sensor: SensorSize,
+                  widget_w: int, widget_h: int) -> float:
+    """Effective screen px per *sensor* px for the requested display zoom."""
     if zoom == FIT:
-        return ZOOM_ALL
-    # Operator-visible rule ("nedělej ořez"): below 1:1 nobody is judging
-    # grain, they are judging the frame — and the body's zoomed stream is a
-    # 43%x48% window at best. Interpolating an overview is honest; cutting off
-    # the picture is not.
-    if zoom < MIN_ZOOM_FOR_BODY_CROP:
-        return ZOOM_ALL if ZOOM_ALL in rates else _widest(rates, lv_width, lv_height, sensor)
-    whole = detail_for(ZOOM_ALL, lv_width, lv_height, sensor)
-    # If the whole-frame stream already serves the request without inventing
-    # more than the limit, never crop: overview scales want to see the frame.
-    if whole.interpolation_at(zoom) <= HONEST_INTERPOLATION_LIMIT:
-        return ZOOM_ALL if ZOOM_ALL in rates else _widest(rates, lv_width, lv_height, sensor)
-    candidates = [
-        r for r in rates
-        if detail_for(r, lv_width, lv_height, sensor).interpolation_at(zoom)
-        <= HONEST_INTERPOLATION_LIMIT
-    ]
-    if not candidates:
-        # Nothing serves the request: give the deepest crop available, which is
-        # the closest to honest, and let the UI flag the invention. Deepest ==
-        # *smallest* sensor-px-per-LV-px factor — not max(rates): the enum
-        # values 13 %/17 % (7/8) are shallower crops than 200 % despite higher
-        # numbers, so ordering by value is wrong.
-        return min(rates, key=lambda r: detail_for(r, lv_width, lv_height, sensor).sensor_px_per_lv_px)
-    # Best == delivered pixels landing nearest one-per-screen-pixel (native,
-    # neither stretched nor averaged away), i.e. min |log2(interpolation)|.
-    # At an exact tie the larger visible crop (shallower rate) wins.
-    return min(
-        candidates,
-        key=lambda r: (
-            abs(math.log2(detail_for(r, lv_width, lv_height, sensor)
-                                .interpolation_at(zoom) or 1e-9)),
-            -detail_for(r, lv_width, lv_height, sensor).crop_fraction,
-        ),
-    )
-
-
-def _widest(rates, lv_width: int, lv_height: int, sensor: SensorSize) -> int:
-    """The rate showing the largest frame area — for a backend lacking ZOOM_ALL.
-
-    Not ``max(rates)``: with the 13 %/17 % enum values (7/8) the numeric
-    ordering no longer matches the crop ordering, so compare actual factors.
-    """
-    return max(
-        rates,
-        key=lambda r: detail_for(r, lv_width, lv_height, sensor).sensor_px_per_lv_px,
-    )
-
-
-def display_scale(
-    zoom: float, sensor: SensorSize, widget_width: int, widget_height: int
-) -> float:
-    """Resolve :data:`FIT` into a screen-pixels-per-sensor-pixel number."""
-    if zoom != FIT:
-        return zoom
-    return sensor.fit_scale(widget_width, widget_height)
-
-
-def is_honest(zoom: float, detail: StreamDetail,
-              sensor: SensorSize = SensorSize(),
-              widget_width: int = 0, widget_height: int = 0) -> bool:
-    """True when the requested scale is met without inventing pixels."""
-    return detail.interpolation_at(
-        display_scale(zoom, sensor, widget_width, widget_height)
-    ) <= HONEST_INTERPOLATION_LIMIT
+        return sensor.fit_scale(widget_w, widget_h)
+    return zoom / OVERVIEW_SCALE  # stream px are overview px by default

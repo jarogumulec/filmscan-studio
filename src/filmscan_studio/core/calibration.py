@@ -38,7 +38,9 @@ class CalibrationStack:
     """Averaged calibration frames in raw DN, plus the exposure they were shot at."""
 
     shutter: float
-    iso: int
+    #: Recorded provenance only — dark current does not scale with ISO or
+    #: electronic gain, so calibration maths never reads it.
+    iso: int | None = None
     aperture: float | None = None
     #: Mean of the contributing frames, in raw DN, same mosaic geometry as scans.
     data: np.ndarray | None = None

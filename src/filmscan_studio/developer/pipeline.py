@@ -2,26 +2,21 @@
 
 The chain the brief specifies::
 
-    RAW
+    RAW (16-bit mono TIFF)
      -> dark correction
      -> flat correction
-     -> demosaic
      -> base subtraction
      -> invert
      -> exposure adjustment
      -> filmic curve
      -> 16-bit TIFF
 
-Three structural choices worth stating:
+Two structural choices worth stating:
 
-* **Calibration happens on mosaic data, before demosaicing.** Dark current and
-  pixel sensitivity are per-site properties; correcting after interpolation
-  smears a per-pixel gain map across four pixels and defeats the point.
-* **LibRaw still does the interpolation.** Calibrated data is written back into
-  rawpy's own mosaic buffer and ``postprocess`` is called on it, verified to be
-  an exact identity mapping with ``user_black=0, no_auto_scale=True`` (a staircase
-  of known values round-trips to 1e-4). So the project honours its own rule of
-  not inventing a demosaicer while still interpolating calibrated data.
+* **Calibration happens on raw sensor data, per site.** Dark current and pixel
+  sensitivity are per-pixel properties, so the correction precedes every
+  interpolation or resize. The mono sensor makes this the whole story: there
+  is no demosaic step anywhere.
 * **The pipeline is pure.** Same inputs, same bytes. Applied parameters come out
   in the result with a fingerprint, so reproducibility is checkable rather than
   claimed.
@@ -38,7 +33,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import rawpy
 
 from filmscan_studio.core.calibration import (
     CalibrationStack,
@@ -54,26 +48,12 @@ from filmscan_studio.core.rawio import RawFrame, open_frame
 
 log = logging.getLogger(__name__)
 
-LUMA = np.array([0.2126, 0.7152, 0.0722])
-#: LibRaw is used only as an interpolator here, so no white balance: a colour cast
-#: would bias the per-channel base subtraction that follows.
-_DEMOSAIC_PARAMS = dict(
-    use_camera_wb=False,
-    no_auto_bright=True,
-    output_bps=16,
-    gamma=(1.0, 1.0),
-    user_black=0,
-    no_auto_scale=True,
-)
-
 
 @dataclass(frozen=True)
 class DeveloperParams:
     """Everything that determines an export's pixels."""
 
     positive: PositiveParams = field(default_factory=PositiveParams)
-    #: Downscale factor for quick look; 1 is full resolution.
-    half_size: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -157,39 +137,15 @@ class DeveloperPipeline:
     # ------------------------------------------------------------------ develop
 
     def develop(self, frame: RawFrame, params: DeveloperParams, shutter: float | None = None) -> DeveloperResult:
-        """Monochrome develop straight from a mosaic frame.
+        """Mono develop of one raw frame — the whole pipeline, end to end.
 
-        Used for BW film, where there is nothing to interpolate and the mosaic is
-        the image. Also the fast path for live-ish previews of colour film.
+        The sensor is monochrome: the raw data *is* the image, no interpolation
+        step exists between calibration and the tone curve.
         """
         # _calibrate already returns normalised 0..1 data; do not re-normalise.
         calibrated = self._calibrate(frame, shutter)
         image = _positive_from_linear(calibrated, params.positive)
         return self._result(image, params, frame.path)
-
-    def develop_colour(self, path: str | Path, params: DeveloperParams) -> DeveloperResult:
-        """Full-quality colour develop of a raw file.
-
-        Calibrated mosaic data is written back into rawpy's buffer and LibRaw
-        interpolates that, so the flat-field gain map is applied per mosaic site
-        (correct) rather than per interpolated pixel (not). The original file is
-        opened read-only and never modified; only the in-memory buffer changes.
-        """
-        p = Path(path)
-        with rawpy.imread(str(p)) as raw:
-            black, white = _levels(raw)
-            shutter = _shutter_of(raw)
-            buffer_view = raw.raw_image_visible
-            # Above-black, scaled into the domain LibRaw interpolates. ``user_black=0``
-            # and ``no_auto_scale=True`` make the postprocess mapping an exact
-            # identity -- verified bit-exact against a staircase test on a real NEF
-            # -- so the calibrated values are interpolated untouched.
-            above_black = self._calibrate_above_black(buffer_view, black, shutter)
-            dn = np.clip(above_black + black, black, white)
-            buffer_view[:] = (dn / white * 65535.0).astype(np.uint16)
-            rgb = raw.postprocess(half_size=params.half_size, **_DEMOSAIC_PARAMS).astype(np.float64) / 65535.0
-        image = _positive_rgb(rgb, params.positive)
-        return self._result(image, params, p)
 
     # ----------------------------------------------------------------- internals
 
@@ -275,21 +231,6 @@ class DeveloperPipeline:
         return tuple(names)
 
 
-def _normalise(data: np.ndarray, black: float, white: float) -> np.ndarray:
-    span = white - black
-    if span <= 0:
-        raise ValueError("white_level must exceed black_level")
-    return (np.asarray(data, dtype=np.float64) - black) / span
-
-
-def _levels(raw: rawpy.RawPy) -> tuple[float, float]:
-    return float(np.mean(raw.black_level_per_channel)), float(raw.white_level)
-
-
-def _shutter_of(raw: rawpy.RawPy) -> float:
-    return float(raw.other.shutter_speed) or 1.0
-
-
 def _positive_from_linear(linear01: np.ndarray, params: PositiveParams) -> np.ndarray:
     """Base subtraction, inversion, exposure and filmic on 2-D linear data."""
     return params.profile.apply(
@@ -305,24 +246,6 @@ def _stage_to_positive(linear01: np.ndarray, params: PositiveParams) -> np.ndarr
     if base is None:
         base = estimate_base(linear01, params.base_percentile)
     return subtract_base(linear01, base)
-
-
-def _positive_rgb(rgb: np.ndarray, params: PositiveParams) -> np.ndarray:
-    """The same tone stages on a colour frame.
-
-    The base level is measured once on luminance and applied to all three
-    channels. Measuring it per channel would let sensor noise in the base pick the
-    base level three different ways, which shows up as a colour cast that grows as
-    the base is raised.
-    """
-    x = np.clip(rgb, 0.0, 1.0)
-    if params.invert:
-        lum = x @ LUMA
-        base = params.base_level
-        if base is None:
-            base = estimate_base(lum, params.base_percentile)
-        x = subtract_base(x, base)
-    return params.profile.apply(exposure_to_linear(x, params.exposure_ev))
 
 
 def write_tiff(result: DeveloperResult, destination: str | Path, bits: int = 16) -> Path:
@@ -367,7 +290,7 @@ def sidecar_for(result: DeveloperResult, processed_at: datetime | None = None) -
         "source": str(result.source) if result.source else None,
         "processed_at": (processed_at or datetime.now().astimezone()).isoformat(),
         "pipeline": [
-            "dark", "flat", "demosaic", "base_subtraction", "invert",
+            "dark", "flat", "base_subtraction", "invert",
             "exposure", "filmic",
         ],
         "calibration": list(result.calibration_used),

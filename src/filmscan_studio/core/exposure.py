@@ -1,4 +1,4 @@
-"""Exposure arithmetic and the auto-exposure controller.
+"""Exposure arithmetic and metering helpers.
 
 Two hard rules from the project brief live here:
 
@@ -9,11 +9,18 @@ Two hard rules from the project brief live here:
 2. Auto-exposure targets a high percentile (99.9), not the brightest pixel, and
    keeps a safety margin of 0.3-0.5 EV below clipping so a single hot pixel or a
    dust speck cannot push real detail out of range.
+
+The acquisition camera (Touptek TS2600MP-G2) has no ISO ladder: sensitivity is
+a continuous analog ``gain`` (linear multiplier, 1.0 = 1x). ``iso`` remains on
+:data:`ExposureSettings` as ``None``-able for backends that report one; the
+archival rule is identical -- gain stays at the noise floor and exposure lives
+in the shutter.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -21,10 +28,11 @@ import numpy as np
 #: Required headroom below clipping, in stops. Brief specifies 0.3-0.5 EV.
 DEFAULT_HEADROOM_EV = 0.4
 
-#: The archival scan's fixed sensitivity (2026-09 brief): D750 native base.
-#: Scanning is a transmission measurement — exposure lives in the shutter,
-#: ISO stays pinned so every frame of a film is the same measurement.
-ARCHIVE_ISO = 100
+#: The archival scan's fixed sensitivity (2026-09 brief): the camera's noise
+#: floor. Scanning is a transmission measurement — exposure lives in the
+#: shutter, gain stays pinned so every frame of a film is the same measurement.
+#: On the IMX571 at HCG this is gain = 1.0 (the SDK's 1000 permille).
+ARCHIVE_GAIN = 1.0
 
 #: Percentile of the linear signal used as the "brightest real value".
 DEFAULT_METER_PERCENTILE = 99.9
@@ -33,8 +41,8 @@ DEFAULT_METER_PERCENTILE = 99.9
 #: unreliable (a hint that the dark frame has drifted).
 BLACK_FLOOR_SANITY_RATIO = 0.001
 
-#: Full-scale value for the D750's 14-bit ADC.
-D750_WHITE_LEVEL = 16383.0
+#: Full-scale value for the Touptek's native 16-bit ADC.
+WHITE_LEVEL_16BIT = 65535.0
 
 
 @dataclass(frozen=True)
@@ -47,23 +55,32 @@ class ExposureSettings:
     """
 
     shutter: float = 1.0
-    iso: int = 100
+    #: Legacy body sensitivity ladder value; ``None`` on cameras without one.
+    iso: int | None = 100
+    #: Analog gain as a linear multiplier (1.0 = 1x). The Touptek's only
+    #: sensitivity control; ``None`` on bodies that speak ISO instead.
+    gain: float | None = None
     aperture: float | None = None
 
     def __post_init__(self) -> None:
         if self.shutter <= 0:
             raise ValueError("shutter must be a positive number of seconds")
-        if self.iso <= 0:
+        if self.iso is not None and self.iso <= 0:
             raise ValueError("iso must be positive")
+        if self.gain is not None and self.gain <= 0:
+            raise ValueError("gain must be a positive multiplier")
 
     def with_shutter(self, shutter: float) -> ExposureSettings:
-        return ExposureSettings(shutter, self.iso, self.aperture)
+        return ExposureSettings(shutter, self.iso, self.gain, self.aperture)
 
     def with_iso(self, iso: int) -> ExposureSettings:
-        return ExposureSettings(self.shutter, iso, self.aperture)
+        return ExposureSettings(self.shutter, iso, self.gain, self.aperture)
+
+    def with_gain(self, gain: float) -> ExposureSettings:
+        return ExposureSettings(self.shutter, self.iso, gain, self.aperture)
 
     def with_aperture(self, aperture: float | None) -> ExposureSettings:
-        return ExposureSettings(self.shutter, self.iso, aperture)
+        return ExposureSettings(self.shutter, self.iso, self.gain, aperture)
 
     def stops_between(self, other: ExposureSettings) -> float:
         """EV difference from this setting to ``other`` (positive = other is brighter)."""
@@ -72,7 +89,9 @@ class ExposureSettings:
     @property
     def exposure_factor(self) -> float:
         """Relative exposure, proportional to shutter/ISO and inversely to N^2."""
-        base = self.shutter * (100.0 / self.iso)
+        base = self.shutter * (100.0 / self.iso if self.iso is not None else 1.0)
+        if self.gain is not None:
+            base /= self.gain
         if self.aperture:
             base /= self.aperture**2
         return base
@@ -83,9 +102,30 @@ class ExposureSettings:
             return f"{self.shutter:g}"
         return f"1/{round(1 / self.shutter)}"
 
+    def sensitivity_string(self) -> str:
+        """How the camera's sensitivity is labelled: ISO or gain."""
+        if self.gain is not None:
+            return f"gain {self.gain:.2f}x"
+        return f"ISO {self.iso}" if self.iso is not None else "citlivost —"
+
     def __str__(self) -> str:
         ap = f" f/{self.aperture:g}" if self.aperture else ""
-        return f"{self.shutter_string()}s ISO{self.iso}{ap}"
+        return f"{self.shutter_string()}s {self.sensitivity_string()}{ap}"
+
+
+#: '1/60', '2.5', '0.0400 s' -> seconds. None for non-numeric speeds ('Bulb').
+_SHUTTER_RE = re.compile(r"^\s*(?:(\d+)\s*/\s*(\d+)|(\d+(?:\.\d+)?))")
+
+
+def parse_shutter(value: str) -> float | None:
+    """Parse a shutter speed written by a human or a camera into seconds."""
+    m = _SHUTTER_RE.match(value)
+    if not m:
+        return None
+    num, den, whole = m.groups()
+    if num is not None:
+        return int(num) / int(den) if int(den) else None
+    return float(whole)
 
 
 @dataclass(frozen=True)
@@ -140,8 +180,8 @@ def measure(
 ) -> MeterReading:
     """Summarise a linear sensor array.
 
-    ``linear`` is raw, demosaic-free sensor data (or a linear preview). No gamma
-    and no inversion may have been applied -- see the module docstring.
+    ``linear`` is raw sensor data (or a linear preview). No gamma and no
+    inversion may have been applied -- see the module docstring.
     """
     data = np.asarray(linear, dtype=np.float64)
     if data.size == 0:
@@ -150,8 +190,8 @@ def measure(
     span = white_level - black_level
     if span <= 0:
         raise ValueError("white_level must exceed black_level")
-    # One ten-thousandth of range: meaningful for raw DN (~1.6 DN) and for
-    # normalised 0..1 data alike.
+    # One ten-thousandth of range: meaningful for raw DN (span 65535 -> ~6.6 DN)
+    # and for normalised 0..1 data alike.
     near_black = black_level + span * 1e-4
 
     span_norm = (data - black_level) / span
@@ -171,7 +211,7 @@ def measure(
 
 def signal_at_target(headroom_ev: float = DEFAULT_HEADROOM_EV,
                      black_level: float = 0.0,
-                     white_level: float = D750_WHITE_LEVEL) -> float:
+                     white_level: float = WHITE_LEVEL_16BIT) -> float:
     """Raw DN that the 99.9th percentile should land on for a given headroom."""
     if headroom_ev < 0:
         raise ValueError("headroom must be non-negative")
@@ -186,14 +226,14 @@ def required_ev_change(
 ) -> float:
     """Stops to add (positive) or remove (negative) so highlights land on target.
 
-    Purely multiplicative in the linear domain, so it is valid for any ISO or
-    shutter combination and independent of the film's density curve.
+    Purely multiplicative in the linear domain, so it is valid for any
+    shutter/gain combination and independent of the film's density curve.
     """
     target = signal_at_target(headroom_ev, reading.black_level, reading.white_level)
     current = reading.signal_p999 - reading.black_level
     # Threshold is a fraction of the range, not an absolute DN: metering runs on
-    # raw DN (span ~15800) and on normalised 0..1 data alike, and a "+1 DN" floor
-    # would reject every normalised reading as "at black".
+    # raw DN (span ~65535) and on normalised 0..1 data alike, and a "+1 DN"
+    # floor would reject every normalised reading as "at black".
     floor = (reading.white_level - reading.black_level) * 1e-4
     if current <= floor:
         raise ValueError("signál je na černé; nelze měřit")
@@ -208,21 +248,32 @@ def choose_shutter(
 ) -> float:
     """Pick the closest available shutter speed that applies ``delta_ev``.
 
-    Shutter is the only actuator the D750 exposes over USB (aperture is on the
-    lens), so shutter alone absorbs the correction. If no candidate is within a
-    stop of the ideal, the ideal is still clamped into the available range --
-    better a partially corrected frame than a silently uncorrected one.
+    Shutter is the archival actuator, so shutter alone absorbs the correction.
+    If no candidate is within a stop of the ideal, the ideal is still clamped
+    into the available range -- better a partially corrected frame than a
+    silently uncorrected one.
     """
     if not candidates:
         raise ValueError("no shutter candidates")
     ideal = current.shutter * 2.0**delta_ev
     ordered = sorted(candidates, key=lambda s: abs(math.log2(s / ideal)))
-    best = ordered[0]
-    if prefer_aperture is not None and abs(math.log2(best / ideal)) > 1.0:
-        # Far from ideal: the operator should know, but we still return the best
-        # available so the caller can report rather than guess.
-        return best
-    return best
+    return ordered[0]
+
+
+def choose_gain(
+    current: ExposureSettings,
+    delta_ev: float,
+    gain_range: tuple[float, float],
+) -> float:
+    """Gain multiplier that applies ``delta_ev``, clamped to the camera's range.
+
+    Only consulted once the shutter has run out of practical range (the
+    archival rule keeps gain at the noise floor otherwise); gain multiplies the
+    signal linearly, so the ideal is ``current * 2**delta``.
+    """
+    low, high = gain_range
+    ideal = (current.gain or 1.0) * 2.0**delta_ev
+    return max(low, min(high, ideal))
 
 
 def clamp_ev(ev: float, limits: tuple[float, float] = (-12.0, 20.0)) -> float:
@@ -234,10 +285,10 @@ def normalisation_exposure_factor(
 ) -> float:
     """Factor to scale a calibration frame onto a scan's exposure.
 
-    Assumes ``RAW signal ∝ exposure time`` at fixed illumination, which holds for
-    the D750 in its linear range. Dark frames must be scaled by shutter *ratio*
-    only -- ISO gain must not be folded in, because dark current does not scale
-    with sensor gain the way photon signal does. Flat frames, being illuminated,
-    do scale with the full exposure factor.
+    Assumes ``RAW signal ∝ exposure time`` at fixed illumination, which holds
+    for the sensor in its linear range. Dark frames must be scaled by shutter
+    *ratio* only -- gain must not be folded in, because dark current does not
+    scale with sensor gain the way photon signal does. Flat frames, being
+    illuminated, do scale with the full exposure factor.
     """
     return capture_exposure.shutter / reference_exposure.shutter

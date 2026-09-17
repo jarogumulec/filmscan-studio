@@ -4,12 +4,12 @@
 
 Design decisions worth stating:
 
-* **Frames are never rewritten.** Every artefact this session produces is a raw
-  file copied off the camera plus a JSON sidecar. The NEF on disk is byte-for-byte
-  what the camera wrote.
-* **Dark and flat are captured, not assumed.** Each records its own shutter and
-  ISO so the developer can normalise by exposure ratio later; nothing requires
-  them to match the scans.
+* **Frames are never rewritten.** Every artefact this session produces is the
+  16-bit TIFF the backend wrote plus a JSON sidecar. Nothing re-encodes pixels.
+* **Dark and flat are captured, not assumed.** Each records its own shutter,
+  gain and sensor temperature so the developer can normalise by exposure ratio
+  later; nothing requires them to match the scans, but a temperature mismatch
+  beyond ``DARK_TEMPERATURE_TOLERANCE_C`` is flagged at export.
 * **Frame numbering follows the film**, not the capture order, because the
   operator advances the film holder by hand and needs the file name to match the
   frame number written on the canister.
@@ -31,14 +31,19 @@ from filmscan_studio.core.models import (
     CaptureRecord,
     FilmMetadata,
     FrameKind,
-    ImageFormat,
     to_json_dict,
 )
-from filmscan_studio.core.rawio import RawFrame, jpeg_dimensions, open_frame
+from filmscan_studio.core.rawio import RawFrame, open_frame
+
+#: A dark may only be subtracted from a scan captured within this thermal
+#: window of it (degC). Dark current roughly halves per ~6 degC drop, so a
+#: mismatch of more than half a degree leaves a visible residual gradient.
+DARK_TEMPERATURE_TOLERANCE_C = 0.5
 
 log = logging.getLogger(__name__)
 
-#: Injectable so tests can supply frames without LibRaw. Defaults to the real reader.
+#: Injectable so tests can stand in their own frame reader. Defaults to the
+#: real TIFF reader.
 FrameReader = Callable[[Path], RawFrame]
 
 
@@ -120,9 +125,8 @@ class CaptureSession:
         self._operator = operator or film.operator
         self._last_error: str | None = None
         self._pending_frame_number: int | None = None
-        #: When True (and the backend supports it) captures release the shutter
-        #: without ending Live View — the mirror stays raised between frames.
-        #: The GUI flips this off for a body that proved it refuses the path.
+        #: When True the backend resumes the Live View mode it had before the
+        #: capture (overview/ROI) instead of leaving the stream stopped.
         self.keep_live_view = keep_live_view
         self.catalog.upsert_film(film)
 
@@ -183,29 +187,17 @@ class CaptureSession:
         self, result: CaptureResult, kind: FrameKind, frame_number: int | None
     ) -> CaptureRecord:
         """Write the JSON sidecar and the catalog row for one captured file."""
-        is_jpeg = result.file_format == "jpeg"
-        if is_jpeg:
-            # Never rawpy: LibRaw reads it as a broken NEF (b'Input/output
-            # error'). Geometry from the SOF marker, radiometry N/A — a
-            # body-JPEG is a display-referred picture, not sensor data.
-            dims = jpeg_dimensions(result.path)
-            frame = None
-            width, height = dims if dims else (None, None)
-            log.warning(
-                "%s je JPEG, ne RAW (tělo má Compression Level jinou než RAW) "
-                "— pro archivní skenování je to nepoužitelné, viz tlačítko "
-                "Nastavit RAW v okně Capture.", result.path.name)
-        else:
-            frame = self._safe_read(result.path)
-            width = frame.width if frame else None
-            height = frame.height if frame else None
+        frame = self._safe_read(result.path)
+        width = frame.width if frame else None
+        height = frame.height if frame else None
         acquisition = (frame.acquisition if frame else None) or AcquisitionMetadata()
-        # Settings at release win over EXIF for shutter and ISO: a long or bulb
-        # exposure can report a rounded EXIF time that is not what was applied.
+        # Settings at release win over anything embedded in the file: they are
+        # what the operator asked for at the moment of exposure.
         acquisition = acquisition.model_copy(
             update={
                 "exposure_time": result.settings.shutter,
                 "iso": result.settings.iso,
+                "gain": result.settings.gain,
                 "f_number": acquisition.f_number or result.settings.aperture,
                 "capture_date": acquisition.capture_date or datetime.now().astimezone(),
             }
@@ -215,11 +207,11 @@ class CaptureSession:
             frame_number=frame_number,
             kind=kind,
             filename=result.path.name,
-            file_format=ImageFormat.JPEG if is_jpeg else ImageFormat.RAW,
             width=width,
             height=height,
             black_level=frame.black_level if frame else None,
             white_level=frame.white_level if frame else None,
+            sensor_temperature_c=result.sensor_temperature_c,
             film=self.film,
             acquisition=acquisition,
         )
@@ -252,9 +244,42 @@ class CaptureSession:
             last_error=self._last_error,
         )
 
-    def export_project(self) -> Path:
-        """Write the project bundle: catalog dump plus the film record."""
+    def unmatched_scan_frame_numbers(self) -> list[int]:
+        """Scan frame numbers with no dark captured at (nearly) the same temperature.
+
+        Dark subtraction on a TEC-cooled sensor is only valid inside a narrow
+        thermal window — a dark taken 2 degC warmer leaves a positive residual
+        everywhere, one 2 degC colder under-subtracts. A scan whose darks all
+        sit outside ``DARK_TEMPERATURE_TOLERANCE_C`` of its own exposure
+        temperature cannot be calibrated honestly, so export must name it.
+        Scans or darks without a recorded temperature are reported too: unknown
+        is not the same as matching.
+        """
+        darks = [r for r in self.catalog.captures(self.film.film_id, FrameKind.DARK)
+                 if r.sensor_temperature_c is not None]
+        unmatched: list[int] = []
+        for scan in self.catalog.captures(self.film.film_id, FrameKind.SCAN):
+            if scan.sensor_temperature_c is None:
+                unmatched.append(scan.frame_number or 0)
+                continue
+            matched = any(
+                abs(scan.sensor_temperature_c - d.sensor_temperature_c)
+                <= DARK_TEMPERATURE_TOLERANCE_C
+                for d in darks
+            )
+            if not matched:
+                unmatched.append(scan.frame_number or 0)
+        return unmatched
+
+    def export_project(self) -> tuple[Path, list[int]]:
+        """Write the project bundle; returns (path, scan frames lacking a dark).
+
+        The second value is empty in the healthy case; non-empty frame numbers
+        mean the GUI must warn the operator that those scans have no
+        temperature-matched dark (see :meth:`unmatched_scan_frame_numbers`).
+        """
         self.catalog.export_json(self.paths.root / "project_export.json")
+        unmatched = self.unmatched_scan_frame_numbers()
         payload = {
             "schema_version": 1,
             "film": to_json_dict(self.film),
@@ -265,8 +290,9 @@ class CaptureSession:
                 "dark": len(self.catalog.captures(self.film.film_id, FrameKind.DARK)),
                 "flat": len(self.catalog.captures(self.film.film_id, FrameKind.FLAT)),
             },
+            "scans_without_temperature_matched_dark": unmatched,
         }
         self.paths.project.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-        return self.paths.project
+        return self.paths.project, unmatched

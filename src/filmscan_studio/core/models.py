@@ -16,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _now() -> datetime:
@@ -182,7 +182,10 @@ class AcquisitionMetadata(BaseModel):
     camera_serial: str | None = None
     lens: str | None = None
     lens_serial: str | None = None
+    #: Legacy bodies only; gain cameras (Touptek) leave this None.
     iso: int | None = None
+    #: Analog gain as a linear multiplier (1.0 = 1x), the Touptek's sensitivity.
+    gain: float | None = None
     exposure_time: float | None = Field(default=None, description="Seconds.")
     f_number: float | None = None
     focus_distance_m: float | None = None
@@ -207,11 +210,15 @@ class AcquisitionMetadata(BaseModel):
         speed be compared against a scan: radiometrically, sensor signal scales
         with exposure time at fixed illumination.
         """
-        if self.exposure_time is None or self.iso is None or self.f_number is None:
+        # A gain camera's 1.0x plays the role of ISO 100: EV100 compares
+        # exposures, and sensitivity enters as 100/iso == 1.0/gain.
+        sensitivity = self.iso if self.iso is not None else (
+            None if self.gain is None else 100.0 * self.gain)
+        if self.exposure_time is None or sensitivity is None or self.f_number is None:
             return None
         import math
 
-        return math.log2(self.f_number**2 / self.exposure_time * 100.0 / self.iso)
+        return math.log2(self.f_number**2 / self.exposure_time * 100.0 / sensitivity)
 
 
 class CaptureRecord(BaseModel):
@@ -230,6 +237,10 @@ class CaptureRecord(BaseModel):
     height: int | None = None
     black_level: float | None = None
     white_level: float | None = None
+    #: Sensor temperature at exposure, degC. A cooled sensor's dark current is
+    #: a function of temperature, so a scan may only be subtracted by a dark
+    #: captured within a narrow thermal window (see export validation).
+    sensor_temperature_c: float | None = None
     film: FilmMetadata
     acquisition: AcquisitionMetadata = Field(default_factory=AcquisitionMetadata)
     created_at: datetime = Field(default_factory=_now)

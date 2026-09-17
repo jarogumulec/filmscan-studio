@@ -1,13 +1,17 @@
 """Camera abstraction.
 
-Everything above this layer talks to :class:`CameraBackend`, never to gphoto2.
-Two reasons:
+Everything above this layer talks to :class:`CameraBackend`, never to a vendor
+SDK. The seam stays narrow for two reasons:
 
-* The brief makes gphoto2 a *first prototype* that Nikon SDK may replace. Keeping
-  the seam narrow means that swap touches one file.
-* Live View and shutter release cannot be tested without a body in hand, so a
+* The acquisition camera has changed once already (D750 -> Touptek TS2600MP-G2)
+  and a swap should touch one file.
+* Live View and exposure cannot be tested without a sensor in hand, so a
   deterministic mock backend is what lets the GUI, session logic and auto
   exposure be covered by the test suite at all.
+
+A frame here is *linear sensor data*, never an encoded picture: the mono
+IMX571 delivers 16-bit grey with no ISP in the way, so Live View and archive
+frames live in the same radiometric domain.
 """
 
 from __future__ import annotations
@@ -16,25 +20,28 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 from filmscan_studio.core.exposure import ExposureSettings
 
 
 @dataclass(frozen=True)
 class CameraInfo:
-    """What the connected body reported about itself."""
+    """What the connected camera reported about itself."""
 
     model: str
     manufacturer: str | None = None
     serial: str | None = None
     battery_percent: int | None = None
-    #: Shutter speeds the body actually offers, parsed to seconds.
+    #: Shutter speeds the camera actually offers, parsed to seconds.
     shutter_choices: tuple[float, ...] = ()
-    #: ISO values the body actually offers.
+    #: ISO values the camera offers. Empty on gain-only cameras like the
+    #: Touptek, which reports ``gain_range`` instead.
     iso_choices: tuple[int, ...] = ()
-    #: Full-resolution frame size — the NEF, what 1:1 zoom is measured against.
-    #: Not read from the body (no MAID cap verified for it on the D750), so
-    #: backends state it explicitly; ``None`` makes the UI fall back to the
-    #: D750's known 6016x4016 rather than guess from the LV stream.
+    #: Analog gain range as (min, max) linear multipliers, e.g. (1.0, 8.0).
+    gain_range: tuple[float, float] | None = None
+    #: Full-resolution sensor size — what 1:1 zoom and ROI coordinates are
+    #: measured against (6224x4168 on the IMX571).
     sensor_width: int | None = None
     sensor_height: int | None = None
 
@@ -57,16 +64,18 @@ def _num(v: object) -> float:
 
 @dataclass
 class LiveFrame:
-    """One Live View frame.
+    """One Live View frame: linear mono sensor data, already de-interleaved.
 
-    ``jpeg`` holds the compressed frame as delivered by the body. The D750 sends
-    a small (640x424) JPEG over PTP; decoding is left to the caller so this layer
-    stays free of image libraries.
+    ``data`` is a 2-D ``uint16`` (or float) array in native DN — no demosaic,
+    no gamma, no auto-brightness. ``black_level``/``white_level`` describe that
+    frame's range, which may be wider than 16 bits when binning sums pixels.
     """
 
-    jpeg: bytes
-    width: int | None = None
-    height: int | None = None
+    data: np.ndarray
+    width: int
+    height: int
+    black_level: float = 0.0
+    white_level: float = 65535.0
 
 
 @dataclass
@@ -78,42 +87,34 @@ class CaptureResult:
     settings: ExposureSettings
     #: Seconds spent on the exposure plus readout, measured rather than estimated.
     elapsed: float = 0.0
-    #: Where the file was written: memory card or internal RAM.
-    capture_target: str = "card"
-    #: Actual bytes on disk ('nef' | 'jpeg' | 'unknown'), sniffed — the file
-    #: extension is what we asked for, this is what the body delivered.
-    file_format: str = "nef"
-    #: True when Live View had to be cycled for this capture (the body refused
-    #: the mirror-up path). The GUI notes it once and stops demanding the
-    #: mirror-up capture from a body that does not grant it.
-    lv_cycled: bool = False
+    #: Sensor temperature at exposure, in degC. Recorded on every frame
+    #: (dark, flat and scan) because dark subtraction is only valid within a
+    #: narrow thermal window — see ``CaptureSession`` export validation.
+    sensor_temperature_c: float | None = None
+    #: Bits actually delivered, so the developer knows the scale to expect.
+    bit_depth: int = 16
+    notes: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
 class CameraCapabilities:
-    """Which controls the body exposes over the wire.
+    """Which controls the camera exposes over the wire.
 
-    The D750 notably has no aperture control: on a manual Micro-Nikkor the
-    operator sets f-stop on the lens, and the value is only known afterwards from
-    EXIF. Modelling this explicitly keeps the UI honest instead of showing a
-    slider that silently does nothing.
+    Modelled explicitly rather than probed by trial so the UI stays honest
+    instead of showing a slider that silently does nothing.
     """
 
     live_view: bool = True
     shutter: bool = True
-    iso: bool = True
+    #: Sensitivity control in use: ISO ladder, analog gain, or neither.
+    iso: bool = False
+    gain: bool = False
     aperture: bool = False
-    focus_drive: bool = True
-    #: Body can reframe the Live View stream itself (Nikon SDK's
-    #: LiveViewImageZoomRate). gphoto2's capturePreview always sends the whole
-    #: downscaled frame, so the zoomed-detail path is SDK-only.
-    live_view_zoom: bool = False
-    #: Body accepts a still release while Live View runs, i.e. the mirror is
-    #: already up and stays up across the capture (Nikon SDK / D750 — the
-    #: vibration-free path for scanning). Backends without it end Live View
-    #: before each capture, which drops and re-raises the mirror and blurs the
-    #: frame vertically (the 2026-09 complaint).
-    capture_in_live_view: bool = False
+    focus_drive: bool = False
+    #: Stream can be reframed by the sensor itself (hardware ROI / binning).
+    live_view_zoom: bool = True
+    #: TEC cooler with a readable sensor temperature and a setpoint.
+    cooling: bool = False
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -136,9 +137,21 @@ class CameraBackend(ABC):
     def set_shutter(self, seconds: float) -> float:
         """Apply the closest supported speed; returns what the camera accepted."""
 
-    @abstractmethod
     def set_iso(self, iso: int) -> int:
-        """Apply the closest supported ISO; returns what the camera accepted."""
+        """Apply the closest supported ISO (bodies with an ISO ladder only)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} ovládá citlivost gainem, ne ISO"
+        )
+
+    def set_gain(self, gain: float) -> float:
+        """Apply analog gain as a linear multiplier; returns what was accepted.
+
+        Optional: only cameras without an ISO ladder (the Touptek) implement
+        it, and the caller checks ``capabilities().gain`` first.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} neumí nastavit gain"
+        )
 
     @abstractmethod
     def start_live_view(self) -> None: ...
@@ -148,43 +161,56 @@ class CameraBackend(ABC):
 
     @abstractmethod
     def next_live_frame(self) -> LiveFrame | None:
-        """Blocking single frame. Returns None when the body offers nothing."""
+        """Blocking single frame. Returns None when the camera offers nothing."""
 
-    def set_live_view_zoom(self, rate: int) -> None:
-        """Ask the body to reframe its Live View stream (core.zoom ZOOM_* rates).
+    def set_live_view_roi(self, roi: tuple[int, int, int, int] | None) -> None:
+        """Reframe the Live View stream: a sensor-pixel ROI, or None for overview.
 
-        Optional: backends without the capability (gphoto2) inherit this
-        no-op-raising default, and the caller checks
-        ``capabilities().live_view_zoom`` first.
+        ``None`` asks for the binned full-sensor overview; an
+        ``(x, y, width, height)`` tuple asks for a 1:1-pixel crop around a point
+        of interest. Coordinates are always in full-sensor pixels.
+
+        Optional: backends without hardware ROI raise, and callers check
+        ``capabilities().live_view_zoom`` first. Must not be called from a
+        streaming callback — route it through the camera worker thread.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} neumí zoom Live View proudu"
-        )
-
-    def set_exposure_ev(self, ev: float) -> float:
-        """Body-side exposure compensation in EV (optional).
-
-        The Nikon SDK exposes ExposureComp as a writable Range cap; gphoto2
-        exposes it variably. Returns the value the body accepted.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} neumí nastavit expoziční korekci"
+            f"{type(self).__name__} neumí měnit řez Live View proudem"
         )
 
     @abstractmethod
     def capture(self, destination: Path, filename_stem: str,
                 keep_live_view: bool = True) -> CaptureResult:
-        """Release the shutter and write the raw file to ``destination``.
+        """Expose and write the 16-bit frame to ``destination``.
 
-        ``keep_live_view`` asks backends that can (see
-        :attr:`CameraCapabilities.capture_in_live_view`) to release without
-        ending Live View, keeping the mirror raised between frames. Backends
-        that cannot end Live View anyway ignore the flag.
+        Always full sensor resolution at native bit depth, whatever the Live
+        View stream was doing — the archive must not inherit a binned or
+        cropped preview. ``keep_live_view`` asks the backend to resume the
+        previous Live View mode afterwards.
         """
 
     @property
     @abstractmethod
     def info(self) -> CameraInfo: ...
+
+    # ------------------------------------------------------------ cooling (optional)
+
+    def get_temperature_c(self) -> float | None:
+        """Current sensor temperature in degC, or None when uncooled."""
+        return None
+
+    def get_target_temperature_c(self) -> float | None:
+        return None
+
+    def set_target_temperature_c(self, temperature_c: float) -> float:
+        raise NotImplementedError(
+            f"{type(self).__name__} nemá chlazení"
+        )
+
+    def set_tec_enabled(self, enabled: bool) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} nemá chlazení"
+        )
 
     def __enter__(self) -> CameraBackend:
         self.connect()
@@ -195,7 +221,7 @@ class CameraBackend(ABC):
 
 
 class CameraError(RuntimeError):
-    """Any failure talking to the body."""
+    """Any failure talking to the camera."""
 
 
 class NotConnectedError(CameraError):

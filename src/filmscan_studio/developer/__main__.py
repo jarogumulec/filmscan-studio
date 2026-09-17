@@ -1,10 +1,11 @@
 """``uv run filmscan-develop RAW [RAW...]`` — batch develop from the command line.
 
 The brief demands strict module separation, and this is the Developer half:
-it never imports the camera layer. It takes raw files plus calibration plus a
-JSON params file and writes 16-bit TIFFs (+ optional JPEG proofs) with metadata
-sidecars. Reproducibility is the point, hence params-from-file rather than a
-pile of flags that cannot be diffed back into a project.
+it never imports the camera layer. It takes archive frames (16-bit mono TIFFs
+with embedded acquisition JSON) plus calibration plus a JSON params file and
+writes 16-bit TIFFs (+ optional JPEG proofs) with metadata sidecars.
+Reproducibility is the point, hence params-from-file rather than a pile of
+flags that cannot be diffed back into a project.
 """
 
 from __future__ import annotations
@@ -12,12 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from pathlib import Path
 
 from filmscan_studio.core.exposure import ExposureSettings
 from filmscan_studio.core.filmic import FilmicProfile
 from filmscan_studio.core.positive import PositiveParams
+from filmscan_studio.core.rawio import RAW_SUFFIX, open_frame
 from filmscan_studio.developer.pipeline import (
     DeveloperParams,
     DeveloperPipeline,
@@ -45,28 +46,26 @@ def _params_from_file(path: Path | None) -> DeveloperParams:
         profile=profile,
         invert=data.get("invert", True),
     )
-    return DeveloperParams(
-        positive=positive, half_size=data.get("half_size", False)
-    )
+    return DeveloperParams(positive=positive)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="filmscan-develop")
-    parser.add_argument("raws", nargs="+", type=Path, help="RAW soubory (NEF/DNG)")
+    parser.add_argument("raws", nargs="+", type=Path,
+                        help=f"archivní snímky ({RAW_SUFFIX})")
     parser.add_argument("-o", "--output", type=Path, default=Path("."))
     parser.add_argument("--dark", type=Path, help="složka nebo soubory dark frameů")
     parser.add_argument("--flat", type=Path, help="složka nebo soubory flat fieldu")
     parser.add_argument(
         "--dark-exposure", type=float,
-        help="času dark frameů v sekundách (přepíše EXIF prvního souboru)",
+        help="expozice dark frameů v sekundách (přepíše vestavěná metadata)",
     )
     parser.add_argument(
         "--flat-exposure", type=float,
-        help="času flatu v sekundách (přepíše EXIF prvního souboru)",
+        help="expozice flatu v sekundách (přepíše vestavěná metadata)",
     )
     parser.add_argument("--params", type=Path, help="JSON s parametry vyvolání")
     parser.add_argument("--jpeg", action="store_true", help="zapsat i JPEG kontrolu")
-    parser.add_argument("--colour", action="store_true", help="barevný průchod (demosaic)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -77,9 +76,10 @@ def main(argv: list[str] | None = None) -> int:
     params = _params_from_file(args.params)
     dark_paths = _expand(args.dark)
     flat_paths = _expand(args.flat)
-    # Calibration exposure comes from EXIF when present -- the whole point of the
-    # brief's "flat need not match scan exposure" rule is that it is *recorded*,
-    # not guessed. Flags override for files with stripped metadata.
+    # Calibration exposure comes from the acquisition JSON embedded in each
+    # frame when present -- the whole point of the brief's "flat need not
+    # match scan exposure" rule is that it is *recorded*, not guessed. Flags
+    # override for files whose metadata was stripped.
     dark_exposure = _exposure_of(dark_paths, args.dark_exposure)
     flat_exposure = _exposure_of(flat_paths, args.flat_exposure)
     pipeline = DeveloperPipeline.from_files(
@@ -91,12 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     failures = 0
     for raw in args.raws:
         try:
-            if args.colour:
-                result = pipeline.develop_colour(raw, params)
-            else:
-                from filmscan_studio.core.rawio import open_frame
-
-                result = pipeline.develop(open_frame(raw), params)
+            result = pipeline.develop(open_frame(raw), params)
             tiff = write_tiff(result, args.output / f"{raw.stem}.tif")
             written = [str(tiff)]
             if args.jpeg:
@@ -115,25 +110,23 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _exposure_of(paths: list[Path], override: float | None) -> ExposureSettings:
-    """EXIF exposure of the first calibration file, or the override."""
+    """Recorded exposure of the first calibration frame, or the override."""
     if override:
-        return ExposureSettings(shutter=override)
+        return ExposureSettings(shutter=override, iso=None)
     if not paths:
         # No calibration frames at all: the value is never consulted, and
         # from_files() ignores it. A placeholder keeps the signature honest.
-        return ExposureSettings(shutter=1.0)
-    if paths:
-        from filmscan_studio.core.rawio import read_exif
-
-        exif = read_exif(paths[0])
-        if exif and exif.exposure_time:
-            return ExposureSettings(
-                shutter=exif.exposure_time,
-                iso=exif.iso or 100,
-                aperture=exif.f_number,
-            )
+        return ExposureSettings(shutter=1.0, iso=None)
+    acquisition = open_frame(paths[0]).acquisition
+    if acquisition.exposure_time:
+        return ExposureSettings(
+            shutter=acquisition.exposure_time,
+            iso=None,
+            gain=acquisition.gain,
+        )
     raise SystemExit(
-        "Kalibrační soubory nemají EXIF čas -- zadej --dark-exposure / --flat-exposure."
+        "Kalibrační soubory nemají zaznamenanou expozici -- zadej "
+        "--dark-exposure / --flat-exposure."
     )
 
 
@@ -144,7 +137,7 @@ def _expand(path: Path | None) -> list[Path]:
         return sorted(
             p
             for p in path.iterdir()
-            if p.suffix.lower() in {".nef", ".dng", ".npy", ".tif", ".tiff"}
+            if p.suffix.lower() in {".tif", ".tiff"}
         )
     return [path]
 
