@@ -168,7 +168,11 @@ def stream_plan(zoom: float,
 
 def display_scale(zoom: float, sensor: SensorSize,
                   widget_w: int, widget_h: int) -> float:
-    """Effective screen px per *sensor* px for the requested display zoom."""
+    """Effective screen px per *sensor* px for the requested display zoom.
+
+    A labelled zoom is already per sensor px (that is what the combobox
+    promises); only Fit resolves against the widget.
+    """
     if zoom == FIT:
         return sensor.fit_scale(widget_w, widget_h)
-    return zoom / OVERVIEW_SCALE  # stream px are overview px by default
+    return zoom

@@ -493,8 +493,9 @@ class TouptekCamera(CameraBackend):
             target = destination / f"{filename_stem}.tif"
             write_frame(target, buf, acquisition=acquisition,
                         black_level=0.0, white_level=WHITE_LEVEL_16BIT)
-            if info.expotime:
-                notes.append(f"expotime hlášen {info.expotime} us")
+            # V4 wraps the V3 record; expotime lives on the inner struct.
+            if info.v3.expotime:
+                notes.append(f"expotime hlášen {info.v3.expotime} us")
         finally:
             try:
                 self._hcam.Stop()

@@ -217,7 +217,9 @@ class MockCamera(CameraBackend):
             size_bytes=target.stat().st_size,
             settings=self._settings,
             elapsed=time.monotonic() - started,
-            sensor_temperature_c=self._temp_c,
+            # An uncooled camera logs no temperature — "unknown" is what the
+            # export validation must see, not a made-up number.
+            sensor_temperature_c=(self._temp_c if self._cooling else None),
             bit_depth=16,
         )
         self._captures.append(result)
