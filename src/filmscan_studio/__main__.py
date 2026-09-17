@@ -16,12 +16,16 @@ def _run_capture(args: argparse.Namespace) -> int:
     from PySide6.QtWidgets import QApplication
 
     from filmscan_studio.capture.mock import MockCamera
+    from filmscan_studio.capture.touptek import TouptekCamera
     from filmscan_studio.gui.capture_window import CaptureWindow
 
     app = QApplication(sys.argv)
-    camera = MockCamera() if args.mock else None
     if args.mock:
+        camera: object = MockCamera()
         camera.connect()
+    else:
+        # Not opened yet: the connect dialog enumerates and opens on demand.
+        camera = TouptekCamera()
     window = CaptureWindow(camera=camera)
     window.show()
     return app.exec()
