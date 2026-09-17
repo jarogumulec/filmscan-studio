@@ -3,6 +3,159 @@
 Vše, co se od posledního stavu změnilo, a hlavně: **co nešlo bez fotoaparátu
 ověřit** a jak to poznat při prvním zapnutí s tělem.
 
+## 2026-09-16 — čtvercový náhled, celé násobky zoomu, WB, zrcadlo nahoře, ISO 100 tvrdě, audit NEFu
+
+Kolo **bez připojeného těla** — vše níže neověřeno na hardwaru, testováno
+proti MockCamera (246 testů). U každého bodu je, jak poznat při prvním
+zapnutí, že to na těle nedělá to, co slibuje.
+
+### 1) „Náhled je pořád ořez čtverec — chcu celé políčko 640×424“
+
+**Příčina (ve kódu):** `ZoomView._crop_rect()` a `_clamp_center()` četly
+`h, w = shape[1], shape[0]` — numpy `shape` je `(výška, šířka)`, takže se
+šířka 640 zaměňovala za výšku. Z proudu 640×424 se řezalo přibližně
+424×424. Opraveno na `shape[0], shape[1]`; Fit teď kreslí celý rám.
+
+### 2) Zoom jen celými násobky — „ať není 3.425×“
+
+Nové `ZoomView.source_zoom()`: zobrazení se snapne na **celý násobek
+proudu** (×1 ×2 ×3 — 3× se vejde na displej); menší požadavky drží ×1 a
+**posouvají se panováním**, nezmenšují. Výjimka: Fit na widgetu menším než
+proud drží přesný zlomkový downscale — tam „vidět celý frame“ předčí
+celistvost. Interpolace je vždy vypnutá (nearest) — zrno se má jevit ostře.
+Poznámka pod zoomem i v obraze teď píše skutečně kreslené `zobrazení ×N`.
+Ověřeno testy (`tests/test_gui.py`: snap na ×1/×2, výplň widgetu).
+
+### 3) Oranžový náhled → BGR/RGB fix + Auto WB uzamčený pro film
+
+- **Skutečná příčina oranžové:** `LiveMeter.decode_live_frame` dekoval
+  OpenCV JPEG jako **BGR** a celý řetězec pak počítal kanály prohozeně.
+  Jeden `cv2.cvtColor` na vstupu — histogram, AE i náhled najednou vidí
+  barvy správně. (Tohle nebyl WB; to bylo prohozené pořadí kanálů.)
+- **Tlačítko Auto WB** (řádek s režimy náhledu): gains se počítají z
+  nejjasnějšího percentile snímku = filmový podklad (u negativu to
+  nejjasnější, co rám nese), měřeno uvnitř červeného AE rámečku, je-li
+  nastaven. Zisky `(r, 1.0, b)` se **uzamknou pro celý film** — per-frame
+  vyvažování by oranžová maska barevného negativu roztančila (dýchající
+  kast). WB těla se záměrně nepoužívá: tělo by si tipovalo samo a kamera
+  WB nemá ani jak zachytit locked neutral pro celý film. Po stisku se zapne
+  Negative náhled, ať je výsledek vidět („ukazovat po vyvážení“). New Film
+  gains resetuje.
+- K ověření na těle: po Auto WB musí být podklad v náhledu neutrálně šedý;
+  při pochybnostech zamíř AE rámeček na proužek čistého podkladu.
+
+### 4) Rychlý live náhled: S-křivka jako LUT („fps mi klesly“)
+
+Celý Working Positive řetězec (WB → base subtract+invert → expozice →
+filmic spline) jsou **tři per-channel mapy a nic víc**, takže se
+předpočítá do tabulek 4096 úrovní na kanál (`FastPositivePreview` v
+`core/positive.py`); spline se vyhodnocuje při změně parametru, ne per
+frame. Base se měří jen každý 12. frame (a po změně parametrů) — base,
+která by cukala každý frame, se jeví jako blikání. Křivka v tabulce je
+*táž* `FilmicProfile` jako při exportu: rychlá cesta je kvantizovaná
+verze pomalé, nikdy jiný vzhled (rozdíl držen pod krok tabulky — test).
+K ověření na těle: po přepnutí na Negative musí fps zůstat srovnatelné
+s RAW View.
+
+### 5) Červený AE rámeček konečně platí i na SDK cestě
+
+Tělní měřič D750 je globální a LV JPEG je auto-brightness (absolutní
+hodnoty nevypovídají nic) — ale **poměr** luminance rámečku ke zbytku
+frame uniformní display gain přežije. `_roi_bias()` změří poměr mediánů
+(rank statistika JPEGem projde), klampuje ±3 EV a Auto Exposure pak cílí
+tělní meter na *rámeček*, ne na celý frame. Cesty bez tělního měřiče
+(gphoto2/mock) měří rámeček přímo — stará cesta zůstává. K ověření na
+těle: tmavý rámeček uvnitř světlého frame musí vést k delšímu času, ne
+ke zkrácení.
+
+### 6) Zrcadlo nahoře: Capture během Live View
+
+Nejzávažnější bod. Dosud Capture LV vypnul → zrcadlo sjelo → expozice →
+zrcadlo vyjelo → **třes, svislé rozostření**. Nová cesta: poller se jen
+**pozastaví** (`LiveViewWorker.pause_polling()` — tělo LV nikdy neopustilo)
+a helper volá `capture_still` při běžícím LV; zrcadlo zůstává nahoře.
+Capability `capture_in_live_view`, flag `keep_live_view` prostoupený
+session → backend → helper. **Záložka v helperu:** pokud tělo při capture
+při LV hodí chybu, zkusí lv_off → capture → lv_on a vrátí `lv_cycled=True`;
+GUI to **jednou** poznamená a dál LV před expozicí vypíná rovnou (cyklovat
+za každou cenu je přesně ten třes, kterému se uniká). gphoto2 zůstává s
+cyklem — PTP při capturePreview still prostě neumí. Záměrně **nepoužity**
+režimy MirrorUp/ExposureDelay (existence na D750 neověřena; ExposureDelay
+hnutí navíc jen odloží, neodstraní).
+
+**NEJISTĚJŠÍ BOD CELÉHO KYCLE — ověřit první:** jestli D750 vůbec dovolí
+expozici při SDK `Capture` za běžícího LV (analýza to čekala, změřeno
+není). Známky selhání: hláška „tělo při Capture vypnulo Live View“, nebo
+zasekané LV po snímku.
+
+### 7) „When ISO isn't 100, don't let me shoot“ — tvrdé pravidlo archivu
+
+`ARCHIVE_ISO = 100` v `core/exposure.py`. Tlačítko **ISO 100** (přejmenováno
+z „ISO min“) pinuje 100; Capture při jakékoli jiné citlivosti **odmítne**
+s hláškou „stiskni ISO 100 a exponuj jen časem“ — tlačítko je šedé se
+stejným tooltipem. Auto Exposure běží s `iso_lock=True` — řeší **časem**,
+ISO nedeforčuje. (Důvod: celý film je jedno měření; měnit citlivost
+uprostřed znamená měnit přenosovou funkci.)
+
+### 8) Post-capture audit NEFu + náhledový JPEG (`capture/quality.py`)
+
+Po každém snímku, mimo UI thread a **bez sahání na fotoaparát** (jen čte
+soubor):
+
+- **Audit** změří dovezený NEF v oblasti červeného rámečku (přepočet z
+  proudu na sensor — **platí jen při Whole zoomu**; při body cropu je
+  pozice výřezu na senzoru neznámá, audit pak meterí celý frame). Cíl =
+  p99.9 na `white · 2^-0.4`. Verdikt `ok` / `over` (blow = >0.01 % pixelů
+  na bílé) / `under`. Při verdiktu ≠ ok **rovnou upraví čas** pro další
+  snímek (`choose_shutter`, jen při ISO 100 — jinak radši nic); stavová
+  řádka hlásí „tento snímek zopakuj“. Exponovaný snímek zachránit nejde —
+  audit existuje proto, aby další seděl.
+- **Náhledový JPEG** `frameNNN.jpg` vedle NEFu: render z RAW (LibRaw
+  demosaic v polovině velikosti; `use_camera_wb` **vypnuto**, jsou-li gains
+  uzamčené — jinak by se korigovalo dvakrát), přes táž
+  `to_working_positive`. Nikdy ne z LV JPEGu — auto-brightness by lhal i v
+  náhledu archivu.
+- K ověření na těle: JPEG musí sedět vedle .NEF, verdikt musí odpovídat
+  skutečné expozici a po záměrné podexpozici se musí čas prodloužit.
+
+### 9) SDK zoom enum 7 a 8 (13 %, 17 %) přidány do žebříku
+
+Hodnoty potvrzeny v SDK tabulce; `BODY_ZOOM_SENSOR_PX_PER_LV_PX` je
+interpretuje jako mělkší crop než 25 % (faktory 1/0.13, 1/0.17 — stejná
+interpretace procent jako u zbytku tabulky, tedy **hypotéza** jako celý
+zbytek tabulky — změř až pravítkem). Vedlejší oprava: `choose_body_rate`
+dřív při neexistenci Whole vrátil `max(rates)` — s enum 7/8, číselně
+většími ale mělkšími než 25 %, to vybírá špatně; teď se srovnává podle
+skutečných faktorů (`_widest`).
+
+### 10) Film dialog — předvyplnění podle reálné sestavy
+
+Placeholdery: Film ID `K16O03_2025`, Fotoaparát `Nikon FM2` (foťák, co film
+exponoval — ne D750, ten má skupina sestava), Objektiv
+`Carl Zeiss MC Biometar 2.8/80, F8.0`, Světlo `LED11x15cm panel 4400 K`.
+**Zrcadlově (lev/prav) je nově implicitně zapnuto** (skenuješ matnou
+stranou k objektivu vždy) — vypne se jen když předchozí film říká opak.
+
+### Drobnosti
+
+- `CAP_SILENT_IMAGE_CAPTURE = 0x8328` **odstraněn** z `nikon_sdk.py` —
+  0x8328 je ve skutečnosti WBPreset Protect3; použití by byla past.
+- Přepnutí režimu náhledu teď hned překreslí i histogram (dřív kurva
+  filmiku přibyla až s dalším frame).
+- `audit_nef`, preview LUT i WB mají vlastní testy
+  (`tests/test_quality.py`; syntetické „NEFy“ přes monkeypatch — rawpy se
+  v testech nevolá).
+
+### Co ověřit při prvním připojení těla (pořadí podle rizika)
+
+1. Capture při LV (bod 6) — zrcadlo má zůstat nahoře, snímek bez chvění;
+   při chybě záložka sama přepne na cyklus a GUI to řekne.
+2. Audit (bod 8) na reálném NEFu — verdikt, korekce času, JPEG vedle NEFu.
+3. Auto WB (bod 3) — podklad musí zůstat neutrální.
+4. Zoom 13 %/17 % (bod 9) — pravítkem změř crop factor, oprav tabulku.
+5. Celé násobky + Fit (body 1–2) — vizuálně, bez měření.
+6. Rychlý LUT náhled (bod 4) — fps v Negative režimu.
+
 ## 2026-09-15 (noc) — AE na tělním měřiči, predikce NEFu, RAW guard, ořez, panel
 
 Druhé kolo se živým tělem. Funguje, změřeno na D750: AE konverguje na

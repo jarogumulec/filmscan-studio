@@ -248,7 +248,10 @@ class TestZoom:
 
     def test_zoomed_view_fills_the_widget(self, qtbot):
         """The 2026-09 complaint: zoomed frames drew from the top-left corner
-        without filling the view. The crop destination must cover the widget."""
+        without filling the view. The crop destination must cover the widget —
+        and since the same month's integer rule, at a whole multiple only: a
+        requested 0.5× of a 1:1 stream clamps UP to ×1 and the view pans, it
+        never shrinks the stream below its native size."""
         view = ZoomView()
         qtbot.addWidget(view)
         view.resize(200, 200)
@@ -256,10 +259,24 @@ class TestZoom:
         view.set_image(np.zeros((400, 400)))
         view.set_source_scale(1.0)
         view.set_zoom(0.5)
+        assert view.source_zoom() == 1.0
         crop, dest = view._crop_rect()
-        assert dest.width() == pytest.approx(200, abs=1)
-        assert dest.height() == pytest.approx(200, abs=1)
+        assert dest.width() >= view.width() - 1
+        assert dest.height() >= view.height() - 1
         assert crop.width() <= 400 and crop.height() <= 400
+
+    def test_zoom_snaps_to_whole_multiples_of_the_stream(self, qtbot):
+        """'ať není 3.425×' — display is whole screen px per stream px."""
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(600, 400)
+        view.show()
+        view.set_image(np.zeros((424, 640)))
+        view.set_source_scale(4.0)          # a body-cropped stream
+        view.set_zoom(0.5)                  # 0.5 * 4 = 2.0 exactly
+        assert view.source_zoom() == 2.0
+        view.set_zoom(0.25)                 # 0.25 * 4 = 1.0
+        assert view.source_zoom() == 1.0
 
     def test_right_click_clears_ae_rect(self, qtbot):
         view = ZoomView()
@@ -365,11 +382,27 @@ class TestExposureControls:
         window.iso_select.setCurrentIndex(index)
         qtbot.waitUntil(lambda: window.camera.get_settings().iso == 400, timeout=2000)
 
-    def test_iso_base_button_uses_lowest_choice(self, window, qtbot):
+    def test_iso_base_button_pins_archival_iso_100(self, window, qtbot):
+        # 2026-09 archival rule: the button pins ISO 100 (the D750's native
+        # base — the scan is one transmission measurement), it no longer drops
+        # to the body's *lowest offered* rung (50 was a Lo extension).
         window.iso_select.setCurrentIndex(window.iso_select.findData(1600))
         qtbot.wait(10)
         window.btn_iso_low.click()
-        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 50, timeout=2000)
+        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 100, timeout=2000)
+
+    def test_capture_blocked_until_iso_100(self, window, qtbot):
+        # "ifo při iso 100 a nastavuj jen expozici": at any other sensitivity
+        # the Capture button is grey and _capture_block_reason says why.
+        window.session = None  # block reason must still speak about ISO path
+        window.iso_select.setCurrentIndex(window.iso_select.findData(400))
+        qtbot.wait(10)
+        assert window._capture_block_reason() is not None
+        assert "ISO 100" in window._capture_block_reason()
+        assert not window.btn_capture.isEnabled()
+        window.btn_iso_low.click()
+        qtbot.waitUntil(lambda: window.camera.get_settings().iso == 100, timeout=2000)
+        assert window._capture_block_reason() is None
 
     def test_shutter_text_edit_snaps_to_ladder(self, window, qtbot):
         window.shutter_edit.setEditText("1/125")

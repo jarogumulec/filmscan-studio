@@ -62,6 +62,7 @@ class LiveViewWorker(QThread):
         self._body_ev_fn = body_ev_fn
         self._min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
         self._running = False
+        self._in_fetch = False
         #: Last successful body exposure-meter reading (EV, log2 domain).
         #: Delivered with every frame so the histogram can be *predicted* to
         #: the exposure the NEF will actually get (see capture_window).
@@ -77,6 +78,12 @@ class LiveViewWorker(QThread):
         #: the Nikon SDK answers GetLiveViewImage with -127 if the teardown
         #: already switched the body's Live View off (observed 2026-09).
         self.leave_live_view = False
+        #: Paused workers keep Live View *on at the body* and only stop
+        #: grabbing frames: the still capture needs the USB pipe and the body's
+        #: full attention, but stopping this thread would run stop_live_view()
+        #: in its teardown, drop the mirror, and shake the camera — the exact
+        #: vertical blur the operator reported (2026-09, "zrcadlo tam lítá").
+        self._paused = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -87,6 +94,25 @@ class LiveViewWorker(QThread):
     def stop(self, wait_ms: int = 3000) -> None:
         self._running = False
         self.wait(wait_ms)
+
+    def pause_polling(self, wait_ms: int = 3000) -> None:
+        """Stop fetching frames; the body stays in Live View (mirror up)."""
+        self._paused = True
+        # Wait until the loop is demonstrably outside next_live_frame: the RPC
+        # pipe serialises, but handing the capture a free pipe *now* beats
+        # racing a frame in flight for it.
+        deadline = wait_ms / 1000.0
+        tick = 0.0
+        while self._in_fetch and tick < deadline:
+            time.sleep(0.01)
+            tick += 0.01
+
+    def resume_polling(self) -> None:
+        self._paused = False
+
+    @property
+    def polling(self) -> bool:
+        return self._running and not self._paused
 
     @property
     def running(self) -> bool:
@@ -103,11 +129,20 @@ class LiveViewWorker(QThread):
             return
         try:
             while self._running:
+                if self._paused:
+                    # Body keeps streaming (mirror stays up); we just let the
+                    # capture own the pipe. Poll cheaply — resume must feel
+                    # instant when the capture lands.
+                    self.msleep(20)
+                    continue
+                self._in_fetch = True
                 try:
                     frame = self._camera.next_live_frame()
                 except Exception as exc:  # noqa: BLE001
+                    self._in_fetch = False
                     self.error.emit(str(exc))
                     break
+                self._in_fetch = False
                 if frame is None:
                     self.msleep(5)
                     continue

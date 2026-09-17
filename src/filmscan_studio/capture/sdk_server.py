@@ -227,13 +227,57 @@ class Server:
 
     # ---------------------------------------------------------------- capture
 
-    def capture(self, destination: str, stem: str) -> dict:
+    def capture(self, destination: str, stem: str,
+                keep_live_view: bool = True) -> dict:
         dest = Path(destination)
         started = time.monotonic()
         # The module keeps the card name it reported on the Item object;
         # capture_still writes exactly what the body sent.
         target = dest / f"{stem}.NEF"
-        self.src.capture_still(target)
+        # Primary path: release while Live View is up, so the mirror never
+        # drops between frames (the vibration the operator saw as vertical
+        # blur). keep_live_view=False forces the old lv_off sequence, used when
+        # the operator disables it or a prior capture proved the body refuses.
+        lv_was = False
+        try:
+            lv_was = self.src.lv_status() == 1
+        except Exception:  # noqa: BLE001 - status read is best effort
+            lv_was = False
+        if keep_live_view:
+            try:
+                self.src.capture_still(target)
+            except Exception as exc:  # noqa: BLE001 - only DeviceBusy-ish falls back
+                if not lv_was:
+                    raise
+                # Body refused a release while Live View ran (or errored
+                # mid-exposure): fall back to lv_off → capture → lv_on so a
+                # shot is still delivered, and tell the caller LV was cycled.
+                self.src.lv_off()
+                try:
+                    self.src.capture_still(target)
+                finally:
+                    try:
+                        self.src.lv_on()
+                    except Exception:  # noqa: BLE001 - caller re-arms LV anyway
+                        pass
+                return self._capture_reply(target, started, lv_cycled=True,
+                                           error=str(exc))
+        else:
+            if lv_was:
+                self.src.lv_off()
+            try:
+                self.src.capture_still(target)
+            finally:
+                if lv_was:
+                    try:
+                        self.src.lv_on()
+                    except Exception:  # noqa: BLE001
+                        pass
+            return self._capture_reply(target, started, lv_cycled=lv_was)
+        return self._capture_reply(target, started, lv_cycled=False)
+
+    def _capture_reply(self, target: Path, started: float, *,
+                       lv_cycled: bool, error: str | None = None) -> dict:
         # The extension is a promise the body does not always keep: with
         # Compression Level != RAW the very same transfer lands as a JPEG
         # (measured 2026-09: JPEG Basic at S 3008x2008, ~1 MB, saved as
@@ -248,10 +292,14 @@ class Server:
             file_format = "nef"
         else:
             file_format = "unknown"
-        return {"path": str(target),
-                "bytes": target.stat().st_size,
-                "elapsed": round(time.monotonic() - started, 2),
-                "file_format": file_format}
+        out = {"path": str(target),
+               "bytes": target.stat().st_size,
+               "elapsed": round(time.monotonic() - started, 2),
+               "file_format": file_format,
+               "lv_cycled": lv_cycled}
+        if error:
+            out["lv_fallback_error"] = error
+        return out
 
     # ------------------------------------------------------------- media caps
 
@@ -328,7 +376,8 @@ def _dispatch(server: Server, req: dict) -> dict:
     if method == "lv_frame":
         return server.lv_frame()
     if method == "capture":
-        return server.capture(req["destination"], req["stem"])
+        return server.capture(req["destination"], req["stem"],
+                              keep_live_view=req.get("keep_live_view", True))
     if method == "media_settings":
         return server.media_settings()
     if method == "set_media":

@@ -48,7 +48,9 @@ ZOOM_LABELS: dict[float, str] = {
 }
 
 #: ``LiveViewImageZoomRate`` element values (eNkMAIDLiveViewImageZoomRate).
-ZOOM_ALL, ZOOM_25, ZOOM_33, ZOOM_50, ZOOM_66, ZOOM_100, ZOOM_200 = range(7)
+#: The SDK enum runs 0..8; 7 (13 %) and 8 (17 %) were confirmed present on the
+#: D750 (2026-09 SDK notes) after the original ladder stopped at 200 %.
+ZOOM_ALL, ZOOM_25, ZOOM_33, ZOOM_50, ZOOM_66, ZOOM_100, ZOOM_200, ZOOM_13, ZOOM_17 = range(9)
 
 #: Sensor pixels represented by one delivered Live View pixel, per rate.
 #:
@@ -56,12 +58,15 @@ ZOOM_ALL, ZOOM_25, ZOOM_33, ZOOM_50, ZOOM_66, ZOOM_100, ZOOM_200 = range(7)
 #: (6016 / 640 ≈ 9.4) and is computed from the actual sizes instead.
 #:
 #: The numbers encode Nikon's documented reading of the percentages as
-#: magnification relative to the sensor's own pixel grid (100 % = 1:1). On the
-#: D750 the LV JPEG stays 640 px wide at every rate (measured — see
+#: magnification relative to the sensor's own pixel grid (100 % = 1:1): a rate
+#: showing X % of the frame's width represents 1/X of the whole-frame factor.
+#: On the D750 the LV JPEG stays 640 px wide at every rate (measured — see
 #: ``sdk_probe_results.json``), so this table *is* the crop model. The deepest
 #: rates have not been verified against a ruler on hardware: run
 #: ``scripts/probe.sh`` and compare its ``crop_factor`` measurements, then
-#: correct this table. Until then the UI prints the assumed figure.
+#: correct this table. Until then the UI prints the assumed figure. The 13 %
+#: and 17 % rows are unverified hypotheses like the rest — the *enum values*
+#: are confirmed, their crop factors are read from the documented meaning.
 BODY_ZOOM_SENSOR_PX_PER_LV_PX: dict[int, float | None] = {
     ZOOM_ALL: None,
     ZOOM_25: 4.0,
@@ -70,6 +75,10 @@ BODY_ZOOM_SENSOR_PX_PER_LV_PX: dict[int, float | None] = {
     ZOOM_66: 1.5,
     ZOOM_100: 1.0,
     ZOOM_200: 0.5,
+    # Same reading as the rows above (factor = 1 / magnification): these sit
+    # *shallower* than 25 % — ~7.7 / ~5.9 sensor px per delivered px.
+    ZOOM_13: 1.0 / 0.13,
+    ZOOM_17: 1.0 / 0.17,
 }
 
 #: Above this interpolation the requested scale is better served by a real
@@ -189,12 +198,12 @@ def choose_body_rate(
     # 43%x48% window at best. Interpolating an overview is honest; cutting off
     # the picture is not.
     if zoom < MIN_ZOOM_FOR_BODY_CROP:
-        return ZOOM_ALL if ZOOM_ALL in rates else max(rates)
+        return ZOOM_ALL if ZOOM_ALL in rates else _widest(rates, lv_width, lv_height, sensor)
     whole = detail_for(ZOOM_ALL, lv_width, lv_height, sensor)
     # If the whole-frame stream already serves the request without inventing
     # more than the limit, never crop: overview scales want to see the frame.
     if whole.interpolation_at(zoom) <= HONEST_INTERPOLATION_LIMIT:
-        return ZOOM_ALL if ZOOM_ALL in rates else max(rates)
+        return ZOOM_ALL if ZOOM_ALL in rates else _widest(rates, lv_width, lv_height, sensor)
     candidates = [
         r for r in rates
         if detail_for(r, lv_width, lv_height, sensor).interpolation_at(zoom)
@@ -202,8 +211,11 @@ def choose_body_rate(
     ]
     if not candidates:
         # Nothing serves the request: give the deepest crop available, which is
-        # the closest to honest, and let the UI flag the invention.
-        return max(rates)
+        # the closest to honest, and let the UI flag the invention. Deepest ==
+        # *smallest* sensor-px-per-LV-px factor — not max(rates): the enum
+        # values 13 %/17 % (7/8) are shallower crops than 200 % despite higher
+        # numbers, so ordering by value is wrong.
+        return min(rates, key=lambda r: detail_for(r, lv_width, lv_height, sensor).sensor_px_per_lv_px)
     # Best == delivered pixels landing nearest one-per-screen-pixel (native,
     # neither stretched nor averaged away), i.e. min |log2(interpolation)|.
     # At an exact tie the larger visible crop (shallower rate) wins.
@@ -214,6 +226,18 @@ def choose_body_rate(
                                 .interpolation_at(zoom) or 1e-9)),
             -detail_for(r, lv_width, lv_height, sensor).crop_fraction,
         ),
+    )
+
+
+def _widest(rates, lv_width: int, lv_height: int, sensor: SensorSize) -> int:
+    """The rate showing the largest frame area — for a backend lacking ZOOM_ALL.
+
+    Not ``max(rates)``: with the 13 %/17 % enum values (7/8) the numeric
+    ordering no longer matches the crop ordering, so compare actual factors.
+    """
+    return max(
+        rates,
+        key=lambda r: detail_for(r, lv_width, lv_height, sensor).sensor_px_per_lv_px,
     )
 
 

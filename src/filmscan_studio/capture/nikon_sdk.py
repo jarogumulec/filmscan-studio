@@ -265,7 +265,9 @@ CAP_CENTER_BUTTON_ON_LIVE_VIEW = 0x8280
 CAP_ZOOM_RATE_ON_LIVE_VIEW = 0x8281
 CAP_LIVE_VIEW_AF = 0x8275
 CAP_TERMINATE_CAPTURE = 0x8318        # verified against header + live D750
-CAP_SILENT_IMAGE_CAPTURE = 0x8328     # 0x8100 + 0x228
+# 0x8328 is WBPreset Protect3 in Maid3d1.h — an earlier draft labelled it
+# "silent capture"; it is *not* and must not be used as one (never verified on
+# the D750, and the probe capability list does not offer it).
 CAP_LIVE_VIEW_EXPOSURE_PREVIEW = 0x8333
 CAP_LIVE_VIEW_SELECTOR = 0x8334
 CAP_LIVE_VIEW_IMAGE_SIZE = 0x8353     # 0x8100 + 0x253

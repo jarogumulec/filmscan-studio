@@ -110,6 +110,7 @@ class CaptureSession:
         paths: SessionPaths,
         operator: str | None = None,
         frame_reader: FrameReader = open_frame,
+        keep_live_view: bool = True,
     ) -> None:
         self.camera = camera
         self.paths = paths
@@ -119,6 +120,10 @@ class CaptureSession:
         self._operator = operator or film.operator
         self._last_error: str | None = None
         self._pending_frame_number: int | None = None
+        #: When True (and the backend supports it) captures release the shutter
+        #: without ending Live View — the mirror stays raised between frames.
+        #: The GUI flips this off for a body that proved it refuses the path.
+        self.keep_live_view = keep_live_view
         self.catalog.upsert_film(film)
 
     # ---------------------------------------------------------------- workflow
@@ -162,7 +167,10 @@ class CaptureSession:
                 else f"{kind.value}_{len(self.catalog.captures(self.film.film_id, kind)) + 1:03d}"
             )
             try:
-                result = self.camera.capture(self.paths.frames, stem)
+                result = self.camera.capture(
+                    self.paths.frames, stem,
+                    keep_live_view=self.keep_live_view,
+                )
             except Exception as exc:  # noqa: BLE001 - surfaced to the GUI via last_error
                 self._last_error = str(exc)
                 log.exception("capture failed")

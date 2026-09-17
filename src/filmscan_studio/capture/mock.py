@@ -82,6 +82,8 @@ class MockCamera(CameraBackend):
         #: synthetic pattern when it changes, like the D750 does.
         self.live_view_zoom_rate = ZOOM_ALL
         self.live_view_zoom_history: list[int] = []
+        #: What the last capture() was asked about Live View (GUI contract).
+        self.last_keep_live_view: bool | None = None
 
     def connect(self) -> CameraInfo:
         self._connected = True
@@ -116,7 +118,8 @@ class MockCamera(CameraBackend):
     def capabilities(self) -> CameraCapabilities:
         # live_view_zoom True so the SDK-only zoomed-detail path is exercised
         # by the GUI tests; the real gphoto2 backend reports False there.
-        return CameraCapabilities(aperture=False, live_view_zoom=True)
+        return CameraCapabilities(aperture=False, live_view_zoom=True,
+                                  capture_in_live_view=True)
 
     def get_settings(self) -> ExposureSettings:
         self._require()
@@ -157,9 +160,13 @@ class MockCamera(CameraBackend):
         self.live_view_zoom_rate = rate
         self.live_view_zoom_history.append(rate)
 
-    def capture(self, destination: Path, filename_stem: str) -> CaptureResult:
+    def capture(self, destination: Path, filename_stem: str,
+                keep_live_view: bool = True) -> CaptureResult:
         self._require()
         started = time.monotonic()
+        # The mock grants the mirror-up path (like the SDK) and records what
+        # was asked, so GUI tests can assert the live view was never stopped.
+        self.last_keep_live_view = keep_live_view
         if self._capture_seconds:
             time.sleep(self._capture_seconds)
         destination.mkdir(parents=True, exist_ok=True)

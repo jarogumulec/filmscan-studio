@@ -154,37 +154,54 @@ class ZoomView(QWidget):
     # ------------------------------------------------------------------ maths
 
     def _display_scale(self) -> float:
-        """Screen pixels per sensor pixel for the current mode."""
+        """Screen pixels per sensor pixel for the current mode (requested)."""
         if self._zoom != FIT:
             return self._zoom
         return self.sensor.fit_scale(self.width(), self.height())
 
+    def source_zoom(self) -> float:
+        """Screen pixels per *source* (stream) pixel actually drawn.
+
+        Focusing is judging grain, and a fractional factor (the old 3.425×)
+        resamples every grain speck and reads as soft at any shutter. The
+        requested display scale is therefore snapped to a whole multiple of
+        the delivered stream: ×1, ×2, ×3. ``Fit`` floors (the whole frame must
+        stay inside the widget), the fixed levels round; both clamp up to ×1,
+        because downscaling a 640px stream throws away detail the body just
+        sent — when the zoomed picture does not fit, the widget pans instead
+        of shrinking it. The one exception is ``Fit`` on a widget *smaller*
+        than the stream: there "see the whole frame" outranks "whole
+        multiples", and an exact fractional downscale is the lesser lie.
+        """
+        if self._image is None:
+            return 1.0
+        requested = self._display_scale() * self._source_scale
+        if self._zoom == FIT and requested < 1.0:
+            return requested
+        return max(1.0, float(round(requested)))
+
     def _crop_rect(self) -> tuple[QRectF, QRectF]:
         """(crop in source px, destination on screen) for the current state.
 
-        Fractional maths on purpose: rounding the crop *size* down and then
-        drawing it at an integer destination left empty margins (the 2026-09
-        complaint: "jen od levého horního rohu, neplní okno"). Now the crop is
-        exactly the widget at the display scale, clamped to the frame at its
-        edges, and the destination covers the full crop — sub-pixel accuracy
-        comes from drawImage's QRectF overload.
+        The destination is always the crop at an exact integer multiple
+        (:meth:`source_zoom`), centred in the widget. ``shape[:2]`` is
+        ``(height, width)`` — reading width first is what produced the
+        near-square crop of the 640×424 stream (the 2026-09 complaint: "náhled
+        je pořád ořez čtverec"). Whole-frame modes copy ``h, w = shape[:2]``.
         """
         if self._image is None:
             return QRectF(), QRectF()
-        h, w = float(self._image.shape[1]), float(self._image.shape[0])
+        h, w = float(self._image.shape[0]), float(self._image.shape[1])
+        k = float(self.source_zoom())
         if self._zoom == FIT:
             # Fit means "see the whole frame": the entire stream, whatever the
             # body's crop — a body-side zoom at Fit would hide most of it.
-            scale = min(self.width() / (w * self._source_scale),
-                        self.height() / (h * self._source_scale))
-            dw, dh = w * self._source_scale * scale, h * self._source_scale * scale
+            dw, dh = w * k, h * k
             return (QRectF(0, 0, w, h),
                     QRectF((self.width() - dw) / 2, (self.height() - dh) / 2, dw, dh))
         self._clamp_center()          # keeps the crop inside the frame
-        # screen px -> source px: divide by (screen/sensor) * (sensor/source)
-        per_source = max(self._display_scale() * self._source_scale, 1e-9)
-        crop_w = min(self.width() / per_source, w)
-        crop_h = min(self.height() / per_source, h)
+        crop_w = min(self.width() / k, w)
+        crop_h = min(self.height() / k, h)
         x0 = np.clip(self._center.x() / self._source_scale - crop_w / 2, 0, w - crop_w)
         y0 = np.clip(self._center.y() / self._source_scale - crop_h / 2, 0, h - crop_h)
         crop = QRectF(float(x0), float(y0), crop_w, crop_h)
@@ -192,17 +209,17 @@ class ZoomView(QWidget):
         # no-op there; it only kicks in when the *whole* frame is smaller than
         # the viewport (low zoom) — letterbox it instead of parking it in the
         # top-left corner, which read as a broken scale.
-        dw, dh = crop_w * per_source, crop_h * per_source
+        dw, dh = crop_w * k, crop_h * k
         dest = QRectF((self.width() - dw) / 2, (self.height() - dh) / 2, dw, dh)
         return crop, dest
 
     def _clamp_center(self) -> None:
         if self._image is None:
             return
-        h, w = float(self._image.shape[1]), float(self._image.shape[0])
-        per_source = max(self._display_scale() * self._source_scale, 1e-9)
-        half_w = self.width() / per_source / 2
-        half_h = self.height() / per_source / 2
+        h, w = float(self._image.shape[0]), float(self._image.shape[1])
+        k = float(self.source_zoom())
+        half_w = self.width() / k / 2
+        half_h = self.height() / k / 2
         cx = self._center.x() / self._source_scale
         cy = self._center.y() / self._source_scale
         cx = float(np.clip(cx, min(half_w, w / 2), max(w - half_w, w / 2)))
@@ -248,8 +265,11 @@ class ZoomView(QWidget):
         if crop.isEmpty():
             return
         image = to_qimage(self._image)
+        # Nearest always: every scale is an integer multiple of the stream
+        # now, and an interpolated grain picture hides focus error — the one
+        # thing this widget exists to show.
         painter.setRenderHint(
-            QPainter.RenderHint.SmoothPixmapTransform, self._zoom == FIT
+            QPainter.RenderHint.SmoothPixmapTransform, False
         )
         painter.drawImage(dest, image, crop)
 
@@ -291,10 +311,10 @@ class ZoomView(QWidget):
         if self._is_panning():
             # Drag the picture: the sensor point grabbed stays under the
             # pointer, which is what "posunuji se fotkou" means physically.
-            per_source = max(self._display_scale() * self._source_scale, 1e-9)
+            k = float(self.source_zoom())
             d = pos - self._drag_current
-            cx = self._center.x() - d.x() / per_source * self._source_scale
-            cy = self._center.y() - d.y() / per_source * self._source_scale
+            cx = self._center.x() - d.x() / k * self._source_scale
+            cy = self._center.y() - d.y() / k * self._source_scale
             self._center = QPoint(int(round(cx)), int(round(cy)))
             self._clamp_center()
             self._drag_pan_accum += d

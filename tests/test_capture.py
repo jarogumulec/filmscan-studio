@@ -136,6 +136,15 @@ class TestSessionWorkflow:
         files = list(session.paths.frames.glob("*.npy"))
         assert len(files) == 1
 
+    def test_keep_live_view_reaches_the_backend(self, session, film) -> None:
+        """Mirror-up capture: the session passes the flag through, and flipping
+        it off (after a body refused) reaches the next capture too."""
+        session.capture_scan()
+        assert session.camera.last_keep_live_view is True
+        session.keep_live_view = False
+        session.capture_scan()
+        assert session.camera.last_keep_live_view is False
+
     def test_sidecar_written_beside_raw(self, session: CaptureSession) -> None:
         result = session.capture_dark(1)[0]
         sidecar = session.paths.sidecar(result.path)
@@ -222,7 +231,8 @@ class TestSessionWorkflow:
         self, tmp_path: Path, film: FilmMetadata
     ) -> None:
         class Failing(MockCamera):
-            def capture(self, destination: Path, filename_stem: str):
+            def capture(self, destination: Path, filename_stem: str,
+                        keep_live_view: bool = True):
                 raise RuntimeError("Závěrka se nespustila")
 
         camera = Failing()
@@ -245,7 +255,8 @@ class TestSessionWorkflow:
         jpeg = cv2.imencode(".jpg", np.zeros((2008, 3008, 3), np.uint8))[1].tobytes()
 
         class JpegBody(MockCamera):
-            def capture(self, destination: Path, filename_stem: str):
+            def capture(self, destination: Path, filename_stem: str,
+                        keep_live_view: bool = True):
                 target = destination / f"{filename_stem}.NEF"
                 target.write_bytes(jpeg)
                 from filmscan_studio.capture.camera import CaptureResult

@@ -233,6 +233,9 @@ class NikonSdkBackend(CameraBackend):
             # the macro rail, not the lens motor.
             focus_drive=False,
             live_view_zoom=True,
+            # The mirror-up capture path: Live View keeps the mirror raised,
+            # so a release without lv_off never drops it (see camera.py).
+            capture_in_live_view=True,
             notes=("Nikon SDK:Live View zoom (Whole..200%) na straně těla; "
                    "clona se na manuálním skle nenastavuje (z EXIF)."),
         )
@@ -322,7 +325,15 @@ class NikonSdkBackend(CameraBackend):
 
     # ---------------------------------------------------------------- capture
 
-    def capture(self, destination: Path, filename_stem: str) -> CaptureResult:
+    def capture(self, destination: Path, filename_stem: str,
+                keep_live_view: bool = True) -> CaptureResult:
+        """Release the shutter. With Live View up the mirror stays up.
+
+        ``keep_live_view`` is passed to the helper; when the body refuses a
+        release during Live View the helper falls back to lv_off→capture→lv_on
+        and reports ``lv_cycled``, which this method surfaces on the result so
+        the GUI can remember the body's preference.
+        """
         if self._proc is None:
             raise NotConnectedError("Nikon SDK helper neběží")
         destination.mkdir(parents=True, exist_ok=True)
@@ -330,7 +341,8 @@ class NikonSdkBackend(CameraBackend):
             ExposureSettings(shutter=self._current_shutter or 1.0,
                              iso=self._current_iso or 100)
         reply = self._rpc("capture", timeout=90.0,
-                          destination=str(destination), stem=filename_stem)
+                          destination=str(destination), stem=filename_stem,
+                          keep_live_view=keep_live_view)
         target = Path(reply["path"])
         if reply.get("file_format") == "jpeg":
             target = target.with_suffix(".jpg")

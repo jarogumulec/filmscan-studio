@@ -9,7 +9,7 @@ neither module can corrupt the other's data.
 uv run filmscan-studio          # Capture GUI (PySide6)
 uv run filmscan-studio --mock   #   …with a simulated D750, no camera needed
 uv run filmscan-develop RAW...  # Developer CLI → 16-bit TIFF + sidecar
-uv run pytest                   # 130 tests
+uv run pytest                   # 246 tests
 ```
 
 ## Design rules the code enforces
@@ -24,6 +24,10 @@ uv run pytest                   # 130 tests
 | Flat fields need **no matching exposure** — dark-subtracted, then mean-normalised | `developer/pipeline.py::_calibrate_above_black` |
 | One thread owns the camera at a time (libgphoto2 is not thread-safe) | `gui/capture_window.py::CameraWorker`, `gui/liveview.py` |
 | No custom demosaicing — LibRaw interpolates the calibrated mosaic via the rawpy buffer trick | `developer/pipeline.py::develop_colour` |
+| Archival scans happen at **ISO 100 only** — capture is blocked at any other sensitivity, exposure lives in the shutter | `core/exposure.py::ARCHIVE_ISO`, `_capture_block_reason` |
+| WB gains are solved once (film base / AE rect) and **locked for the whole film** — never per frame, never by the body | `core/positive.py::estimate_wb_gains`, `PositiveParams.wb_gains` |
+| Display zoom is a **whole multiple of the stream** (×1 ×2 ×3, nearest) — a fractional factor resamples grain and lies about focus | `gui/widgets.py::ZoomView.source_zoom` |
+| Every NEF is audited after capture (red-rect region, p99.9 target); the shutter for the *next* frame is corrected automatically | `capture/quality.py::audit_nef` |
 
 ## The macOS `ptpcamerad` problem
 
@@ -50,12 +54,21 @@ the device differently and the daemon kill will not free them.
 **Capture:** Nový film (metadata dialog) → *Dark Frame* → *Flat Field* →
 frame-by-frame *Capture* (auto frame numbering matching the canister) →
 *Exportovat projekt*. Each film is a folder: untouched camera files +
-`<raw>.json` sidecars + `catalog.sqlite` + `project.json`.
+`<raw>.json` sidecars + `catalog.sqlite` + `project.json`. Scans run at
+**ISO 100** (the Capture button refuses any other sensitivity); *Auto
+Exposure* solves with the shutter alone. On the SDK backend a capture keeps
+Live View on (mirror stays raised, no shake); if the body refuses, it falls
+back to a Live View cycle and remembers. After every scan the NEF is
+**audited** against the red-rect region and the next frame's shutter is
+corrected, and a positive `frameNNN.jpg` is rendered from the RAW beside it.
 
 **Two preview modes:** *RAW View* (display gamma only — judge exposure here)
 and *Working Positive* (auto base subtraction, inversion, preview exposure,
 Fritsch–Carlson spline filmic with Toe/Gamma/Shoulder — judge the picture
-here, it changes nothing on disk).
+here, it changes nothing on disk). The live Working Positive runs through a
+per-channel LUT (`FastPositivePreview`) so the tone curve costs one lookup
+per pixel; *Auto WB* locks gains for the whole film. Display zoom is whole
+multiples of the delivered stream (×1 ×2 ×3, nearest-neighbour).
 
 **Developer:** `filmscan-develop scan.NEF --dark darks/ --flat flats/
 --params look.json -o out/ --jpeg`. Pipeline: dark → flat → demosaic (LibRaw)

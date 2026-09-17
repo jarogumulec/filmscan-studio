@@ -21,6 +21,11 @@ import numpy as np
 #: Required headroom below clipping, in stops. Brief specifies 0.3-0.5 EV.
 DEFAULT_HEADROOM_EV = 0.4
 
+#: The archival scan's fixed sensitivity (2026-09 brief): D750 native base.
+#: Scanning is a transmission measurement — exposure lives in the shutter,
+#: ISO stays pinned so every frame of a film is the same measurement.
+ARCHIVE_ISO = 100
+
 #: Percentile of the linear signal used as the "brightest real value".
 DEFAULT_METER_PERCENTILE = 99.9
 

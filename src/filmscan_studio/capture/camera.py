@@ -83,6 +83,10 @@ class CaptureResult:
     #: Actual bytes on disk ('nef' | 'jpeg' | 'unknown'), sniffed — the file
     #: extension is what we asked for, this is what the body delivered.
     file_format: str = "nef"
+    #: True when Live View had to be cycled for this capture (the body refused
+    #: the mirror-up path). The GUI notes it once and stops demanding the
+    #: mirror-up capture from a body that does not grant it.
+    lv_cycled: bool = False
 
 
 @dataclass
@@ -104,6 +108,12 @@ class CameraCapabilities:
     #: LiveViewImageZoomRate). gphoto2's capturePreview always sends the whole
     #: downscaled frame, so the zoomed-detail path is SDK-only.
     live_view_zoom: bool = False
+    #: Body accepts a still release while Live View runs, i.e. the mirror is
+    #: already up and stays up across the capture (Nikon SDK / D750 — the
+    #: vibration-free path for scanning). Backends without it end Live View
+    #: before each capture, which drops and re-raises the mirror and blurs the
+    #: frame vertically (the 2026-09 complaint).
+    capture_in_live_view: bool = False
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -162,8 +172,15 @@ class CameraBackend(ABC):
         )
 
     @abstractmethod
-    def capture(self, destination: Path, filename_stem: str) -> CaptureResult:
-        """Release the shutter and write the raw file to ``destination``."""
+    def capture(self, destination: Path, filename_stem: str,
+                keep_live_view: bool = True) -> CaptureResult:
+        """Release the shutter and write the raw file to ``destination``.
+
+        ``keep_live_view`` asks backends that can (see
+        :attr:`CameraCapabilities.capture_in_live_view`) to release without
+        ending Live View, keeping the mirror raised between frames. Backends
+        that cannot end Live View anyway ignore the flag.
+        """
 
     @property
     @abstractmethod

@@ -75,8 +75,10 @@ from filmscan_studio.capture.camera import CameraBackend, CameraError, CameraInf
 from filmscan_studio.capture.gphoto2 import GPhoto2Backend, parse_shutter
 from filmscan_studio.capture.mock import MockCamera
 from filmscan_studio.capture.nikon_backend import NikonSdkBackend
+from filmscan_studio.capture.quality import audit_nef, render_preview_jpeg
 from filmscan_studio.capture.session import CaptureSession, SessionPaths
 from filmscan_studio.core.exposure import (
+    ARCHIVE_ISO,
     DEFAULT_HEADROOM_EV,
     ExposureSettings,
     MeterReading,
@@ -84,7 +86,11 @@ from filmscan_studio.core.exposure import (
 from filmscan_studio.core.filmic import FilmicProfile
 from filmscan_studio.core.histogram import compute
 from filmscan_studio.core.models import FilmMetadata
-from filmscan_studio.core.positive import PositiveParams
+from filmscan_studio.core.positive import (
+    FastPositivePreview,
+    PositiveParams,
+    estimate_wb_gains,
+)
 from filmscan_studio.core.zoom import (
     FIT,
     ZOOM_ALL,
@@ -237,6 +243,14 @@ class CaptureWindow(QMainWindow):
         self._ae_rect: tuple[int, int, int, int] | None = None  # x0, y0, x1, y1
         #: Echo suppression: refresh writes must not re-trigger apply handlers.
         self._echo = False
+        #: Set when the in-flight capture is using the mirror-up path (Live
+        #: View left running, poller paused) rather than stopping Live View.
+        self._capture_kept_lv = False
+        #: Post-capture NEF exposure audit verdict, for the status label.
+        self._last_audit: str | None = None
+        self._wb_gains: tuple[float, float, float] | None = None
+        self._fast_preview = FastPositivePreview(
+            PositiveParams(base_percentile=_LIVE_BASE_PERCENTILE))
         #: Last film record — prefills the rig group of the next dialog.
         self._last_film: FilmMetadata | None = None
 
@@ -338,8 +352,11 @@ class CaptureWindow(QMainWindow):
             "v Working Positive je jiná vrstva — viz Náhled výše."
         )
         self.ev_spin.editingFinished.connect(self._apply_ev_comp)
-        self.btn_iso_low = QPushButton("ISO min")
-        self.btn_iso_low.setToolTip("Nejnižší native ISO — archivní sken chce odstup od šumu.")
+        self.btn_iso_low = QPushButton("ISO 100")
+        self.btn_iso_low.setToolTip(
+            "Archivní sken se exponuje při ISO 100 (native base D750) — "
+            "odstup signálu od šumu; expozice se pak řeší jen časem."
+        )
         self.btn_iso_low.clicked.connect(self._iso_to_base)
         row = QHBoxLayout()
         row.addWidget(self.ev_spin)
@@ -395,6 +412,20 @@ class CaptureWindow(QMainWindow):
         self.mode_positive.toggled.connect(lambda on: self._set_mode(raw_view=not on))
         mode_row.addWidget(self.mode_positive)
         mode_row.addStretch()
+        # Camera WB is not an option here: the body would bake a per-frame
+        # guess into the display while the orange mask of a colour negative
+        # needs ONE neutral for the whole film. So the app solves it once —
+        # on film base inside the AE rect if set — and holds it.
+        self.btn_wb = QPushButton("Auto WB")
+        self.btn_wb.setToolTip(
+            "Vyváží bílou z nejjasnějšího pole snímku (filmový podklad), "
+            "případně z červeného AE rámečku. Zisky se uzamknou pro celý "
+            "film — per-frame by oranžová maska barevného negativu "
+            "vyvažování roztančila. Po vyvážení se zapne Negative náhled, "
+            "ať je výsledek vidět."
+        )
+        self.btn_wb.clicked.connect(self._auto_white_balance)
+        mode_row.addWidget(self.btn_wb)
         # Outside the collapsed box on purpose: the toggle is the point of the
         # box's whole layer, hidden-behind-expand is what made it disappear.
         right_layout.addLayout(mode_row)
@@ -657,16 +688,41 @@ class CaptureWindow(QMainWindow):
         self._refresh_settings()
 
     def _iso_to_base(self) -> None:
-        """Lowest native ISO: the archival scan wants noise floor, not speed."""
+        """Archival ISO: the scan is a transmission measurement at the noise
+        floor — ISO 100 on the D750, its native base, exposure lives in time."""
+        self._set_iso_pinned(ARCHIVE_ISO)
+
+    def _set_iso_pinned(self, wanted: int) -> None:
         if self.camera is None or self.info is None or not self.info.iso_choices:
             return
         try:
-            applied = self.camera.set_iso(min(self.info.iso_choices))
+            applied = self.camera.set_iso(wanted)
         except CameraError as exc:
             QMessageBox.warning(self, "ISO", str(exc))
             return
-        self.statusBar().showMessage(f"ISO {applied} (minimum)", 4000)
+        note = "" if applied == wanted else f" — tělo snaplo z {wanted}"
+        self.statusBar().showMessage(f"ISO {applied}{note}", 4000)
         self._refresh_settings()
+        self._refresh_buttons()
+
+    def _capture_block_reason(self) -> str | None:
+        """Why Capture must refuse right now, or None when it may run.
+
+        The archival rule (2026-09 brief): scan at ISO 100 and vary only the
+        shutter. A frame exposed at any other ISO is a different measurement
+        with more noise, so the button refuses rather than let it slip through;
+        the operator presses the ISO 100 button or fixes it on the body.
+        """
+        if self.camera is None:
+            return "Fotoaparát není připojen."
+        try:
+            iso = self.camera.get_settings().iso
+        except Exception:  # noqa: BLE001 - settings read flaky over USB
+            return None       # never block a shot on a meter read that hiccuped
+        if iso != ARCHIVE_ISO:
+            return (f"Archivní sken vyžaduje ISO {ARCHIVE_ISO} (teď {iso}) — "
+                    "stiskni 'ISO 100' a exponuj jen časem.")
+        return None
 
     def _apply_ev_comp(self) -> None:
         if self.camera is None:
@@ -733,13 +789,14 @@ class CaptureWindow(QMainWindow):
         w, h = self._last_source_size()
         detail = detail_for(self._body_zoom, w, h, self._sensor_size())
         zoom = self.view.zoom()
-        # Fit lies least when it downsamples; on big widgets it stretches the
-        # 640px stream too — say so there as well, the whole point of the
-        # sensor-pixel ladder was to stop hiding that.
-        scale = display_scale(zoom, self._sensor_size(),
-                              self.view.width(), self.view.height())
-        interp = detail.interpolation_at(scale)
-        note = detail.summary() + f" · interpolace ×{interp:.1f}"
+        # Disclose what is *drawn*, not what was requested: the view snaps to
+        # whole multiples of the stream (×1 ×2 ×3) so focusing never fights a
+        # resampled 3.425× grain. One delivered pixel lands on `k` screen
+        # pixels; the stream is worth `sensor_px_per_lv_px` sensor pixels per
+        # delivered pixel, so inventing detail starts where k exceeds it.
+        k = self.view.source_zoom()
+        interp = detail.interpolation_at(k / detail.sensor_px_per_lv_px)
+        note = detail.summary() + f" · zobrazení ×{k:g} (interpolace ×{interp:.1f})"
         if interp > 2.0:
             note += " — proud neposkytuje tolik detailu"
         self.zoom_note.setText(note)
@@ -793,6 +850,11 @@ class CaptureWindow(QMainWindow):
             self._worker = None
 
     def _resume_live_view(self) -> None:
+        # A worker only *paused* for a mirror-up capture resumes polling; the
+        # body never left Live View, so there is nothing to re-arm.
+        if self._worker is not None and self._worker.running:
+            self._worker.resume_polling()
+            return
         if self.camera is not None:
             self.start_live_view()
 
@@ -844,7 +906,13 @@ class CaptureWindow(QMainWindow):
         # A Live View JPEG's tone curve puts "base" somewhere a raw's does not,
         # so the base percentile is measured, not inherited from the raw default.
         positive = replace(self.positive, base_percentile=_LIVE_BASE_PERCENTILE)
-        return preview(image, positive, raw_view=False, black_level=0.0, white_level=1.0)
+        # The exact chain costs a spline evaluation per pixel per frame — the
+        # 2026-09 fps complaint. WB + base subtract + exposure + filmic are all
+        # per-channel scalar maps once the base is fixed, so the fast preview
+        # precomputes them into LUTs and rebuilds only when a parameter moved
+        # or its base refresh came due. Same curve, table-lookup price.
+        self._fast_preview.set_params(positive)
+        return self._fast_preview.render(image)
 
     def _on_live_error(self, message: str) -> None:
         # Live View dying (cable pull, ptpcamerad stealing the device) must be
@@ -957,10 +1025,60 @@ class CaptureWindow(QMainWindow):
         self.neg_toggle.blockSignals(False)
         self.filmic.setEnabled(not raw_view)
         # Repaint the last frame now, so switching modes is instant even with
-        # Live View stopped.
+        # Live View stopped — and repaint the histogram with it: its curve
+        # overlay belongs to the mode, and waiting up to a frame period for
+        # the next one made the toggle look lagged.
         if self._last_linear is not None:
             self.view.set_image(self._display_for(self._last_linear))
+            if self._last_frame_reading is not None:
+                self._last_reading = self._update_histogram(
+                    self._last_frame_reading, self._last_linear
+                )
         self._refresh_buttons()
+
+    def _auto_white_balance(self) -> None:
+        """Solve WB once (film base / AE rect) and hold it for the whole film.
+
+        Camera WB cannot do this job: the D750 would re-guess per frame, and
+        the orange mask of a colour negative makes every frame's guess slightly
+        different — a cast that breathes. Metering the *brightest* area of a
+        negative is metering clear film base, which is the one thing on the
+        frame that is truly neutral. The AE rect lets the operator point the
+        meter at a base strip deliberately.
+        """
+        if self._last_linear is None:
+            self.statusBar().showMessage("Auto WB: zatím není co vyvážit (Liv View?)", 4000)
+            return
+        img = self._last_linear
+        if self._ae_rect is not None:
+            x0, y0, x1, y1 = self._ae_rect
+            h, w = img.shape[:2]
+            x0, y0 = max(int(x0), 0), max(int(y0), 0)
+            x1, y1 = min(int(x1), w), min(int(y1), h)
+            if x1 > x0 and y1 > y0:
+                img = img[y0:y1, x0:x1]
+        try:
+            gains = estimate_wb_gains(img)
+        except ValueError as exc:
+            self.statusBar().showMessage(f"Auto WB: {exc}", 4000)
+            return
+        self._wb_gains = gains
+        # PositiveParams is frozen and rebuilt by the filmic panel — carry the
+        # locked gains through so no slider move silently drops the balance.
+        self.positive = replace(self.positive, wb_gains=gains)
+        # "ukazovat náhled po vyvážení" (2026-09): the correction is only
+        # judgeable through the inverted, curved preview.
+        if self.raw_view:
+            self.neg_toggle.setChecked(True)   # routes through _set_mode
+        if self._last_linear is not None:
+            self.view.set_image(self._display_for(self._last_linear))
+        self.statusBar().showMessage(
+            f"Auto WB uzamčen pro celý film: R{gains[0]:.2f} "
+            f"G{gains[1]:.2f} B{gains[2]:.2f}"
+            + (" (měřeno v AE rámečku)" if self._ae_rect is not None else ""),
+            6000,
+        )
+        self._log(f"Auto WB {gains[0]:.2f}/{gains[1]:.2f}/{gains[2]:.2f} uzamčeno")
 
     def _on_filmic_changed(self) -> None:
         self.positive = PositiveParams(
@@ -971,6 +1089,8 @@ class CaptureWindow(QMainWindow):
                 shoulder=self.filmic.shoulder.value(),
             ),
             invert=self.filmic.invert.isChecked(),
+            # The locked WB survives every curve edit (see _auto_white_balance).
+            wb_gains=self._wb_gains,
         )
         self.histogram.set_curve(self.positive.profile.curve_table(256))
         if self._last_linear is not None and not self.raw_view:
@@ -984,6 +1104,10 @@ class CaptureWindow(QMainWindow):
             return
         if self._camera_queue.busy:
             return  # one exposure at a time - the camera can only do that anyway
+        reason = self._capture_block_reason()
+        if reason is not None:
+            self.statusBar().showMessage(reason, 6000)
+            return
         if scan:
             number = self.frame_number.value() if self.frame_number.value() > 0 else None
             fn, args = self.session.capture_scan, (number,)
@@ -993,7 +1117,19 @@ class CaptureWindow(QMainWindow):
             args = ()
             label = "Dark" if kind == "dark" else "Flat"
         self._set_actions_busy(True)
-        self._pause_live_view()
+        # Mirror-up path: a backend that releases during Live View keeps the
+        # mirror raised — poller paused (free pipe), Live View *left on*.
+        # Stopping the worker instead would drop the mirror, and the re-raise
+        # before the next frame is the shake that blurred captures (2026-09).
+        self._capture_kept_lv = False
+        if (self._worker is not None and self._worker.running
+                and self.session.keep_live_view
+                and self.camera is not None
+                and self.camera.capabilities().capture_in_live_view):
+            self._worker.pause_polling()
+            self._capture_kept_lv = True
+        else:
+            self._pause_live_view()
         self.statusBar().showMessage(f"{label}: expozice…")
         self._start_worker(fn, lambda res: self._on_captured(label, res), *args)
 
@@ -1082,6 +1218,13 @@ class CaptureWindow(QMainWindow):
             f"{label} uložen: {first.path.name} ({first.size_bytes / 1e6:.1f} MB, {first.elapsed:.1f} s)"
         )
         self._log(f"{label}: {first.path.name} · {first.settings.shutter_string()} · ISO {first.settings.iso}")
+        if getattr(first, "lv_cycled", False) and self.session is not None:
+            # The body refused the mirror-up release this time. One note and
+            # stop asking: repeated cycling is exactly the shake the operator
+            # is trying to eliminate, and now it would be a known cost.
+            self.session.keep_live_view = False
+            self._log("tělo při Capture vypnulo Live View (zrcadlo sjelo) — "
+                      "zaznamenáno, příště se LV před expozicí vypne rovnou.")
         if getattr(first, "file_format", "nef") == "jpeg":
             # A capture is harder evidence than any CapGet read: the body
             # answered a still with JPEG. Surface the fix, not just a log line.
@@ -1097,13 +1240,95 @@ class CaptureWindow(QMainWindow):
         self._refresh_settings()
         self._refresh_stage()
         self.act_export.setEnabled(True)
+        # Post-capture exposure audit + positive preview JPEG, off the UI
+        # thread and off the camera: both read the NEF that just landed.
+        if label == "Snímek" and getattr(first, "file_format", "nef") == "nef":
+            self._post_capture_check(first)
+
+    # --------------------------------------------------- post-capture pipeline
+
+    def _post_capture_check(self, result) -> None:
+        """Audit the fresh NEF and render its positive JPEG, off-thread.
+
+        The NEF is the only honest metering source (the Live View JPEG is
+        auto-brightness and the body meter is global), so "right-max" exposure
+        is decided *after* the capture: the audit says under/over, the shutter
+        is corrected for the next frame, and the operator is told to repeat
+        this one — an exposed frame cannot be rescued. File IO only; the
+        camera is never touched, so the queue slot frees for the next shot.
+        """
+        if self.session is None:
+            return
+        if result.path.suffix.lower() not in (".nef", ".nrw", ".dng"):
+            # The mock body writes .npy mosaics; auditing one through rawpy
+            # would only produce a scary traceback over a passing test.
+            return
+        # Rect→sensor mapping is linear only for the whole-frame stream. At a
+        # body zoom the crop's position on the sensor is unreported by the
+        # D750, so the rect would meter an unknown area — meter the whole
+        # frame instead of guessing (audit_nef documents the same refusal).
+        rect = self._ae_rect if self._body_zoom == ZOOM_ALL else None
+        lv_size = self._last_source_size()
+        settings = result.settings
+        ladder = list(self.info.shutter_choices) if self.info else None
+        # Snapshot for the JPEG: the same look the live preview is showing.
+        # self.positive is frozen and already carries the NEF-side base
+        # percentile (99) + locked WB gains; only the live path overrides it.
+        params = self.positive
+        jpg = result.path.with_suffix(".jpg")
+
+        def job():
+            audit = None
+            try:
+                audit = audit_nef(result.path, rect, lv_size, settings,
+                                  shutter_ladder=ladder)
+            except Exception:  # noqa: BLE001 - audit must never eat the capture
+                log.exception("audit NEFu %s selhal", result.path.name)
+            written: Path | None = None
+            try:
+                written = render_preview_jpeg(result.path, jpg, params)
+            except Exception:  # noqa: BLE001
+                log.exception("náhledový JPEG %s selhal", jpg.name)
+            return audit, written
+
+        self._start_worker(job, self._on_audit_done)
+
+    def _on_audit_done(self, payload) -> None:
+        audit, jpg = payload if payload else (None, None)
+        if jpg is not None:
+            self._log(f"náhled {Path(jpg).name}")
+        if audit is None:
+            return
+        self._last_audit = audit.message
+        self._log(audit.message)
+        if audit.verdict == "ok":
+            self.statusBar().showMessage(audit.message, 5000)
+            return
+        # Fix the *next* frame with the shutter — never ISO (archival rule) —
+        # then tell the operator this frame must be repeated.
+        applied = ""
+        if audit.suggested_shutter is not None and self.camera is not None:
+            try:
+                # set_shutter returns what the body actually took (ladder snap);
+                # the message reports that, not what was requested.
+                got = self.camera.set_shutter(audit.suggested_shutter)
+                self._refresh_settings()
+                applied = (" — čas pro další snímek nastaven na "
+                           f"{ExposureSettings(shutter=got).shutter_string()}")
+            except Exception as exc:  # noqa: BLE001 - the verdict still stands
+                applied = f" (čas se nepodařilo nastavit: {exc})"
+        self.statusBar().showMessage(
+            audit.message + applied + " — tento snímek zopakuj", 10000
+        )
 
     def _auto_exposure(self) -> None:
         if self.camera is None or self._worker is None:
             QMessageBox.information(self, "Auto Exposure", "Musí běžet Live View.")
             return
         controller = AutoExposureController(
-            self.camera, self._meter, headroom_ev=DEFAULT_HEADROOM_EV
+            self.camera, self._meter, headroom_ev=DEFAULT_HEADROOM_EV,
+            # Archival rule: AE solves with the shutter alone, ISO 100 stays.
+            iso_lock=True,
         )
         self._set_actions_busy(True)
         if self._worker is not None:
@@ -1112,17 +1337,51 @@ class CaptureWindow(QMainWindow):
             # once the worker's teardown has switched it off).
             self._worker.leave_live_view = True
         self._pause_live_view()
-        # No `read` callable: the controller probes the body's own exposure
-        # meter and uses the LV-rect metering below only where no body meter
-        # exists (mock/gphoto2). Passing read unconditionally used to force the
-        # LV path — and the SDK's LV stream is auto-brightness, so the loop
-        # never saw its own moves and reported ladder limits that were lies.
-        self.statusBar().showMessage("Auto Exposure: řeším na tělní meter…")
+        # On a body with an exposure meter the controller drives that; the red
+        # AE rect still matters — _roi_bias below measures how much brighter or
+        # darker the framed area is than the whole frame and aims the *body
+        # meter* at the ROI's correct exposure, not the frame's (2026-09
+        # complaint: the SDK path ignored the rect and metered everything).
+        bias = self._roi_bias() if self._has_body_meter() else 0.0
+        controller.target_ev = bias
+        self.statusBar().showMessage(
+            "Auto Exposure: řeším na tělní meter…"
+            + (f", AE výřez {bias:+.2f} EV" if bias else "")
+        )
         self._start_worker(
             controller.run,
             self._on_auto_exposure_done,
             None if self._has_body_meter() else self._meter_source(),
         )
+
+    def _roi_bias(self) -> float:
+        """EV correction the red AE rect implies for the body meter.
+
+        The D750's body meter is global — it cannot be aimed at a rectangle.
+        The LV JPEG is auto-brightness (its absolute levels mean nothing), but
+        the *ratio* of the framed area's luminance to the whole frame's is
+        untouched by the body's uniform display gain, and that ratio is exactly
+        how far the framed area sits from what the global meter assumes. A
+        rect on dark film inside a frame with bright borders therefore reads a
+        positive bias: expose so the *rect* is correct, not the borders.
+        Medians (rank statistics survive the JPEG's compression), clamped to
+        ±3 EV so a pathological rect cannot command a runaway exposure.
+        """
+        if self._last_linear is None or self._ae_rect is None:
+            return 0.0
+        img = self._last_linear
+        x0, y0, x1, y1 = self._ae_rect
+        h, w = img.shape[:2]
+        x0, y0 = max(int(x0), 0), max(int(y0), 0)
+        x1, y1 = min(int(x1), w), min(int(y1), h)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        lum = luminance(img)
+        whole = float(np.median(lum))
+        roi = float(np.median(lum[y0:y1, x0:x1]))
+        if whole <= 1e-6 or roi <= 1e-6:
+            return 0.0
+        return float(np.clip(np.log2(whole / roi), -3.0, 3.0))
 
     def _has_body_meter(self) -> bool:
         return self.camera is not None and hasattr(self.camera, "exposure_ev")
@@ -1171,7 +1430,11 @@ class CaptureWindow(QMainWindow):
         assert self.camera is not None
         self.session = CaptureSession(camera=self.camera, film=film, paths=paths)
         self._last_film = film
-        self.positive = self.positive.with_base(None)
+        # A new film is a new light + a new emulsion: neither the auto-detected
+        # base nor the locked WB gains of the previous one may leak into it.
+        self._wb_gains = None
+        self.positive = replace(self.positive, base_level=None, wb_gains=None)
+        self._fast_preview.reset()
         self.setWindowTitle(f"FilmScan Studio — Capture — {film.label()}")
         self.act_export.setEnabled(True)
         self.statusBar().showMessage(f"Film {film.film_id}: {paths.root}")
@@ -1269,7 +1532,17 @@ class CaptureWindow(QMainWindow):
         has_session = self.session is not None
         for button in (self.btn_dark, self.btn_flat):
             button.setEnabled(has_camera and has_session)
-        self.btn_capture.setEnabled(has_camera and has_session)
+        # The archival ISO rule (2026-09): no scan at any sensitivity but the
+        # base one. The tooltip states why, so the greyed button is an
+        # explanation and not a mystery.
+        scans_allowed = has_camera and has_session and (
+            self.camera is None or self._capture_block_reason() is None)
+        self.btn_capture.setEnabled(scans_allowed)
+        self.btn_capture.setToolTip(
+            "" if scans_allowed else
+            "Archivní sken se exponuje při ISO 100 — stiskni 'ISO 100' "
+            "a nastavuj jen čas."
+        )
         self.btn_autoexposure.setEnabled(has_camera)
 
     def _log(self, line: str) -> None:

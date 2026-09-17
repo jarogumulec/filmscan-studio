@@ -83,13 +83,15 @@ class FilmDialog(QDialog):
         film_form = QFormLayout(film_box)
         layout.addWidget(film_box)
 
-        self.film_id = _line(film_src.film_id, "HP5_001")
+        self.film_id = _line(film_src.film_id, "K16O03_2025")
         film_form.addRow("Film ID *", self.film_id)
 
         self.film_name = _line(film_src.film_name, "Fomapan 100 Classic")
         film_form.addRow("Film (výrobce + typ)", self.film_name)
 
-        self.camera = _line(rig_src.camera, "Nikon D750")
+        # The *film's* camera — the body that exposed the negative, not the
+        # D750 doing the digitising (that is the rig group's job).
+        self.camera = _line(rig_src.camera, "Nikon FM2")
         film_form.addRow("Fotoaparát", self.camera)
 
         self.format = QComboBox()
@@ -109,7 +111,11 @@ class FilmDialog(QDialog):
         self.mirrored = QCheckBox(
             "Zrcadlově (lev/prav) — skenuji matnou stranou k objektivu"
         )
-        self.mirrored.setChecked(rig_src.mirrored)
+        # The operator scans emulsion-side-to-lens as a rule (2026-09 brief):
+        # a first film starts ON; only a prior record that says otherwise — or
+        # an edited film that was explicitly OFF — unchecks it.
+        self.mirrored.setChecked(film_src.mirrored if defaults is not None
+                                 else (rig_defaults.mirrored if rig_defaults else True))
         self.mirrored.setToolTip(
             "Oznčí, že snímky jsou vodorovně převrácené. Zatím se pouze "
             "ukládá do metadat; převracení obrazů zatím neběží."
@@ -144,10 +150,12 @@ class FilmDialog(QDialog):
         rig_form = QFormLayout(rig_box)
         layout.addWidget(rig_box)
 
-        self.digitising_lens = _line(rig_src.digitising_lens, "Micro-Nikkor 55/3.5 AI")
+        self.digitising_lens = _line(
+            rig_src.digitising_lens, "Carl Zeiss MC Biometar 2.8/80, F8.0"
+        )
         rig_form.addRow("Objektiv", self.digitising_lens)
 
-        self.digitising_light = _line(rig_src.digitising_light, "CRS LED panel")
+        self.digitising_light = _line(rig_src.digitising_light, "LED11x15cm panel 4400 K")
         rig_form.addRow("Světlo", self.digitising_light)
 
         self.digitising_holder = _line(rig_src.digitising_holder, "PSI 35mm")

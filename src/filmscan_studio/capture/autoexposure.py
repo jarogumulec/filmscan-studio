@@ -111,11 +111,19 @@ class LiveMeter:
 
     @staticmethod
     def decode_live_frame(frame: LiveFrame) -> np.ndarray:
-        """Decode a Live View JPEG to float 0..1, no colour assumptions made."""
+        """Decode a Live View JPEG to float 0..1 **RGB**.
+
+        OpenCV decodes BGR; the whole app downstream (Rec. 709 luminance,
+        white-balance gains, the QImage blit) is RGB. The missing conversion
+        was the 2026-09 "náhled je strašně oranžový" — on a color negative the
+        swap trades the orange mask's red for blue and every neutral reads as
+        a cast.
+        """
         buf = np.frombuffer(frame.jpeg, dtype=np.uint8)
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError("Live View JPEG nelze dekódovat")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img.astype(np.float64) / 255.0
 
     def jpeg_to_linear(self, encoded: np.ndarray) -> np.ndarray:
@@ -153,6 +161,11 @@ class AutoExposureController:
     target_ev: float = 0.0
     headroom_ev: float = DEFAULT_HEADROOM_EV
     max_iterations: int = 4
+    #: Archival mode (2026-09 brief): the shutter is the only actuator; ISO is
+    #: the measurement's identity and must not move. With the lock on, a
+    #: residual the shutter alone cannot close is reported as a lighting limit,
+    #: never fixed by raising ISO.
+    iso_lock: bool = False
 
     def next_live_reading(self) -> MeterReading:
         frame = self.camera.next_live_frame()
@@ -315,6 +328,11 @@ class AutoExposureController:
         """
         shutter_ladder, iso_ladder = ladders
         iso_lo, iso_hi = min(iso_ladder), max(iso_ladder)
+        if self.iso_lock:
+            # One actuator only: the nearest shutter rung, ISO untouched.
+            ideal = settings.shutter * 2.0 ** needed_ev
+            rung = _snap(ideal, shutter_ladder)
+            return rung, settings.iso
         ideal_shutter = settings.shutter * 2.0 ** needed_ev
         below = max((r for r in shutter_ladder if r <= ideal_shutter),
                     default=min(shutter_ladder))

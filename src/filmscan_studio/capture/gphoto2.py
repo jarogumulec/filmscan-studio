@@ -241,12 +241,18 @@ class GPhoto2Backend(CameraBackend):
 
     # ------------------------------------------------------------------ capture
 
-    def capture(self, destination: Path, filename_stem: str) -> CaptureResult:
+    def capture(self, destination: Path, filename_stem: str,
+                keep_live_view: bool = True) -> CaptureResult:
         """Release the shutter, then pull the raw file off the body.
 
         The frame is written to the memory card rather than internal RAM: the D750
         holds only a handful of frames in RAM, and a 30 MB NEF is not one of them.
         The card copy is kept, which doubles as an in-camera backup.
+
+        ``keep_live_view`` is accepted for the backend contract and ignored:
+        PTP ``camera-capture`` does not answer while ``capturePreview`` owns
+        the session, so the GUI stops Live View here (and pays the mirror
+        cycle) — the mirror-up capture is SDK-only.
         """
         if self._camera is None:
             raise NotConnectedError("fotoaparát není připojen")
