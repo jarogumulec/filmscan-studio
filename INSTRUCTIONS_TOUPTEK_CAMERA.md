@@ -253,21 +253,48 @@ Mirror současného přístupu (`tests/test_nikon_sdk.py`) →
 
 ## 11. Co musí příští Copilot ověřit na reálném hardwaru
 
+> **2026-09-17: ověřeno na reálném ATR2600M** (macOS, USB3, napájení 12 V).
+> Výsledky k jednotlivým bodům jsou poznámenky níže; navíc zjistěno:
+> `get_Size` lže (vždy rozlišení senzoru, i při BINNING/ROI — velikost
+> rámu je v `info.v3.width/height` každého rámku), `PullImageV4`/
+> `PullStillImageV2` berou `c_char_p` buffer (přes `create_string_buffer`,
+> ndarray i POINTER odmítnou), a `WaitImageV4` na Snap'd still vrací
+> `E_UNEXPECTED` — still chodí přes `TOUPCAM_EVENT_STILLIMAGE` +
+> `PullStillImageV2`. Gain range `get_ExpoAGainRange` = 0,1–10×.
+
 1. Skutečný max fps při `BINNING=0x83` overview (16bit, USB3) —
    dokumentace dává vzorec jen orientačně
    (`TOUPCAM_OPTION_MAX_PRECISE_FRAMERATE`, závisí na
    bandwidth/ROI/bitdepth)
+   → **✅ 3,4 fps** při 2074×1388 (senzor dodává i při binning sudé
+   zaokrouhlení 1388, ne 4168/3=1389 — appka nesmí předpokládat přesné
+   //3). ROI 1200×1200 bez binningu: **~11,4 fps**, doručuje přesně
+   požadovanou velikost.
 2. Zda `Snap`/`SnapR` na tomto modelu funguje v RAW módu, nebo je nutné
    dělat capture přes dočasné `Stop → put_Size(full) → Start →
    PullImageV4` (viz `demostillraw.cpp`/`demoraw.cpp` — chování se liší
    model od modelu)
+   → **✅ Snap funguje**, ale still nedorazí přes `WaitImageV4`
+   (vždy `E_UNEXPECTED` 0x8000FFFF). Funkční flow: callback →
+   `Snap(0xFFFFFFFF)` → čekat `TOUPCAM_EVENT_STILLIMAGE` (přijde za
+   expozici + ~0,9 s) → `PullStillImageV2`. Full-size still 6224×4168
+   trval 2,6 s (1s expozice), TIFF round-trip ok.
 3. Skutečné jednotky `ExpoAGain` (dB vs. permile) pro tento konkrétní model
    — SDK je obecné napříč desítkami produktů
+   → **✅ permile** (`put_ExpoAGain(1000)` = 1,00×; range 0,1–10×).
+   Pro archiv se doporučuje pevně 1,00×: IMX571 má 16bit ADC a plná
+   nádrž se vejde do 65535, <1× signál jen tłumí, >1× přidává šum.
 4. Zda externí 11–14V napájení je potřeba mít připojené i pro pouhé USB
    enumeraci/streamování bez chlazení (varovná hláška v GUI, pokud
    `EnumV2` selže a napájení není indikováno)
+   → napájení připojeno celou dobu, bez něj neměřeno; kamera bez něj
+   nesvítí (červená LED = napájení OK). Varovná hláška v GUI zůstává.
 5. Reálná teplotní stabilizační doba po `put_Temperature()` — pro UX
    semaforu a tooltip
+   → **~3 minuty** z 32 °C na −5 °C (plný výkon TEC, naměřeno
+   `scripts/cooling_probe.py`: 32,1 → −3,1 °C za 180 s, dosáhne cíle
+   ±0,2 °C). Semafor ±2 °C je tedy po nastavení cíle „closed“ zhruba
+   po 3 minutách; při vypnutém chlazení teplota vyleze ke ~25–32 °C.
 
 ## Doporučené pořadí implementace
 

@@ -3,6 +3,31 @@
 Vše, co se od posledního stavu změnilo, a hlavně: **co nešlo bez fotoaparátu
 ověřit** a jak to poznat při prvním zapnutí s tělem.
 
+## 2026-09-17 (večer) — první světlo: reálný ATR2600M
+
+Checklist §11 instrukcí odškrtán na hardware. Tři kontrakty, které fake
+hodoval špatně, přepsány podle měření (commit `1b49348`):
+
+- **`get_Size` lže** — vždy vrací rozlišení senzoru, ať je BINNING nebo
+  ROI jakkoli. Skutečná velikost rámu je v info záznamu každého rámu.
+  Podle `get_Size` se overview 2074×1388 přepisoval jako devět full-size
+  rámu nad sebou → **záhada „Mosaik“ v GUI je vyřešena**, hardware
+  potvrzuje čisté 2074×1388 @ 3,4 fps a ROI 1200×1200 @ ~11,4 fps.
+  (Pozor: binning zaokrouhluje sudě — 1388, ne 4168/3.)
+- **buffery jsou `c_char_p`** — ndarray i `POINTER(c_ubyte)` odmítnuté na
+  volání; `create_string_buffer` + `np.frombuffer` výběr rámu.
+- **still nepřišel přes `WaitImageV4`** (vždy `E_UNEXPECTED`) —
+  `capture()` nyní čeká na `TOUPCAM_EVENT_STILLIMAGE` a sahá pro
+  `PullStillImageV2`. Full-size still 6224×4168: 2,6 s, TIFF round-trip
+  ok, teplota senzoru zaznamenána.
+
+Dodatečná měření: `get_ExpoAGainRange` = **0,1–10×** (mock i instrukce
+opraveny; pro archiv zůstává 1,00× — 16bit ADC, <1× jen tłumí),
+TEC projede **32 → −5 °C za ~3 min** (semafor ±2 °C se zavře zhruba za
+tři minuty od nastavení cíle). FakeHcam teď napodobuje všechna tři
+odchylky SDK od dokumentace, takže regrese padají i bez hardwaru
+(263 testů zelených).
+
 ## 2026-09-17 — přechod na Touptek TS2600MP-G2 (monokrystal bez zrcátka)
 
 Kolo **bez fotoaparátu** — vše níže je testováno proti MockCamera a FakeHcam
