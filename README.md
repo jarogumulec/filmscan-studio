@@ -1,108 +1,101 @@
 # FilmScan Studio
 
-Reproducible digitisation of photographic film via DSLR (Nikon D750).
-Two deliberately separate modules: **Capture** (camera → RAW + metadata) and
-**Developer** (RAW → 16-bit TIFF). Acquisition never influences development and
-neither module can corrupt the other's data.
+Reproducible digitisation of photographic film on a **Touptek TS2600MP-G2**
+mono astro camera (Sony IMX571, 6224×4168, 16-bit, TEC-cooled) instead of a
+DSLR. Two deliberately separate modules: **Capture** (camera → 16-bit TIFF +
+metadata) and **Developer** (TIFF → developed 16-bit TIFF). Acquisition never
+influences development and neither module can corrupt the other's data.
+
+The D750 era (PTP/gphoto2 + Nikon SDK) lives on branch `D750`; see
+`INSTRUCTIONS_TOUPTEK_CAMERA.md` for the migration spec.
 
 ```
 uv run filmscan-studio          # Capture GUI (PySide6)
-uv run filmscan-studio --mock   #   …with a simulated D750, no camera needed
+uv run filmscan-studio --mock   #   …with a simulated TS2600MP-G2, no camera needed
 uv run filmscan-develop RAW...  # Developer CLI → 16-bit TIFF + sidecar
-uv run pytest                   # 246 tests
+uv run pytest                   # 262 tests
 ```
 
 ## Design rules the code enforces
 
 | Rule | Where |
 |---|---|
-| Metadata lives in JSON sidecars + SQLite, **never** written into the DNG/NEF | `capture/session.py` — raw files are copied, never opened for writing |
-| Histogram is always **linear sensor data**, in both preview modes | `core/histogram.py`, `gui/capture_window.py` |
-| Auto exposure targets the **99.9th percentile** with 0.4 EV headroom, on linear data only, never on the inverted preview | `core/exposure.py`, `capture/autoexposure.py` |
-| Working Positive preview (invert + base + curve) **cannot touch the stored RAW** | preview is a display-only transform in `core/positive.py` |
+| Metadata lives in JSON sidecars + SQLite, **never** written into the TIFF | `capture/session.py` — raw files are copied, never opened for writing |
+| Histogram is always **linear sensor data**, in both preview modes — the stream is linear, so one honest path replaced the D750's two disagreeing ones | `core/histogram.py`, `gui/capture_window.py` |
+| Auto exposure targets the **99.9th percentile** with 0.4 EV headroom, metered from the linear stream itself | `core/exposure.py`, `capture/autoexposure.py` |
+| Working Positive preview (invert + base + curve) **cannot touch the stored raw** | preview is a display-only transform in `core/positive.py` |
 | Dark frames rescale by **shutter ratio only** (dark current precedes electronic gain); sensor pedestal is not scaled | `core/calibration.py::rescale_dark` |
 | Flat fields need **no matching exposure** — dark-subtracted, then mean-normalised | `developer/pipeline.py::_calibrate_above_black` |
-| One thread owns the camera at a time (libgphoto2 is not thread-safe) | `gui/capture_window.py::CameraWorker`, `gui/liveview.py` |
-| No custom demosaicing — LibRaw interpolates the calibrated mosaic via the rawpy buffer trick | `developer/pipeline.py::develop_colour` |
-| Archival scans happen at **ISO 100 only** — capture is blocked at any other sensitivity, exposure lives in the shutter | `core/exposure.py::ARCHIVE_ISO`, `_capture_block_reason` |
-| WB gains are solved once (film base / AE rect) and **locked for the whole film** — never per frame, never by the body | `core/positive.py::estimate_wb_gains`, `PositiveParams.wb_gains` |
-| Display zoom is a **whole multiple of the stream** (×1 ×2 ×3, nearest) — a fractional factor resamples grain and lies about focus | `gui/widgets.py::ZoomView.source_zoom` |
-| Every NEF is audited after capture (red-rect region, p99.9 target); the shutter for the *next* frame is corrected automatically | `capture/quality.py::audit_nef` |
+| One thread owns the camera at a time (the SDK is not thread-safe) | `gui/capture_window.py::CameraWorker`, `gui/liveview.py` |
+| Archival scans happen at **gain 1.00× only** — capture is blocked at any other sensitivity, exposure lives in the shutter | `core/exposure.py::ARCHIVE_GAIN`, `_capture_block_reason` |
+| Every scan is audited after capture (p99.9 target, optional red-rect region); the shutter for the *next* frame is corrected automatically | `capture/quality.py::audit_frame` |
+| Export **warns per frame number** when a scan has no dark measured within ±0.5 °C — dark subtraction on a cooled sensor only holds in a narrow temperature window | `capture/session.py::export_project` |
+| Display zoom is labelled in **sensor pixels** and drawn at a whole multiple of the delivered stream; ≥3× switches the sensor to a 1:1 hardware ROI (Stop → reconfigure → Start) | `core/zoom.py`, `gui/widgets.py::ZoomView` |
+| The zoom note states honestly what one stream pixel is worth (3×3 binned overview vs 1:1 ROI vs interpolation) | `gui/capture_window.py::_update_zoom_note` |
 
-## The macOS `ptpcamerad` problem
+## The camera
 
-macOS runs `ptpcamerad`, which claims the PTP interface and makes libgphoto2
-fail with `-53 Cannot allocate USB device`. It cannot be disabled (SIP) and
-respawns when killed. `GPhoto2Backend.connect()` therefore runs a retry loop
-that `pkill -9`s the daemon between attempts; connection normally succeeds in
-about 1–2 s. Close Photos/Image Capture manually before connecting — they hold
-the device differently and the daemon kill will not free them.
+TS2600MP-G2 (= ATR2600M): IMX571 APS-C mono, 6224×4168 @ ~6.5 fps full
+16-bit USB3, native 16-bit ADC (no demosaic, no gamma, no auto-brightness —
+what the stream measures is what the file holds), two-stage TEC to ΔT −42 °C,
+**needs external 11–14 V power** — without it the camera may not enumerate on
+USB at all (the connect dialog says so). The vendor SDK
+(`capture/_toupcam/`, universal dylib x86_64+arm64, vendored — see that
+directory) is driven directly; no gphoto2, no PTP, no `ptpcamerad` fights.
 
-## Measured on real hardware (D750, this machine)
-
-- Live View via python-gphoto2 bindings: **~38–43 fps** at 640×424 JPEG —
-  the Nikon SDK is unnecessary (the gphoto2 *CLI* only manages ~1–8 fps;
-  persistent-session bindings are the difference).
-- Connect with retry: ~1.2 s. Still capture + NEF download: ~1.7 s.
-- 29 ISO choices, 52 shutter choices; **no aperture control** over USB
-  (manual AI lens — the app says so in the UI instead of faking it).
-- `viewfinder` config needs integer `1`, not `'1'`; choice lists are localised
-  („Paměťová karta") and matched by substring.
+Stream design: a 3×3-binned whole-sensor overview (~2074×1389) is the honest
+everyday stream — one stream pixel is the mean of 3×3 sensor pixels, so
+metering on it is honest. Display zoom ≥3× swaps it for a 1200×1200 1:1
+hardware ROI around the point you are looking at (focusing at true pixel
+detail); below 3× the overview already shows every real detail and the swap
+is refused on principle.
 
 ## Workflow
 
 **Capture:** Nový film (metadata dialog) → *Dark Frame* → *Flat Field* →
 frame-by-frame *Capture* (auto frame numbering matching the canister) →
-*Exportovat projekt*. Each film is a folder: untouched camera files +
-`<raw>.json` sidecars + `catalog.sqlite` + `project.json`. Scans run at
-**ISO 100** (the Capture button refuses any other sensitivity); *Auto
-Exposure* solves with the shutter alone. On the SDK backend a capture keeps
-Live View on (mirror stays raised, no shake); if the body refuses, it falls
-back to a Live View cycle and remembers. After every scan the NEF is
-**audited** against the red-rect region and the next frame's shutter is
-corrected, and a positive `frameNNN.jpg` is rendered from the RAW beside it.
+*Exportovat projekt*. Each film is a folder: untouched 16-bit TIFFs +
+`<raw>.tif.json` sidecars + `catalog.sqlite` + `project.json`. Scans run at
+**gain 1.00×** (the Capture button refuses any other sensitivity); *Auto
+Exposure* solves with the shutter alone while the archival-gain button is
+checked. The cooling panel shows current/target temperature with a
+traffic-light semaphore — green means "u cíle — darky platí". After every
+scan the TIFF is **audited** (whole frame, or the red AE rect while streaming
+the overview) and the next frame's shutter is corrected; a positive
+`frameNNN.jpg` is rendered from the TIFF beside it. The export lists any scan
+whose darks sit further than ±0.5 °C away.
 
 **Two preview modes:** *RAW View* (display gamma only — judge exposure here)
 and *Working Positive* (auto base subtraction, inversion, preview exposure,
 Fritsch–Carlson spline filmic with Toe/Gamma/Shoulder — judge the picture
 here, it changes nothing on disk). The live Working Positive runs through a
 per-channel LUT (`FastPositivePreview`) so the tone curve costs one lookup
-per pixel; *Auto WB* locks gains for the whole film. Display zoom is whole
-multiples of the delivered stream (×1 ×2 ×3, nearest-neighbour).
+per pixel. Mono sensor: no WB to chase, but the WB controls still exist for
+the colour preview chain (tested for determinism; currently exposed nowhere).
 
-**Developer:** `filmscan-develop scan.NEF --dark darks/ --flat flats/
---params look.json -o out/ --jpeg`. Pipeline: dark → flat → demosaic (LibRaw)
-→ base subtraction → inversion → exposure → filmic → 16-bit TIFF (+
-`.develop.json` provenance with a parameter fingerprint, so any export can be
-re-generated bit-identically).
+**Developer:** `filmscan-develop frameNNN.tif --dark darks/ --flat flats/
+--params look.json -o out/ --jpeg`. Pipeline: dark → flat → base subtraction
+→ inversion → exposure → filmic → 16-bit TIFF (+ `.develop.json` provenance
+with a parameter fingerprint, so any export can be re-generated
+bit-identically).
 
 ## Status
 
-- **v1 (this code):** Capture GUI complete against MockCamera; Developer CLI
-  complete against a real NEF; 152 tests.
-- Live D750: connect, settings, metering and 38 fps Live View verified
-  end-to-end through the app's own backend. *Still capture* pending on the
-  camera's absent/unformatted memory card (software path proven previously).
-- **Nikon SDK track — viable, backend wired:** MAID3 bindings
-  (`capture/nikon_sdk.py`) + hardware probe (`capture/sdk_probe.py`) +
-  `NikonSdkBackend` served by an x86_64 JSON-RPC helper
-  (`capture/nikon_backend.py` ↔ `capture/sdk_server.py`). The probe on the
-  real D750: module loads under Rosetta on macOS 15.5 (official support ends
-  at 14), camera-side Live View zoom works (640×480 crop at 100 % vs
-  640×424 whole frame), ~6.5 fresh fps, `ExposureStatus` (Float) readable
-  during LV, NEF capture + download in ~2 s, MfDrive absent (manual lens —
-  as expected). Caveat found on hardware: with the mode dial on **A** the
-  body refuses shutter/exposure-mode writes — set the dial to **M** (or S)
-  for scripted exposure control; ISO + ExposureComp work in any mode.
-  Setup: `scripts/install_helper.sh`, `scripts/install_sdk.sh` (sudo once),
-  verify with `scripts/probe.sh --capture`. The GUI connect dialog offers
-  "Nikon D750 (Nikon SDK)" first and falls back to gphoto2 automatically.
+- **v2 (this code):** Capture GUI + Touptek backend + rebuilt test suite
+  (262 tests) complete against MockCamera; Developer CLI complete on mono
+  TIFFs.
+- **Pending hardware verification** (`INSTRUCTIONS_TOUPTEK_CAMERA.md` §11):
+  real fps at the 0x83 binning, Snap-in-RAW-mode behaviour, ExpoAGain units,
+  enumeration under missing power, real TEC settling, the
+  `put_Roi(0,0,W,H)`-as-ROI-off assumption. Every assumption the fake SDK
+  (`tests/test_touptek.py::FakeHcam`) makes is listed there as a checklist
+  item in waiting.
 - Planned: Developer GUI (share `gui/widgets.py` + pipeline), film profiles
-  (`{name, toe, gamma, shoulder}` JSON, loaded by `FilmicProfile.from_dict`),
-  Linux packaging, Windows.
+  (`{name, toe, gamma, shoulder}` JSON), Linux packaging, Windows.
 
 ## Requirements
 
 Python 3.12 via [uv](https://docs.astral.sh/uv/); `uv sync` installs
-everything (PySide6, rawpy/LibRaw, OpenCV, gphoto2 bindings 2.6.4 — the system
-needs no libgphoto2, the wheel bundles it).
+everything (PySide6, numpy, OpenCV, tifffile, pydantic). The Touptek SDK
+dylib is vendored in the repo — nothing to download; the camera needs 11–14 V
+DC power and a USB3 port.

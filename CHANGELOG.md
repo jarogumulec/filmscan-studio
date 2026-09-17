@@ -3,6 +3,82 @@
 Vše, co se od posledního stavu změnilo, a hlavně: **co nešlo bez fotoaparátu
 ověřit** a jak to poznat při prvním zapnutí s tělem.
 
+## 2026-09-17 — přechod na Touptek TS2600MP-G2 (monokrystal bez zrcátka)
+
+Kolo **bez fotoaparátu** — vše níže je testováno proti MockCamera a FakeHcam
+(262 testů), na hardwaru neověřeno. Specifikace přechodu:
+`INSTRUCTIONS_TOUPTEK_CAMERA.md`; její §11 je **checklist pro první zapnutí
+s pravou kamerou** — každý předpoklad, který fake SDK dělá, je tam bod.
+Starý D750/gphoto2/SDK kód je smazán ze `main` a žije na branchi `D750`;
+staré NEF projekty se záměrně nenačítají (clean transition).
+
+### 1) Nová data: 16-bit TIFF místo NEFu
+
+`core/rawio.py` přepsán na `tifffile`: archivní snímek je mono uint16 TIFF,
+sidecar JSON nezapisuje do RAWu (zkoušeno testem „nikdy nemodifikuje zdroj“).
+Rawpy/LibRaw demosaicing z develop pipelineu odešel s mozaikou — monokrystal
+žádnou nemá.
+
+### 2) `TouptekCamera` — nativní backend přes vendor SDK
+
+`capture/touptek.py` + vendované `capture/_toupcam/` (toupcam.py +
+univerzální dylib 43 MB, x86_64+arm64 — žádný Rosetta helper, na rozdíl od
+Nikonu). Jednotky SDK se přepínají na backend kontrakt: shutter µs
+(clamp 300 µs–1800 s), gain celá permile (readback po zápisu), teplota a
+TECTARGET v 0,1 °C. Ověřeno `tests/test_touptek.py` (33 testů) přes FakeHcam,
+který hlídá i to, co SDK jen slibuje: audit voleb po zápisu, Stop-před-
+překonfigurováním (E_WRONG_THREAD), drop-oldest frontu, sekvenci Snapu
+v RAW módu. **Při prvním zapnutí ověř:** fps při binningu 0x83, chování
+Snapu v RAW módu, jednotky ExpoAGain, enumeraci bez napájení, reálné
+dosetí TECu, a předpoklad `put_Roi(0,0,W,H)`-jako-vypnutý-ROI.
+
+### 3) Live View je lineární 16-bit data — jedna upřímná cesta
+
+Žádný JPEG, žádné auto-jas, žádná predikce NEFu: proud *je* radiometrie
+snímku. `LiveViewWorker` posílá `(normalizovaný 0..1 float, měření)` vždy spolu; histogram, AE i náhled se nikdy neliší v tom, co měří. Predikční
+přepínač histogramu (`hist_predict`) i `body_ev` kanál zemřely na nadbytečno.
+
+### 4) Zoom mluví jazykem senzoru — overview 3×3 vs hardware ROI
+
+Značky zoomu (100/200/400 %) jsou px obrazovky na **px senzoru**. Do 3×
+ostříme na 3×3-binned overviewu (2074×1389, lineární průměr = poctivé
+měření); od 3× vysílá senzor 1:1 ROI 1200×1200 kolem hledaného bodu
+(`core/zoom.py::stream_plan`; Stop → překonfigurovat → Start, kvůli
+E_WRONG_THREAD). Pozámka pod zoomem se přepočítává každý frame — lhaní
+přes „zobrazení ×N“ je ten problém, který widget existuje dělat.
+Ověřeno end-to-end proti Mocku (`stream_history`); na kameře viz §11.
+
+### 5) GUI: gain místo ISO, TEC panel, audit z TIFFu
+
+- **Gain, ne ISO:** spinbox 1.00–8.00×, tlačítko „Gain 1.00× (archiv)“.
+  Archivní pravidlo přežilo: Capture při jiném gainu odmítne
+  (`_capture_block_reason`), AE při zamčeném tlačítku řeší jen časem.
+- **Chlazení:** panel s teplotou/cílem (−35…20 °C), TEC přepínač a
+  semaphore ● — zelená = „u cíle“ (±2 °C), darky platí. Export projektu
+  vrací `(zip, [čísel snímků bez darku ve stejné teplotě ±0,5 °C])` a GUI
+  je hlasitě vyjmenuje. Mock modeluje TEC zrychleně ×20.
+- **Audit:** `audit_frame` čerstvý TIFF (přímo produkční `rawio`), náhledový
+  JPEG se renderuje off-thread; verdikt ≠ ok přepne čas na `×2^EV` a řekne
+  „tento snímek zopakuj“.
+- Připojovací dialog hlídá **napájení 11–14 V** (bez něj kamera není na USB).
+
+### 6) Test suite přepracován na nové kontrakty (262 testů)
+
+`test_touptek.py` nový; `test_gui.py` proti ROI/gain/chlazení (d750 třídy
+body-crop, predikce NEFu a RAW-media guard smazeny s mizejícími featurami);
+`test_capture/quality/zoom/developer` na reálných TIFF výstupech Mocku
+(žádná injikace readeru — testy čtou produkční cestou). Testy zachytily
+tři reálné bogy: `info.v3.expotime` (V4 obaluje V3 — padal každý capture),
+Mock lhal teplotou u nechazené kamery, `display_scale` dělil zoom(scale).
+
+### Odstraněno (nebojte, je to na `D750`)
+
+gphoto2/Nikon backendy + SDK helper, `ptpcamerad` retry, Nikon MAID bindings,
+NEF/LibRaw demosaic v developeru, `develop_colour` (color cesta), WB UI
+(tlačítka z GUI odešla; WB math zůstává v `core/positive.py` pro barevný
+náhledový řetězec a je pod testy determinismu), ISO widgety, body-zoom
+(`set_live_view_zoom`), predikce histogramu, kontrola NEF media nastavení.
+
 ## 2026-09-16 — čtvercový náhled, celé násobky zoomu, WB, zrcadlo nahoře, ISO 100 tvrdě, audit NEFu
 
 Kolo **bez připojeného těla** — vše níže neověřeno na hardwaru, testováno
