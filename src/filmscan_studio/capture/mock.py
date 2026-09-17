@@ -46,7 +46,10 @@ MOCK_SENSOR = SensorSize(6224, 4168)
 MOCK_BLACK = 0.0
 MOCK_WHITE = 65535.0
 #: The SDK's analog gain range, in linear multipliers (permille 1000..8000).
-MOCK_GAIN_RANGE = (1.0, 8.0)
+# Measured on the real ATR2600M (get_ExpoAGainRange): 0.1x..10x. The floor
+# is below unity — the sensor can attenuate, which is honest AE room but
+# never an archival setting (ARCHIVE_GAIN is pinned at 1.00x).
+MOCK_GAIN_RANGE = (0.1, 10.0)
 #: Simulated dark-current DN per second of exposure at the archive gain.
 MOCK_DARK_DN_PER_S = 6.0
 #: Sensor temperature physics: ambient the sensor drifts toward, °C per minute

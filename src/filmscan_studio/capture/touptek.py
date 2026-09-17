@@ -18,9 +18,10 @@ What this module adds on top of the raw SDK:
   SDK refuses ``BINNING``/``ROI`` changes from the callback context, so a
   mode change is always Stop -> configure -> Start, and every call runs on
   the caller's thread (the GUI's CameraWorker), never in the callback.
-* **Capture** reconfigures the stream to full-sensor 1:1, waits one frame
-  (``WaitImageV4`` with the SDK's exposure-aware default timeout — the frame
-  that arrives *is* the exposure), writes the mono TIFF through
+* **Capture** reconfigures the stream to full-sensor 1:1, ``Snap``, waits
+  for ``TOUPCAM_EVENT_STILLIMAGE`` on the callback and pulls with
+  ``PullStillImageV2`` (measured on the ATR2600M; ``WaitImageV4`` never
+  delivers a Snap'd still there), writes the mono TIFF through
   :func:`filmscan_studio.core.rawio.write_frame`, and restores the previous
   Live View mode when asked.
 * **Cooling**: TEC on/off, setpoint exchanged in the SDK's 0.1 °C units,
@@ -36,6 +37,7 @@ from __future__ import annotations
 import logging
 import queue
 import time
+from ctypes import create_string_buffer
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +78,9 @@ EXPO_TIME_RANGE_US = (300, 1_800_000_000)
 GAIN_UNIT = 1000.0
 #: How long the live-view poll tolerates a silent stream before erroring.
 FRAME_TIMEOUT_S = 5.0
+#: Still-event wait on top of the exposure itself (ATR2600M: 1 s still
+#: arrived ~0.9 s after Snap — readout + USB download).
+STILL_WAIT_HEADROOM_S = 15.0
 
 #: Option writes the raw contract consists of, as (option, wanted, label).
 #: Verified after connect (and before every capture) by :func:`audit_options`;
@@ -218,7 +223,7 @@ class TouptekCamera(CameraBackend):
         # Stream mode the pull loop is configured for right now:
         self._binning = OVERVIEW_BINNING
         self._roi: Roi | None = None
-        self._buf: np.ndarray | None = None
+        self._buf: object | None = None       # ctypes char buffer, see _start_stream
         self._stream_size = (0, 0)
 
     # ------------------------------------------------------------------ identity
@@ -382,9 +387,19 @@ class TouptekCamera(CameraBackend):
 
     def _start_stream(self) -> None:
         self._configure_stream()
+        # get_Size reports the *sensor* resolution on this model even with
+        # binning or ROI active (hardware-measured) — it bounds the buffer,
+        # never the frame. The delivered frame size comes from each frame's
+        # own info record; sizing by get_Size reshaped one 2074x1388 overview
+        # frame as nine full-size ones and showed a mosaic.
         width, height = self._hcam.get_Size()
-        self._stream_size = (width, height)
-        self._buf = np.zeros((height, width), dtype=np.uint16)
+        # The wrapper's argtypes is c_char_p: the SDK writes into a char
+        # buffer, not an ndarray (hardware-measured: arrays and POINTERs
+        # both raise TypeError at the call). A create_string_buffer is the
+        # mutable form c_char_p accepts — the vendor samples pass an
+        # immutable bytes and let the SDK overwrite it, which only works by
+        # CPython accident. Frames are copied out under the callback.
+        self._buf = create_string_buffer(height * width * 2)
         # StartPullModeWithCallback pins `self` as the ctypes ctx and keeps
         # the trampoline referenced on the handle — no dangling callback.
         self._hcam.StartPullModeWithCallback(self._on_event, None)
@@ -393,21 +408,32 @@ class TouptekCamera(CameraBackend):
         """SDK-thread callback: copy, queue, nothing else — never options.
 
         ``TOUPCAM_EVENT_IMAGE`` means one frame is ready for PullImageV4
-        into the sized buffer. A full queue drops the *oldest* frame: live
-        view wants the newest frame, never a backlog (the D750 worker had
-        the same freshness rule).
+        into the (sensor-sized) buffer; the frame's own info record carries
+        its true size, which is what the queue carries onward. A full queue
+        drops the *oldest* frame: live view wants the newest frame, never a
+        backlog (the D750 worker had the same freshness rule).
         """
         if event != sdk.TOUPCAM_EVENT_IMAGE or self._hcam is None:
             return
         buf = self._buf
         if buf is None:
             return
+        info = sdk.ToupcamFrameInfoV4()
         try:
-            self._hcam.PullImageV4(buf, 0, 16, 0, None)
-        except sdk.HRESULTException as exc:
-            log.warning("PullImageV4 selhalo (hr=0x%x)", exc.hr & 0xffffffff)
+            self._hcam.PullImageV4(buf, 0, 16, 0, info)
+        except Exception as exc:  # noqa: BLE001 - a raised exception here
+            # escapes into ctypes and prints a traceback per frame; the SDK
+            # thread must never see Python noise.
+            log.warning("PullImageV4 selhalo: %s", exc)
             return
-        frame = (buf.copy(), self._stream_size)
+        width, height = int(info.v3.width), int(info.v3.height)
+        if width <= 0 or height <= 0:
+            return
+        # A copy, not a view: the SDK thread is already overwriting the
+        # buffer for the next frame while the UI reads this one.
+        data = (np.frombuffer(buf, dtype=np.uint16, count=width * height)
+                .reshape(height, width).copy())
+        frame = (data, (width, height))
         try:
             self._frames.put_nowait(frame)
         except queue.Full:
@@ -443,10 +469,13 @@ class TouptekCamera(CameraBackend):
 
         Never the streamed frame — the archive must not inherit a binned or
         cropped preview (``CameraBackend.capture`` contract). Stop the live
-        stream, reconfigure to full sensor without binning, ``Snap`` the
-        still, ``WaitImageV4`` with the SDK's exposure-aware default timeout
-        (``waitMS=0`` → exposure × 1.02 + 4 s; it cannot time out on a long
-        exposure), then restore the previous Live View mode when asked.
+        stream, reconfigure to full sensor without binning, ``Snap``, then
+        wait for ``TOUPCAM_EVENT_STILLIMAGE`` on the callback and pull with
+        ``PullStillImageV2`` — the still-frame flow measured on the real
+        ATR2600M (``WaitImageV4`` delivers nothing for a Snap: E_UNEXPECTED
+        for any waitMS, and waitMS=0 additionally means "return immediately"
+        rather than a sensible default, whatever the docstring says). Then
+        restore the previous Live View mode when asked.
         """
         self._require()
         started = time.monotonic()
@@ -467,20 +496,38 @@ class TouptekCamera(CameraBackend):
             if (width, height) != (self._sensor.width, self._sensor.height):
                 notes.append(f"still size {width}x{height} místo "
                              f"{self._sensor.width}x{self._sensor.height}")
-            buf = np.zeros((height, width), dtype=np.uint16)
-            self._hcam.StartPullModeWithCallback(self._on_event, None)
-            try:
-                self._hcam.Snap(0xFFFFFFFF)     # 0xffffffff = current preview res
-            except sdk.HRESULTException as exc:
-                notes.append(f"Snap odmítnut (hr=0x{exc.hr & 0xffffffff:x})")
+            # Same c_char_p contract as the live buffer (_start_stream).
+            buf = create_string_buffer(height * width * 2)
             info = sdk.ToupcamFrameInfoV4()
+            still_events: queue.Queue = queue.Queue()
+            self._hcam.StartPullModeWithCallback(
+                lambda event, _ctx: still_events.put(event), None)
             try:
-                # waitMS=0: the documented default timeout already scales
-                # with the exposure time — right for 30-minute dithers too.
-                self._hcam.WaitImageV4(0, buf, 0, 16, 0, info)
+                self._hcam.Snap(0xFFFFFFFF)     # 0xffffffff = current res
+                # Exposure time + readout + download headroom; the ATR2600M
+                # delivered a 1 s still in ~1.9 s.
+                deadline = (time.monotonic() + self._settings.shutter
+                            + STILL_WAIT_HEADROOM_S)
+                arrived = False
+                while time.monotonic() < deadline:
+                    try:
+                        event = still_events.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if event == sdk.TOUPCAM_EVENT_STILLIMAGE:
+                        arrived = True
+                        break
+                if not arrived:
+                    raise CameraError(
+                        f"still expozice {self._settings.shutter:g} s "
+                        "nedodala snímek (do 15 s žádná STILLIMAGE událost) "
+                        "— zkontroluj napájení a kabel")
+                self._hcam.PullStillImageV2(buf, 16, info)
             except sdk.HRESULTException as exc:
                 raise CameraError(
                     f"exposice nedodala snímek (hr=0x{exc.hr & 0xffffffff:x})")
+            still = (np.frombuffer(buf, dtype=np.uint16, count=width * height)
+                     .reshape(height, width))
             temp = self.get_temperature_c()
             acquisition = AcquisitionMetadata(
                 camera=self._info.model,
@@ -491,7 +538,7 @@ class TouptekCamera(CameraBackend):
             )
             destination.mkdir(parents=True, exist_ok=True)
             target = destination / f"{filename_stem}.tif"
-            write_frame(target, buf, acquisition=acquisition,
+            write_frame(target, still, acquisition=acquisition,
                         black_level=0.0, white_level=WHITE_LEVEL_16BIT)
             # V4 wraps the V3 record; expotime lives on the inner struct.
             if info.v3.expotime:

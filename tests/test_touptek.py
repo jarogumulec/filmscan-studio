@@ -11,6 +11,7 @@ matching test must fail, not silently pass.
 
 from __future__ import annotations
 
+
 import numpy as np
 import pytest
 
@@ -48,8 +49,11 @@ class FakeHcam:
     """Records every call; answers plausibly; enforces stream-state rules."""
 
     def __init__(self, *, options: dict[int, int] | None = None,
-                 size: tuple[int, int] = (2074, 1389),
+                 size: tuple[int, int] = (6224, 4168),
                  gain_range=(1000, 8000, 1000), refuse_options=()) -> None:
+        # size is what get_Size answers — hardware: always the sensor
+        # resolution, binning/ROI notwithstanding. Delivered frames come
+        # from delivered_size().
         self.calls: list[tuple] = []
         self.options = dict(options or {})
         self.refused = set(refuse_options)
@@ -97,8 +101,10 @@ class FakeHcam:
     # -- geometry -----------------------------------------------------------
     def put_Roi(self, x: int, y: int, w: int, h: int) -> None:
         self.calls.append(("put_Roi", x, y, w, h))
-        self.roi = (x, y, w, h)
-        self._size = (w, h)
+        # put_Roi over the whole sensor IS "ROI off" — the hardware idiom
+        # _configure_stream uses — and binning then applies again.
+        self.roi = None if (x, y) == (0, 0) and (w, h) == self._size \
+            else (x, y, w, h)
         self._check_not_running("put_Roi")
 
     def put_Size(self, w: int, h: int) -> None:
@@ -118,16 +124,40 @@ class FakeHcam:
         self.calls.append(("Stop",))
         self.stream_running = False
 
+    # -- image pulls -----------------------------------------------------------
     def PullImageV4(self, buf, width, bits, pitch, info) -> None:
-        self.pulls.append((buf.shape, bits, width, pitch))
-        buf[:] = 4242
+        # Hardware contract on the ATR2600M: the image argument is a char
+        # buffer (c_char_p argtypes — arrays/POINTERs raise TypeError) and
+        # *the frame's own info record* carries its true size, because
+        # get_Size keeps naming the sensor resolution whatever binning or
+        # ROI is active. A backend sizing by get_Size shows a mosaic; the
+        # fake reproduces the mismatch so such a regression fails here.
+        w, h = self.delivered_size()
+        self.pulls.append(((h, w), bits, width, pitch))
+        np.frombuffer(buf, dtype=np.uint16, count=w * h).reshape(h, w)[:] = 4242
+        if info is not None:
+            info.v3.width, info.v3.height = w, h
 
-    def WaitImageV4(self, wait_ms, buf, width, bits, pitch, info) -> None:
-        self.waited.append((wait_ms, buf.shape, bits))
-        buf[:] = 999
+    def PullStillImageV2(self, buf, bits, info) -> None:
+        w, h = self._size
+        self.pulls.append(((h, w), bits))
+        np.frombuffer(buf, dtype=np.uint16, count=w * h).reshape(h, w)[:] = 999
+
+    def delivered_size(self) -> tuple[int, int]:
+        """What the stream actually sends: get_Size is *not* this."""
+        if self.roi is not None:
+            return (self.roi[2], self.roi[3])
+        binning = self.options.get(_const("BINNING"), OVERVIEW_BINNING)
+        if binning == OVERVIEW_BINNING:
+            return (self._size[0] // 3, self._size[1] // 3)
+        return self._size
 
     def Snap(self, flag: int) -> None:
         self.calls.append(("Snap", flag))
+        # Hardware fires TOUPCAM_EVENT_STILLIMAGE when the exposed still is
+        # ready (~exposure + readout); the fake delivers it straight away —
+        # capture waits on the event, so the ordering is all that matters.
+        self._callback(sdk.TOUPCAM_EVENT_STILLIMAGE, None)
 
     def fire_frame(self) -> None:
         """Simulate one SDK-thread TOUPCAM_EVENT_IMAGE callback."""
@@ -305,20 +335,23 @@ class TestStreamModes:
         fake.fire_frame()
         frame = camera.next_live_frame()
         assert fake.pulls and fake.pulls[-1][1] == 16
-        buf_shape, _bits, width, _pitch = fake.pulls[-1]
-        assert buf_shape == (frame.height, frame.width)
+        pull_shape, _bits, width, _pitch = fake.pulls[-1]
+        assert pull_shape == (frame.height, frame.width)
         assert width == 0                        # 0 = full buffer width
-        assert (frame.width, frame.height) == fake._size
+        # The frame arrives at the *delivered* (binned) size — get_Size
+        # still says the sensor resolution, trusting it would reshape a
+        # 2074x1388 overview as nine full-size frames (the mosaic).
+        assert (frame.width, frame.height) == fake.delivered_size()
+        assert (frame.width, frame.height) == (2074, 1389)
         assert frame.data.dtype == np.uint16
         assert frame.white_level == 65535.0
 
     def test_stale_frames_dropped_newest_kept(self, fake, camera) -> None:
         camera.start_live_view()
-        fake._size = fake._size          # same size; contents differ per pull
         fake.fire_frame()
         fake.fire_frame()
         _data, size = camera._frames.get_nowait()   # queue maxsize=1
-        assert size == fake._size
+        assert size == fake.delivered_size()
 
     def test_silent_stream_times_out_as_camera_error(self, camera, monkeypatch) -> None:
         monkeypatch.setattr(touptek, "FRAME_TIMEOUT_S", 0.01)
@@ -342,7 +375,7 @@ class TestCapture:
         frame = open_frame(result.path)
         assert (frame.width, frame.height) == (6224, 4168)
         assert frame.data.dtype == np.uint16
-        assert int(frame.data.max()) == 999   # what WaitImageV4 filled
+        assert int(frame.data.max()) == 999   # what PullStillImageV2 filled
         assert result.bit_depth == 16
         assert result.sensor_temperature_c == pytest.approx(-5.2)
 
@@ -357,8 +390,10 @@ class TestCapture:
         assert ("put_Roi", 0, 0, 6224, 4168) in fake.calls
         assert ("put_Size", 6224, 4168) in fake.calls
         assert ("Snap", 0xFFFFFFFF) in fake.calls
-        assert fake.waited and fake.waited[-1][0] == 0  # exposure-aware timeout
-        assert fake.waited[-1][2] == 16                 # 16-bit pull
+        # The still comes via TOUPCAM_EVENT_STILLIMAGE + PullStillImageV2 —
+        # never WaitImageV4 (hardware: a Snap'd still never arrives there).
+        assert fake.waited == []
+        assert fake.pulls and fake.pulls[-1][1] == 16   # 16-bit pull
 
     def test_capture_restores_live_view_mode(self, fake, camera, tmp_path) -> None:
         camera.start_live_view()
@@ -376,14 +411,25 @@ class TestCapture:
         camera.capture(tmp_path, "f", keep_live_view=False)
         assert fake.stream_running is False
 
-    def test_wait_timeout_surfaces_as_camera_error(
+    def test_pull_refusal_surfaces_as_camera_error(
         self, fake, camera, tmp_path
     ) -> None:
         def refuse(*_args):
             raise sdk.HRESULTException(0x80040000)
-        fake.WaitImageV4 = refuse
+        fake.PullStillImageV2 = refuse
         camera.start_live_view()
         with pytest.raises(CameraError, match="exposice"):
+            camera.capture(tmp_path, "f")
+
+    def test_missing_still_event_times_out_as_camera_error(
+        self, fake, camera, tmp_path, monkeypatch
+    ) -> None:
+        # Snap that never fires STILLIMAGE (dead cable mid-exposure) must
+        # fail as CameraError, not hang.
+        monkeypatch.setattr(touptek, "STILL_WAIT_HEADROOM_S", 0.05)
+        fake.Snap = lambda flag: fake.calls.append(("Snap", flag))
+        camera.start_live_view()
+        with pytest.raises(CameraError, match="STILLIMAGE"):
             camera.capture(tmp_path, "f")
 
     def test_settings_embedded_in_acquisition(self, fake, camera, tmp_path) -> None:
