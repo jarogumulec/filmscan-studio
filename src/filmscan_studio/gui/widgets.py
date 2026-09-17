@@ -120,6 +120,16 @@ class ZoomView(QWidget):
     def source_scale(self) -> float:
         return self._source_scale
 
+    def center_uv(self) -> tuple[float, float]:
+        """View centre in *stream* pixels (the delivered frame's own grid).
+
+        The internal centre is kept in stream px scaled by ``source_scale``;
+        dividing it back out is what the capture window needs to ask the
+        sensor for a hardware ROI around the point being looked at.
+        """
+        return (self._center.x() / self._source_scale,
+                self._center.y() / self._source_scale)
+
     def set_detail_note(self, note: str) -> None:
         """Status of the delivered stream, painted in the corner (never empty
         when zoomed — this is the widget's honesty channel)."""

@@ -23,13 +23,15 @@ from dataclasses import dataclass
 #: Sentinel zoom meaning "fit the whole frame to the widget".
 FIT = 0.0
 
-#: Display zoom steps offered by the zoom combobox (multiples of screen px
-#: per stream px). FIT first, then pixel-snapped magnifications.
+#: Display zoom steps offered by the zoom combobox, labelled in *sensor* px:
+#: 100 % = one screen pixel per sensor pixel, whichever stream delivers it
+#: (×3 nearest on the binned overview, ×1 on a ROI). FIT first, then
+#: pixel-snapped magnifications.
 ZOOM_LEVELS = (FIT, 1.0, 2.0, 4.0)
 
 ZOOM_LABELS = {
     FIT: "Vejít se",
-    1.0: "100 % — 1:1 px proudu",
+    1.0: "100 % — 1:1 px senzoru",
     2.0: "200 %",
     4.0: "400 %",
 }
@@ -133,7 +135,12 @@ def roi_for_center(sensor_x: int, sensor_y: int, sensor: SensorSize,
                    size: int = ZOOM_ROI_SIZE) -> Roi:
     """ROI window of ``size`` px centred on a sensor point, clamped inside."""
     half = size // 2
-    return Roi(sensor_x - half, sensor_y - half, size, size).clamped(sensor)
+    # The origin clamp happens *before* constructing the Roi: aiming near the
+    # top-left edge puts the nominal corner negative, which the Roi guard
+    # would (rightly) refuse — here the aim point is an intention, not a
+    # promise; clamped() then slides the window off the far edge.
+    return Roi(max(0, sensor_x - half), max(0, sensor_y - half),
+               size, size).clamped(sensor)
 
 
 def stream_plan(zoom: float,

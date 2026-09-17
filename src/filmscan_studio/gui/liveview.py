@@ -1,14 +1,16 @@
 """Live View off the UI thread.
 
-Two facts drive this module. The D750 delivers ~43 Live View frames per second
-over the python-gphoto2 bindings, and the call that fetches one blocks until a
-frame arrives. Neither is compatible with a Qt event loop: at 43 fps a queued
-signal per frame would flood it, and a blocking call in the GUI thread freezes
-the window.
+Two facts drive this module. The Touptek streams up to ~30 overview frames per
+second over USB3, and the call that fetches one blocks until a frame arrives
+(``queue.get`` behind the SDK callback). Neither is compatible with a Qt event
+loop: at full rate a queued signal per frame would flood it, and a blocking
+call in the GUI thread freezes the window.
 
 So the worker runs its own loop, drops frames the GUI has not consumed yet
 (always showing the newest, which is what focusing wants anyway), and delivers
-decoded frames at most ``max_fps`` times a second.
+*normalised linear data* plus its metering — both from the same frame, so the
+histogram and the picture always agree. The stream is already linear sensor
+data; the only transform here is the divide by the frame's own white level.
 """
 
 from __future__ import annotations
@@ -24,50 +26,38 @@ from filmscan_studio.capture.camera import CameraBackend, LiveFrame
 
 log = logging.getLogger(__name__)
 
-#: Cap on delivered frames. The D750 offers ~43; the eye does not need the rest
-#: and the tone mapping in the preview path costs real milliseconds.
-DELIVERY_FPS = 20.0
+#: Cap on delivered frames. The overview stream offers ~15-30 fps; the eye
+#: does not need the rest and the preview transform costs real milliseconds.
+DELIVERY_FPS = 15.0
 
 
 class LiveViewWorker(QThread):
-    """Polls the camera and emits linear-domain frames plus their metering.
+    """Polls the camera and emits normalised linear frames plus their metering.
 
-    Both are emitted together and always agree: the histogram and the image the
-    operator sees are the same frame, which matters because the brief requires
-    the histogram to describe linear sensor data. A histogram computed from a
-    later frame than the one on screen would be a subtle lie about exposure.
+    Both are emitted together and always agree: the histogram and the image
+    the operator sees are the same frame, which matters because the brief
+    requires the histogram to describe linear sensor data. Unlike the D750
+    there is no body meter to predict against — the stream *is* the capture's
+    radiometry, so one honest path replaced two disagreeing ones.
     """
 
-    #: (linear 0..1 luminance-ready RGB float image, meter reading for that
-    #: image, body exposure-meter EV or None when the backend has no meter)
-    frameReady = Signal(object, object, object)
+    #: (normalised 0..1 float mono image, meter reading for that image)
+    frameReady = Signal(object, object)
     error = Signal(str)
     stopped = Signal()
-
-    #: The body meter is a cheap CapGet, but not free: read it at most this
-    #: often so a 20 fps poller does not spend half its USB bandwidth on it.
-    BODY_EV_INTERVAL_S = 0.2
 
     def __init__(
         self,
         camera: CameraBackend,
         meter: LiveMeter | None = None,
         max_fps: float = DELIVERY_FPS,
-        body_ev_fn=None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._camera = camera
         self._meter = meter or LiveMeter()
-        self._body_ev_fn = body_ev_fn
         self._min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
         self._running = False
-        self._in_fetch = False
-        #: Last successful body exposure-meter reading (EV, log2 domain).
-        #: Delivered with every frame so the histogram can be *predicted* to
-        #: the exposure the NEF will actually get (see capture_window).
-        self._body_ev: float | None = None
-        self._body_ev_updated = 0.0
         #: The newest undelivered frame. Older ones are discarded, not queued:
         #: a stale frame on a focus screen is worse than a dropped one. A lost
         #: race on this single reference can only drop a frame, which is the
@@ -75,15 +65,8 @@ class LiveViewWorker(QThread):
         self._pending: LiveFrame | None = None
         #: Set by the owner before stop() when it will keep metering itself:
         #: Auto Exposure polls frames right after the worker is stopped, and
-        #: the Nikon SDK answers GetLiveViewImage with -127 if the teardown
-        #: already switched the body's Live View off (observed 2026-09).
+        #: the camera must therefore stay streaming through the teardown.
         self.leave_live_view = False
-        #: Paused workers keep Live View *on at the body* and only stop
-        #: grabbing frames: the still capture needs the USB pipe and the body's
-        #: full attention, but stopping this thread would run stop_live_view()
-        #: in its teardown, drop the mirror, and shake the camera — the exact
-        #: vertical blur the operator reported (2026-09, "zrcadlo tam lítá").
-        self._paused = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -94,25 +77,6 @@ class LiveViewWorker(QThread):
     def stop(self, wait_ms: int = 3000) -> None:
         self._running = False
         self.wait(wait_ms)
-
-    def pause_polling(self, wait_ms: int = 3000) -> None:
-        """Stop fetching frames; the body stays in Live View (mirror up)."""
-        self._paused = True
-        # Wait until the loop is demonstrably outside next_live_frame: the RPC
-        # pipe serialises, but handing the capture a free pipe *now* beats
-        # racing a frame in flight for it.
-        deadline = wait_ms / 1000.0
-        tick = 0.0
-        while self._in_fetch and tick < deadline:
-            time.sleep(0.01)
-            tick += 0.01
-
-    def resume_polling(self) -> None:
-        self._paused = False
-
-    @property
-    def polling(self) -> bool:
-        return self._running and not self._paused
 
     @property
     def running(self) -> bool:
@@ -129,20 +93,11 @@ class LiveViewWorker(QThread):
             return
         try:
             while self._running:
-                if self._paused:
-                    # Body keeps streaming (mirror stays up); we just let the
-                    # capture own the pipe. Poll cheaply — resume must feel
-                    # instant when the capture lands.
-                    self.msleep(20)
-                    continue
-                self._in_fetch = True
                 try:
                     frame = self._camera.next_live_frame()
                 except Exception as exc:  # noqa: BLE001
-                    self._in_fetch = False
                     self.error.emit(str(exc))
                     break
-                self._in_fetch = False
                 if frame is None:
                     self.msleep(5)
                     continue
@@ -155,24 +110,13 @@ class LiveViewWorker(QThread):
                     continue
                 last_delivery = now
                 try:
-                    encoded = self._meter.decode_live_frame(current)
-                    linear = self._meter.jpeg_to_linear(encoded)
-                    reading = self._meter.meter_jpeg(current)
+                    normalised, reading = self._meter.normalized_frame(current)
                 except Exception as exc:  # noqa: BLE001 - one bad frame is not fatal
                     log.debug("skipping undecodable Live View frame: %s", exc)
                     continue
-                if (
-                    self._body_ev_fn is not None
-                    and now - self._body_ev_updated >= self.BODY_EV_INTERVAL_S
-                ):
-                    self._body_ev_updated = now
-                    try:
-                        self._body_ev = self._body_ev_fn()
-                    except Exception:  # noqa: BLE001 - a missed read is not fatal
-                        log.debug("exposure_ev read failed", exc_info=True)
                 if not self._running:
                     break
-                self.frameReady.emit(linear, reading, self._body_ev)
+                self.frameReady.emit(normalised, reading)
         finally:
             if not self.leave_live_view:
                 try:
@@ -182,6 +126,13 @@ class LiveViewWorker(QThread):
             self.stopped.emit()
 
 
-def luminance(rgb: np.ndarray) -> np.ndarray:
-    """Rec. 709 luminance of a float RGB image, for histogram display."""
-    return np.asarray(rgb, dtype=np.float64) @ np.array([0.2126, 0.7152, 0.0722])
+def luminance(image: np.ndarray) -> np.ndarray:
+    """Rec. 709 luminance; a no-op passthrough for the mono stream's 2-D data.
+
+    Kept so histogram code reads the same whether a source is colour or the
+    TS2600MP-G2's single channel — the mono path must not pretend to be RGB.
+    """
+    a = np.asarray(image, dtype=np.float64)
+    if a.ndim == 2:
+        return a
+    return a @ np.array([0.2126, 0.7152, 0.0722])
