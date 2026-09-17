@@ -1,18 +1,15 @@
 # FilmScan Studio
 
 Reproducible digitisation of photographic film on a **Touptek TS2600MP-G2**
-mono astro camera (Sony IMX571, 6224×4168, 16-bit, TEC-cooled) instead of a
-DSLR. Two deliberately separate modules: **Capture** (camera → 16-bit TIFF +
-metadata) and **Developer** (TIFF → developed 16-bit TIFF). Acquisition never
-influences development and neither module can corrupt the other's data.
-
-The D750 era (PTP/gphoto2 + Nikon SDK) lives on branch `D750`; see
-`INSTRUCTIONS_TOUPTEK_CAMERA.md` for the migration spec.
+mono astro camera (Sony IMX571, 6224×4168, 16-bit, TEC-cooled). Two
+deliberately separate modules: **Capture** (camera → 16-bit TIFF + metadata)
+and **Developer** (TIFF → developed 16-bit TIFF). Acquisition never influences
+development and neither module can corrupt the other's data.
 
 ```
 uv run filmscan-studio          # Capture GUI (PySide6)
 uv run filmscan-studio --mock   #   …with a simulated TS2600MP-G2, no camera needed
-uv run filmscan-develop RAW...  # Developer CLI → 16-bit TIFF + sidecar
+uv run filmscan-develop frameNNN.tif ...  # Developer CLI → 16-bit TIFF + sidecar
 uv run pytest                   # 262 tests
 ```
 
@@ -21,8 +18,8 @@ uv run pytest                   # 262 tests
 | Rule | Where |
 |---|---|
 | Metadata lives in JSON sidecars + SQLite, **never** written into the TIFF | `capture/session.py` — raw files are copied, never opened for writing |
-| Histogram is always **linear sensor data**, in both preview modes — the stream is linear, so one honest path replaced the D750's two disagreeing ones | `core/histogram.py`, `gui/capture_window.py` |
-| Auto exposure targets the **99.9th percentile** with 0.4 EV headroom, metered from the linear stream itself | `core/exposure.py`, `capture/autoexposure.py` |
+| Histogram, auto exposure and preview all read the **same linear sensor stream** — one honest path, they can never disagree | `core/histogram.py`, `core/exposure.py`, `gui/capture_window.py` |
+| Auto exposure targets the **99.9th percentile** with 0.4 EV headroom | `capture/autoexposure.py` |
 | Working Positive preview (invert + base + curve) **cannot touch the stored raw** | preview is a display-only transform in `core/positive.py` |
 | Dark frames rescale by **shutter ratio only** (dark current precedes electronic gain); sensor pedestal is not scaled | `core/calibration.py::rescale_dark` |
 | Flat fields need **no matching exposure** — dark-subtracted, then mean-normalised | `developer/pipeline.py::_calibrate_above_black` |
@@ -36,12 +33,12 @@ uv run pytest                   # 262 tests
 ## The camera
 
 TS2600MP-G2 (= ATR2600M): IMX571 APS-C mono, 6224×4168 @ ~6.5 fps full
-16-bit USB3, native 16-bit ADC (no demosaic, no gamma, no auto-brightness —
-what the stream measures is what the file holds), two-stage TEC to ΔT −42 °C,
-**needs external 11–14 V power** — without it the camera may not enumerate on
+16-bit USB3, native 16-bit ADC — no demosaic, no gamma, no auto-brightness;
+what the stream measures is what the file holds. Two-stage TEC to ΔT −42 °C.
+**Needs external 11–14 V power** — without it the camera may not enumerate on
 USB at all (the connect dialog says so). The vendor SDK
-(`capture/_toupcam/`, universal dylib x86_64+arm64, vendored — see that
-directory) is driven directly; no gphoto2, no PTP, no `ptpcamerad` fights.
+(`capture/_touptek/`, universal dylib x86_64+arm64, vendored — see that
+directory) is driven directly over USB3.
 
 Stream design: a 3×3-binned whole-sensor overview (~2074×1389) is the honest
 everyday stream — one stream pixel is the mean of 3×3 sensor pixels, so
@@ -70,8 +67,7 @@ and *Working Positive* (auto base subtraction, inversion, preview exposure,
 Fritsch–Carlson spline filmic with Toe/Gamma/Shoulder — judge the picture
 here, it changes nothing on disk). The live Working Positive runs through a
 per-channel LUT (`FastPositivePreview`) so the tone curve costs one lookup
-per pixel. Mono sensor: no WB to chase, but the WB controls still exist for
-the colour preview chain (tested for determinism; currently exposed nowhere).
+per pixel. Mono sensor: no white balance to chase.
 
 **Developer:** `filmscan-develop frameNNN.tif --dark darks/ --flat flats/
 --params look.json -o out/ --jpeg`. Pipeline: dark → flat → base subtraction
@@ -81,9 +77,8 @@ bit-identically).
 
 ## Status
 
-- **v2 (this code):** Capture GUI + Touptek backend + rebuilt test suite
-  (262 tests) complete against MockCamera; Developer CLI complete on mono
-  TIFFs.
+- **This code:** Capture GUI + Touptek backend + test suite (262 tests)
+  complete against MockCamera; Developer CLI complete on mono TIFFs.
 - **Pending hardware verification** (`INSTRUCTIONS_TOUPTEK_CAMERA.md` §11):
   real fps at the 0x83 binning, Snap-in-RAW-mode behaviour, ExpoAGain units,
   enumeration under missing power, real TEC settling, the
