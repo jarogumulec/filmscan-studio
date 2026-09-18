@@ -162,6 +162,15 @@ class MeterReading:
         return self.clipped_fraction > 0.0001
 
     @property
+    def crushed(self) -> bool:
+        """Mirror of :attr:`clipped` on the black rail (underexposure).
+
+        Same tolerance: dust and a hot/cold pixel here as there; real density
+        crushed to zero is far more common than a tenth of a percent.
+        """
+        return self.black_fraction > 0.0001
+
+    @property
     def highlights_at_target(self) -> bool:
         return abs(self.highlight_utilisation - self._target_utilisation()) < 0.02
 

@@ -123,6 +123,22 @@ class TestModes:
     def test_meter_label_reports_utilisation(self, window):
         assert "plného rozsahu" in window.meter_label.text()
 
+    def test_meter_label_flags_both_rails(self, window):
+        """Red PŘEPAL on a blown reading, blue PODEXP on a crushed one."""
+        from filmscan_studio.core.exposure import MeterReading
+
+        blown = MeterReading(0.0, 1.0, 0.1, 0.5, 1.0, 1.0,
+                             clipped_fraction=0.01, near_black_fraction=0.0)
+        crushed = MeterReading(0.0, 1.0, 0.0, 0.05, 0.4, 0.6,
+                               clipped_fraction=0.0, near_black_fraction=0.5,
+                               black_fraction=0.5)
+        window._update_meter_label(blown)
+        assert "PŘEPAL" in window.meter_label.text()
+        assert "PODEXP" not in window.meter_label.text()
+        window._update_meter_label(crushed)
+        assert "PODEXP" in window.meter_label.text()
+        assert "PŘEPAL" not in window.meter_label.text()
+
 
 class TestCaptureWorkflow:
     def test_buttons_disabled_without_film(self, window):
@@ -811,6 +827,105 @@ class TestLiveWorker:
             worker.start()
         worker.stop()
         assert not camera._live_view
+
+
+class TestFilmBaseMinPoint:
+    """The blue min-point rect: its own drag role, measurement and storage."""
+
+    def test_base_mode_drag_draws_base_not_ae_rect(self, qtbot):
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.show()
+        view.set_image(np.zeros((400, 400)))
+        view.set_zoom(1.0)
+        view.set_rect_mode("base")
+        SHIFT = Qt.KeyboardModifier.ShiftModifier
+        with qtbot.waitSignal(view.baseRectChanged):
+            view.mousePressEvent(_mouse_event(20, 20, modifiers=SHIFT))
+            view.mouseMoveEvent(_mouse_event(90, 70, modifiers=SHIFT))
+            view.mouseReleaseEvent(_mouse_event(90, 70, modifiers=SHIFT))
+        assert view.base_rect() is not None
+        assert view.ae_rect() is None          # the AE rect stayed untouched
+
+    def test_right_click_clears_only_the_active_role(self, qtbot):
+        view = ZoomView()
+        qtbot.addWidget(view)
+        view.resize(200, 200)
+        view.show()
+        view.set_image(np.zeros((400, 400)))
+        view._ae_rect = QRect(10, 10, 50, 50)
+        view._base_rect = QRect(60, 60, 40, 40)
+        view.set_rect_mode("base")
+        view.mousePressEvent(_mouse_event(5, 5, button=Qt.MouseButton.RightButton))
+        assert view.base_rect() is None
+        assert view.ae_rect() is not None      # AE metering survives
+        view.set_rect_mode("ae")
+        view.mousePressEvent(_mouse_event(5, 5, button=Qt.MouseButton.RightButton))
+        assert view.ae_rect() is None
+
+    def test_mode_toggle_switches_the_view(self, window):
+        window.btn_base_mode.setChecked(True)
+        assert window.view.rect_mode() == "base"
+        window.btn_base_mode.setChecked(False)
+        assert window.view.rect_mode() == "ae"
+
+    def test_stream_measurement_stores_sample_with_exposure(self, window,
+                                                            tmp_path, qtbot):
+        """Mean DN of the blue rect from the live stream, stored with the
+        exposure it was read at — the pair the scaling rule needs."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="FB_1", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window._refresh_buttons()
+        window._on_base_rect(QRect(100, 100, 200, 150))
+        window._measure_base_from_stream()
+        # waitUntil accepts None/bool only — a still-empty list must be
+        # False, not the [] the accessor naturally returns.
+        qtbot.waitUntil(lambda: bool(window.session.base_samples()),
+                        timeout=10000)
+        sample = window.session.base_samples()[0]
+        assert sample.kind == "stream"
+        assert sample.mean_dn > 0
+        # The exposure travelled with the reading: the mock is at 1.0 s gain 1.0.
+        assert sample.shutter > 0
+        assert sample.gain == pytest.approx(1.0)
+        assert sample.rect is not None          # converted to sensor px
+        assert (paths.root / "film_base.json").exists()
+        assert "film base" in window.log_view.text().lower()
+
+    def test_stream_measurement_refuses_without_rect(self, window, tmp_path):
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="FB_2", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window._measure_base_from_stream()
+        assert window.session.base_samples() == []
+        assert "min point" in window.statusBar().currentMessage().lower()
+
+    def test_base_frame_capture_archives_and_measures(self, window, tmp_path,
+                                                      qtbot):
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="FB_3", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window._refresh_buttons()
+        window._on_base_rect(QRect(10, 20, 110, 120))
+        window._capture_base_frame()
+        qtbot.waitUntil(lambda: window.session.state.base_count == 1,
+                        timeout=15000)
+        qtbot.waitUntil(lambda: bool(window.session.base_samples()),
+                        timeout=5000)
+        sample = window.session.base_samples()[0]
+        assert sample.kind == "frame"
+        assert sample.source.endswith(".tif")
+        # QRect(10,20,110,120) == stream px (x0,y0,x1,y1)=(10,20,120,140);
+        # overview 3x3 binning -> sensor px x3.
+        assert sample.rect == (30, 60, 360, 420)
 
 
 class SlowCaptureCamera(MockCamera):

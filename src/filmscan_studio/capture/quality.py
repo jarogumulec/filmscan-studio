@@ -55,6 +55,9 @@ class AuditResult:
     ev_change: float                   # stops to ADD for the next frame (0 = none)
     suggested_shutter: float | None    # shutter that would land the target
     clipped_fraction: float
+    #: Share of pixels on the black rail — the underexposure counterpart of
+    #: ``clipped_fraction``, reported so the GUI can say how much is crushed.
+    black_fraction: float = 0.0
     #: True when the suggestion is actionable (a shutter move exists on ladder).
     auto_applied: bool = False
 
@@ -107,19 +110,26 @@ def audit_frame(
             f"snímek zopakuj, další o {ev:+.2f} EV",
             ev, reading, settings, shutter_ladder,
         )
+    crushed = reading.black_fraction
     try:
         ev = required_ev_change(reading, headroom_ev)
     except ValueError:
         ev = headroom_ev + 4.0     # signal at black: badly under
         return _decision(
-            "under", f"PODEXPOZICE v {scope}: signál na černé ({path.name})",
+            "under",
+            f"PODEXPOZICE v {scope}: signál na černé, {crushed:.3%} pixelů "
+            f"na černi ({path.name})",
             ev, reading, settings, shutter_ladder,
         )
     if ev > EV_TOLERANCE:
+        # The % says how much of the frame is already crushed to the black
+        # rail — the under counterpart of the over verdict's clip figure.
+        detail = (f", {crushed:.3%} pixelů na černi" if crushed > 0
+                  else "")
         return _decision(
             "under",
-            f"PODEXPOZICOVÁNO v {scope}: o {ev:.2f} EV níž, než cílí "
-            f"({path.name})",
+            f"PODEXPOZICOVÁNO v {scope}: o {ev:.2f} EV níž, než cílí"
+            f"{detail} ({path.name})",
             ev, reading, settings, shutter_ladder,
         )
     if ev < -EV_TOLERANCE:
@@ -132,6 +142,7 @@ def audit_frame(
         verdict="ok",
         message=f"Expozice v cíli ({scope}, {path.name})",
         ev_change=0.0, suggested_shutter=None, clipped_fraction=clipped,
+        black_fraction=reading.black_fraction,
     )
 
 
@@ -158,6 +169,7 @@ def _decision(
         verdict=verdict, message=message, ev_change=ev,
         suggested_shutter=suggested,
         clipped_fraction=reading.clipped_fraction,
+        black_fraction=reading.black_fraction,
     )
 
 

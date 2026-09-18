@@ -3,6 +3,56 @@
 Vše, co se od posledního stavu změnilo, a hlavně: **co nešlo bez fotoaparátu
 ověřit** a jak to poznat při prvním zapnutí s tělem.
 
+## 2026-09-18 — podexpozice modře + film base / min point (třetí kalibrace)
+
+(307 testů zelených.)
+
+### 1) Underexposure warning — zrcadlovka k over
+
+Kde byl červený PŘEPAL, je teď modrý PODEXP: histogram kreslí modrou lajnu na
+černé liště s `PODEXP` + %, clip readout hlásí `černá X %` modře (a bílá
+červeně, barevně HTML), stavová řádka měření dostala modrou vlajku
+`PODEXP` (`MeterReading.crushed`, zrcadlo `clipped`). Audit snímku hlásí u
+`PODEXPOZICOVÁNO` i kolik procent měřené plochy leží na černi
+(`AuditResult.black_fraction`). Nové `Histogram.crushing_warning` /
+`clipped_low_fraction` / `clipped_high_fraction`.
+
+### 2) Film base / min point — nové `FrameKind.BASE`, `core/filmbase.py`
+
+Výslovně NE flat: flat se fotí bez filmu a dělí vinětaci/prach; min point se
+měří **skrz držený film** na čirou základnu (obvykle jen část snímku — proto
+vlastní modrý obdélník, repurposed red-rect drag: `ZoomView.set_rect_mode`
+„ae"/„base", oba rámečky mohou koexistovat, pravé tlačítko ruší jen aktivní
+režim). Třetí řádka v Kalibraci:
+
+* **Režim min point** — přepne SHIFT-tažení na modrý rámeček (červený AE dál
+  měří expozici).
+* **Měřit z proudu** — průměr DN pod rámečkem z čerstvého Live View frame
+  (žádná nová expozice); expozice frame (jeho vlastní `expotime_us` stamp) +
+  gain + teplota se ukládají s hodnotou, aby šla přepočítat na jinak
+  exponované snímky.
+* **Snímek base** — plnohodnotná archivace (`kind: "base"`, TIFF + sidecar se
+  záznamem expozice jako dark/flat) + měření rámečku na full-size datech.
+
+Srážka souřadnic (taženo na 3×3 binnovaném proudu, měřeno na full-size) se
+řeší stejně jako audit: GUI převede stream px na sensor px
+(`_rect_in_sensor_px`) a měření probíhá 1:1. Výsledky: `film_base.json` ve
+složce filmu (historie vzorků, append), `CaptureSession.capture_base()`,
+`FilmBaseSample.scaled_above_black()` — škálování signálu poměrem
+shutter/gain, pedestal se neškáluje (stejná disciplína jako u dark/flat).
+**Zatím se nic neaplikuje na náhled** — jen měření a archiv; H-D/S-curve
+parametrizace z naměřených min/max hodnot je příští úkol až budou data.
+
+Návratové testy: `tests/test_filmbase.py` (region mean, škálování, JSON
+historie), `test_base_capture_archives_and_measures`,
+`TestFilmBaseMinPoint` (rect módy, měření z proudu i snímku, conversion),
+`test_under_message_reports_crushed_percentage`, `test_crushing_is_the_mirror_flag`.
+
+**Co nešlo bez těla ověřit:** že `expotime_us` stamp proudu sedí s nastaveným
+časem i při běžícím Live View (mock ho nedává → cestou jsou settings); chování
+modrého rámečku při přepnutí na ROI proud (clear rect po změně streamu platí
+pro oba rámečky, ale na těle ověřit až s filmem v držáku).
+
 ## 2026-09-18 — zmrazení po dlouhé expozici: příčina nalezena a zavřena
 
 Dlouhé trápení: po Auto Exposure + expozici v desítkách sekund se

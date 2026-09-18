@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS captures (
     capture_id      TEXT PRIMARY KEY,
     film_id         TEXT NOT NULL REFERENCES films(film_id),
     frame_number    INTEGER,
-    kind            TEXT NOT NULL,          -- scan | dark | flat
+    kind            TEXT NOT NULL,          -- scan | dark | flat | base
     filename        TEXT NOT NULL,
     file_format     TEXT NOT NULL,
     width           INTEGER,

@@ -63,6 +63,36 @@ next frame's shutter is corrected; a positive
 `frameNNN.jpg` is rendered from the TIFF beside it. The export lists any scan
 whose darks sit further than ±0.5 °C away.
 
+**Both rails are loud (2026-09):** overexposure is red everywhere (histogram
+bar + `PŘEPAL` flag + `clip: …` on the rail), underexposure is its blue mirror
+— histogram bar + `PODEXP` flag with the crushed-pixel %, a blue `černá … %`
+in the clip readout, a blue `PODEXP` on the meter line, and the post-capture
+audit's `PODEXPOZICOVÁNO` message now names how many percent of the metered
+area sit on black.
+
+**Film base / min point (third calibration, 2026-09):** *not* the flat field —
+a flat is shot **without** film and divides out vignetting/dust; the min point
+measures the held film's **clear base** (the subtraction floor of the
+emulsion, raw material for a per-film Hurter–Driffield curve: min from this,
+max from each frame). The calibration box has a third row: *Režim min point*
+switches the shift-drag rect from red (AE) to blue (base — both rects can
+coexist, the inactive one dims; the rect usually covers only a patch of clear
+edge, not the whole frame), and two ways to measure it:
+
+* **Měřit z proudu** — mean DN under the blue rect on a fresh Live View frame,
+  no new exposure; the frame's own exposure stamp plus shutter/gain/temperature
+  travel with the reading.
+* **Snímek base** — a real full-size archived capture (`kind: "base"`, sidecar
+  like a dark's) with the rect mean measured on it.
+
+Every reading lands in the project's `film_base.json` with its exposure, and
+`FilmBaseSample.scaled_above_black()` scales it onto differently exposed
+frames — signal by the shutter/gain ratio, pedestal never scaled. The rect
+collision (dragged on the 3×3-binned stream, measured on full-size frames) is
+resolved the same way as the audit's: the GUI converts stream px to sensor px
+before measurement. Nothing is applied to the preview yet; the level is
+measurement + archive only.
+
 **Two preview modes:** *RAW View* (display gamma only — judge exposure here)
 and *Working Positive* (auto base subtraction, inversion, preview exposure,
 Fritsch–Carlson spline filmic with Toe/Gamma/Shoulder — judge the picture

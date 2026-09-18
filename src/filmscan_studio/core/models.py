@@ -80,6 +80,12 @@ class FrameKind(StrEnum):
     SCAN = "scan"
     DARK = "dark"
     FLAT = "flat"
+    #: Film base / min point: the clear-base level of the *held film*, measured
+    #: over the operator's rect. Unlike a flat (light with no film, division
+    #: correction of vignetting/dust), this is a subtraction reference for the
+    #: emulsion's own base+fog, recorded with its exposure so it can be scaled
+    #: onto frames exposed at another shutter.
+    BASE = "base"
 
 
 class ImageFormat(StrEnum):

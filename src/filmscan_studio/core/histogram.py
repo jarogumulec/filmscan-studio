@@ -49,6 +49,14 @@ class Histogram:
         return self.clipped_total / self.total if self.total else 0.0
 
     @property
+    def clipped_high_fraction(self) -> float:
+        return self.clipped_high / self.total if self.total else 0.0
+
+    @property
+    def clipped_low_fraction(self) -> float:
+        return self.clipped_low / self.total if self.total else 0.0
+
+    @property
     def clipping_warning(self) -> bool:
         """True when any pixel sits on the ADC rail.
 
@@ -56,6 +64,16 @@ class Histogram:
         unlike a bright sky there is no way to recover it in the developer.
         """
         return self.clipped_high > 0
+
+    @property
+    def crushing_warning(self) -> bool:
+        """True when any pixel sits on the black rail (underexposure).
+
+        The mirror of :attr:`clipping_warning`: density that never rose above
+        the pedestal is as unrecoverable as blown base, so the GUI flags it
+        with the same strictness — blue where overexposure is red.
+        """
+        return self.clipped_low > 0
 
 
 def compute(

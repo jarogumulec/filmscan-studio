@@ -30,11 +30,19 @@ from filmscan_studio.core.zoom import FIT, ZOOM_LEVELS, SensorSize
 from filmscan_studio.gui.imageutil import to_qimage
 
 _CLIP_PEN = QPen(QColor(255, 80, 80))
+#: Underexposure colour: the blue rail (crushed density), mirror of clip red —
+#: used by the histogram bar, its text flag and the capture window's labels.
+_BLUE = QColor(80, 120, 255)
+_CRUSH_PEN = QPen(_BLUE)
 _GRID_PEN = QPen(QColor(110, 110, 110))
 _CURVE_PEN = QPen(QColor(235, 235, 235))
 _BG = QColor(28, 28, 30)
 _AE_PEN = QPen(QColor(255, 40, 40))
 _AE_PEN.setWidth(1)
+#: The same drag-rect in its film-base role: blue, so "měřím základnu" and
+#: "měřím expozici" can never be confused while the gesture is identical.
+_BASE_PEN = QPen(QColor(80, 150, 255))
+_BASE_PEN.setWidth(1)
 #: A drag shorter than this is a re-centre click, not an AE rectangle.
 _DRAG_THRESHOLD_PX = 8
 
@@ -62,6 +70,11 @@ class ZoomView(QWidget):
     centerChanged = Signal(int, int)
     #: AE rectangle selected / cleared, in SOURCE pixel coordinates.
     aeRectChanged = Signal(object)   # QRect or None
+    #: Film base / min point rectangle, same coordinate space as the AE one.
+    #: The drag gesture is identical; the mode decides which rect the gesture
+    #: draws and which colour it wears, so one rectangle never means two
+    #: things at once.
+    baseRectChanged = Signal(object)  # QRect or None
 
     def __init__(self, parent: QWidget | None = None,
                  sensor: SensorSize | None = None) -> None:
@@ -73,6 +86,9 @@ class ZoomView(QWidget):
         self._has_image = False
         self.sensor = sensor or SensorSize()
         self._ae_rect: QRect | None = None   # source coordinates
+        self._base_rect: QRect | None = None  # source coordinates
+        #: Which role the shift-drag draws: "ae" (red) or "base" (blue).
+        self._rect_mode = "ae"
         self._drag_origin: QPointF | None = None
         self._drag_current: QPointF | None = None
         self._drag_shift = False             # this gesture drags AE, not pans
@@ -160,6 +176,41 @@ class ZoomView(QWidget):
         self._ae_rect = None
         self.aeRectChanged.emit(None)
         self.update()
+
+    # ------------------------------------------------------------- base rect
+
+    def base_rect(self) -> QRect | None:
+        return QRect(self._base_rect) if self._base_rect is not None else None
+
+    def clear_base_rect(self) -> None:
+        if self._base_rect is None:
+            return
+        self._base_rect = None
+        self.baseRectChanged.emit(None)
+        self.update()
+
+    def rect_mode(self) -> str:
+        return self._rect_mode
+
+    def set_rect_mode(self, mode: str) -> None:
+        """'ae' (red, metering) or 'base' (blue, film base / min point).
+
+        The rect the previous mode drew stays on screen — it keeps metering —
+        but only the active mode's rect is drawn in its strong colour, so the
+        picture always says which measurement a drag is aiming.
+        """
+        if mode not in ("ae", "base"):
+            raise ValueError(f"neznámý režim obdélníku {mode!r}")
+        if mode == self._rect_mode:
+            return
+        self._rect_mode = mode
+        self.update()
+
+    def _active_rect(self) -> QRect | None:
+        return self._base_rect if self._rect_mode == "base" else self._ae_rect
+
+    def _active_pen(self) -> QPen:
+        return _BASE_PEN if self._rect_mode == "base" else _AE_PEN
 
     # ------------------------------------------------------------------ maths
 
@@ -283,14 +334,20 @@ class ZoomView(QWidget):
         )
         painter.drawImage(dest, image, crop)
 
-        if self._ae_rect is not None and not self._ae_rect.isEmpty():
-            a = self._source_to_screen(self._ae_rect.topLeft())
-            b = self._source_to_screen(self._ae_rect.bottomRight())
-            painter.setPen(_AE_PEN)
-            painter.drawRect(QRectF(a, b).normalized())
+        # Both rects can coexist (AE meters exposure while the base rect
+        # remembers where the min point was); the inactive one is drawn dim so
+        # it neither vanishes nor pretends to be what the next drag will move.
+        for rect, pen in ((self._ae_rect, _AE_PEN),
+                          (self._base_rect, _BASE_PEN)):
+            if rect is not None and not rect.isEmpty():
+                a = self._source_to_screen(rect.topLeft())
+                b = self._source_to_screen(rect.bottomRight())
+                active = rect is self._active_rect()
+                painter.setPen(pen if active else QPen(pen.color().darker(200), 1))
+                painter.drawRect(QRectF(a, b).normalized())
         if (self._drag_origin is not None and self._drag_current is not None
                 and not self._is_panning()):
-            painter.setPen(_AE_PEN)
+            painter.setPen(self._active_pen())
             painter.drawRect(QRectF(self._drag_origin,
                                     self._drag_current).normalized())
 
@@ -304,7 +361,13 @@ class ZoomView(QWidget):
         if self._image is None:
             return
         if event.button() == Qt.MouseButton.RightButton:
-            self.clear_ae_rect()
+            # Right-click cancels the rect of the active role only: clearing
+            # the AE meter while aiming a base rect would silently change what
+            # Auto Exposure measures.
+            if self._rect_mode == "base":
+                self.clear_base_rect()
+            else:
+                self.clear_ae_rect()
             return
         self._drag_origin = event.position()
         self._drag_current = self._drag_origin
@@ -363,8 +426,13 @@ class ZoomView(QWidget):
             return
         tl = self._screen_to_source(drag.topLeft())
         br = self._screen_to_source(drag.bottomRight())
-        self._ae_rect = QRect(tl, br).normalized()
-        self.aeRectChanged.emit(self.ae_rect())
+        rect = QRect(tl, br).normalized()
+        if self._rect_mode == "base":
+            self._base_rect = rect
+            self.baseRectChanged.emit(self.base_rect())
+        else:
+            self._ae_rect = rect
+            self.aeRectChanged.emit(self.ae_rect())
         self.update()
 
 
@@ -437,17 +505,29 @@ class HistogramWidget(QWidget):
 
         # Clip flags: bars on the rail, sized sqrt() so a tiny but real
         # overflow is still visible without a huge fraction being louder.
+        # Both rails get the same treatment: red right (blown base), blue
+        # left (crushed density = underexposure) — the under flag is the
+        # mirror of the over flag, 2026-09 request.
         if self._hist.clipped_high:
             frac = min(1.0, (self._hist.clipped_high / max(self._hist.total, 1)) ** 0.5)
             painter.fillRect(w - 6, h - int(frac * h), 6, int(frac * h), QColor(255, 80, 80))
         if self._hist.clipped_low:
             frac = min(1.0, (self._hist.clipped_low / max(self._hist.total, 1)) ** 0.5)
-            painter.fillRect(0, h - int(frac * h), 6, int(frac * h), QColor(80, 120, 255))
+            painter.fillRect(0, h - int(frac * h), 6, int(frac * h), _BLUE)
 
         if self._hist.clipping_warning:
             painter.setPen(_CLIP_PEN)
             painter.drawText(6, 14, "PŘEPAL")
-            painter.drawText(w - 66, 14, f"clip {self._hist.clipped_fraction:.2%}")
+            painter.drawText(w - 66, 14,
+                             f"clip {self._hist.clipped_high_fraction:.2%}")
+        if self._hist.crushing_warning:
+            # Right of the red flag (or at its old spot when there is no red);
+            # the % is the crushed share alone, mirroring the over figure.
+            x = 66 if self._hist.clipping_warning else 6
+            painter.setPen(_CRUSH_PEN)
+            painter.drawText(x, 14, "PODEXP")
+            painter.drawText(w - 96, 28,
+                             f"černá {self._hist.clipped_low_fraction:.2%}")
 
 
 class CollapsibleBox(QWidget):

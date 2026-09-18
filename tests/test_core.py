@@ -324,6 +324,21 @@ class TestHistogram:
         h = histogram.compute(np.linspace(600, 16000, 10_000), 600, 16383)
         assert not h.clipping_warning
 
+    def test_crushing_is_the_mirror_flag(self) -> None:
+        """Pixels on the black rail raise crushing_warning, not clipping."""
+        h = histogram.compute(np.full((100, 100), 600.0), 600, 16383)
+        assert h.clipped_low == 10_000
+        assert h.crushing_warning
+        assert not h.clipping_warning
+        assert h.clipped_low_fraction == 1.0
+
+    def test_both_rails_report_their_own_fraction(self) -> None:
+        data = np.linspace(0.0, 2.0, 10_000)      # both rails hit
+        h = histogram.compute(data, 0.0, 1.0)
+        assert h.clipping_warning and h.crushing_warning
+        assert (h.clipped_high_fraction + h.clipped_low_fraction
+                == pytest.approx(h.clipped_fraction))
+
     def test_normalised_peaks_at_one(self) -> None:
         h = histogram.compute(np.random.default_rng(0).random((50, 50)), 0, 1)
         assert h.normalised().max() == pytest.approx(1.0)

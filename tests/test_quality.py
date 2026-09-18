@@ -71,6 +71,28 @@ class TestAudit:
         assert result.suggested_shutter is not None
         assert result.suggested_shutter > 1.0
 
+    def test_under_message_reports_crushed_percentage(self, tmp_path):
+        """The under verdict carries its black-rail figure, like over's clip %.
+
+        Half the frame pinned at 0 (crushed) and half modestly lit: the
+        verdict is under and the message must say how much sits on black —
+        the mirror of the over verdict's blown-pixel percentage.
+        """
+        data = np.full((200, 300), 3000.0)
+        data[:100, :] = 0.0
+        result = audit_frame(_tiff(tmp_path, data), None, (640, 424),
+                             _settings(), shutter_ladder=LADDER)
+        assert result.verdict == "under"
+        assert result.black_fraction == pytest.approx(0.5)
+        assert "50.000% pixelů na černi" in result.message
+
+    def test_ok_verdict_reports_black_fraction_too(self, tmp_path):
+        data = np.full((200, 300), TARGET_DN)
+        result = audit_frame(_tiff(tmp_path, data), None, (640, 424),
+                             _settings(), shutter_ladder=LADDER)
+        assert result.verdict == "ok"
+        assert result.black_fraction == 0.0
+
     def test_continuous_backend_gets_no_ladder_suggestion(self, tmp_path):
         """No ladder = no rung to suggest: the audit still says by how many EV
         the next frame must move (the GUI turns that into a µs shutter), but

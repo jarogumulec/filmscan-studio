@@ -26,6 +26,13 @@ from pathlib import Path
 
 from filmscan_studio.capture.camera import CameraBackend, CaptureResult
 from filmscan_studio.core.catalog import Catalog
+from filmscan_studio.core.filmbase import (
+    FILM_BASE_FILENAME,
+    FilmBaseSample,
+    append_sample,
+    load_samples,
+    region_mean,
+)
 from filmscan_studio.core.models import (
     AcquisitionMetadata,
     CaptureRecord,
@@ -79,6 +86,11 @@ class SessionPaths:
     def sidecar(self, raw_file: Path) -> Path:
         return raw_file.with_name(raw_file.name + ".json")
 
+    @property
+    def film_base(self) -> Path:
+        """Per-film JSON of film-base / min-point measurements (see filmbase)."""
+        return self.root / FILM_BASE_FILENAME
+
 
 @dataclass
 class SessionState:
@@ -87,6 +99,7 @@ class SessionState:
     film: FilmMetadata
     dark_count: int = 0
     flat_count: int = 0
+    base_count: int = 0
     scan_count: int = 0
     next_frame_number: int = 1
     last_error: str | None = None
@@ -143,6 +156,46 @@ class CaptureSession:
         way to detect a cosmic-ray hit in the stack.
         """
         return self._capture_frames(count, FrameKind.FLAT)
+
+    def capture_base(self, rect: tuple[int, int, int, int] | None = None,
+                     ) -> tuple[CaptureResult, FilmBaseSample]:
+        """Capture a film base / min point frame and measure the rect on it.
+
+        A real exposure (unlike the stream reading the GUI can also take): the
+        frame is archived as a ``base`` capture with its own sidecar — shutter,
+        gain, temperature — exactly like a dark or a flat, because a later
+        scaling of this reference onto other-exposure frames needs all three.
+        ``rect`` is in *sensor* pixels (the frame is full-size; the GUI
+        converts from stream px before calling). The measured mean lands in the
+        per-film ``film_base.json`` next to the archive record.
+        """
+        result = self._capture_frames(1, FrameKind.BASE)[0]
+        # The measurement is this capture's whole point: an unreadable frame
+        # is an error here, not a sidecar-worth-saving degradation.
+        frame = self._read_frame(result.path)
+        mean = region_mean(frame.data, rect)
+        sample = FilmBaseSample(
+            kind="frame",
+            mean_dn=mean,
+            black_level=frame.black_level,
+            white_level=frame.white_level,
+            shutter=result.settings.shutter,
+            gain=result.settings.gain,
+            sensor_temperature_c=result.sensor_temperature_c,
+            rect=rect,
+            source=result.path.name,
+            captured_at=datetime.now().astimezone(),
+        )
+        self.record_base_sample(sample)
+        return result, sample
+
+    def record_base_sample(self, sample: FilmBaseSample) -> Path:
+        """Append one film-base measurement to the per-film JSON."""
+        append_sample(self.paths.film_base, sample)
+        return self.paths.film_base
+
+    def base_samples(self) -> list[FilmBaseSample]:
+        return load_samples(self.paths.film_base)
 
     def capture_scan(self, frame_number: int | None = None) -> CaptureResult:
         """Capture one film frame under its film-advance number."""
@@ -240,6 +293,7 @@ class CaptureSession:
             film=self.film,
             dark_count=len(self.catalog.captures(self.film.film_id, FrameKind.DARK)),
             flat_count=len(self.catalog.captures(self.film.film_id, FrameKind.FLAT)),
+            base_count=len(self.catalog.captures(self.film.film_id, FrameKind.BASE)),
             scan_count=len(self.catalog.captures(self.film.film_id, FrameKind.SCAN)),
             next_frame_number=self.catalog.next_frame_number(self.film.film_id),
             last_error=self._last_error,
@@ -290,6 +344,7 @@ class CaptureSession:
                 "scans": len(self.catalog.captures(self.film.film_id, FrameKind.SCAN)),
                 "dark": len(self.catalog.captures(self.film.film_id, FrameKind.DARK)),
                 "flat": len(self.catalog.captures(self.film.film_id, FrameKind.FLAT)),
+                "base": len(self.catalog.captures(self.film.film_id, FrameKind.BASE)),
             },
             "scans_without_temperature_matched_dark": unmatched,
         }

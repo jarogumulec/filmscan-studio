@@ -48,6 +48,7 @@ import logging
 import threading
 from collections import deque
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -88,6 +89,7 @@ from filmscan_studio.core.exposure import (
     MeterReading,
     parse_shutter,
 )
+from filmscan_studio.core.filmbase import FilmBaseSample, region_mean
 from filmscan_studio.core.filmic import FilmicProfile
 from filmscan_studio.core.histogram import compute
 from filmscan_studio.core.models import FilmMetadata
@@ -243,6 +245,9 @@ class CaptureWindow(QMainWindow):
         self._roi_applied: tuple[int, int, int, int] | None = None
         #: AE metering rectangle in source pixels, from the view's red drag.
         self._ae_rect: tuple[int, int, int, int] | None = None  # x0, y0, x1, y1
+        #: Film base / min point rectangle, same source-pixel space, from the
+        #: view's blue drag (rect mode "base").
+        self._base_rect: tuple[int, int, int, int] | None = None
         #: Echo suppression: refresh writes must not re-trigger apply handlers.
         self._echo = False
         #: Post-capture exposure audit verdict, for the status label.
@@ -289,6 +294,7 @@ class CaptureWindow(QMainWindow):
         # exposure both want the largest possible view of real pixels.
         self.view = ZoomView(sensor=self._sensor_size())
         self.view.aeRectChanged.connect(self._on_ae_rect)
+        self.view.baseRectChanged.connect(self._on_base_rect)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -475,6 +481,37 @@ class CaptureWindow(QMainWindow):
         self.btn_flat.clicked.connect(lambda: self._capture(kind="flat"))
         calib_row.addWidget(self.btn_flat)
         calib_box.body_layout().addLayout(calib_row)
+        # Film base / min point — not a flat: a flat is shot WITHOUT film and
+        # divides out vignetting/dust; this measures the held film's clear
+        # base (subtraction floor for the H-D characterisation), usually only
+        # a patch of the frame — hence its own blue rect, not the red AE one.
+        base_row = QHBoxLayout()
+        self.btn_base_mode = QPushButton("Režim min point")
+        self.btn_base_mode.setCheckable(True)
+        self.btn_base_mode.setToolTip(
+            "Přepne tažení SHIFT+mýší na modrý obdélník film base / min point "
+            "(červený AE rámeček zůstává a dál měří expozici). Modrý rámeček "
+            "vezmi na čirou základnu filmu (okraj bez obrazu)."
+        )
+        self.btn_base_mode.toggled.connect(self._on_base_mode_toggled)
+        base_row.addWidget(self.btn_base_mode)
+        self.btn_base_stream = QPushButton("Měřit z proudu")
+        self.btn_base_stream.setToolTip(
+            "Změří průměr DN modrého obdélníku z aktuálního Live View proudu "
+            "(žádná nová expozice) a uloží ho i s expozicí proudu (čas, gain, "
+            "teplota) do film_base.json — škáluje se na jinak exponované "
+            "snímky poměrem."
+        )
+        self.btn_base_stream.clicked.connect(self._measure_base_from_stream)
+        base_row.addWidget(self.btn_base_stream)
+        self.btn_base_frame = QPushButton("Snímek base")
+        self.btn_base_frame.setToolTip(
+            "Vyfotí a archivuje full-size snímek (jako dark/flat, s sidecarem) "
+            "a změří na něm modrý obdélník. Pro měření na konkrétní expozici."
+        )
+        self.btn_base_frame.clicked.connect(self._capture_base_frame)
+        base_row.addWidget(self.btn_base_frame)
+        calib_box.body_layout().addLayout(base_row)
         frame_row = QHBoxLayout()
         frame_row.addWidget(QLabel("Číslo snímku"))
         self.frame_number = QSpinBox()
@@ -796,8 +833,9 @@ class CaptureWindow(QMainWindow):
         self._stream_binned = want_roi is None
         # The red rect is in *stream* pixels; the new stream delivers different
         # pixels at a different scale, so a kept rect would meter the wrong
-        # film area.
+        # film area. The blue base rect has the same contract.
         self.view.clear_ae_rect()
+        self.view.clear_base_rect()
         self._update_zoom_note()
 
     def _center_in_overview(self) -> tuple[float, float]:
@@ -823,17 +861,20 @@ class CaptureWindow(QMainWindow):
             return self._stream_size
         return (self._sensor_size().width // 3, self._sensor_size().height // 3)
 
-    def _ae_rect_in_sensor_px(self) -> tuple[int, int, int, int] | None:
-        """The AE rect (stream px) expressed in full-sensor px.
+    def _rect_in_sensor_px(self, rect: tuple[int, int, int, int] | None,
+                           ) -> tuple[int, int, int, int] | None:
+        """One rect (stream px) expressed in full-sensor px.
 
         Overview: one stream px is exactly the 3×3 bin of its sensor px.
         ROI mode: the stream *is* the ROI window 1:1, so add the ROI origin.
         Both are exact — no guessing, which is what lets the audit meter the
-        same film area the red rect covers even over a moved ROI.
+        same film area the red rect covers even over a moved ROI. The base
+        rect rides the same conversion: it too is drawn on the stream and
+        measured on a full-size frame.
         """
-        if self._ae_rect is None:
+        if rect is None:
             return None
-        x0, y0, x1, y1 = self._ae_rect
+        x0, y0, x1, y1 = rect
         if self._stream_binned:
             sw, sh = self._last_source_size()
             sensor = self._sensor_size()
@@ -844,6 +885,12 @@ class CaptureWindow(QMainWindow):
         rx0, ry0, _, _ = self._roi_applied or (0, 0, 0, 0)
         return (round(x0) + rx0, round(y0) + ry0,
                 round(x1) + rx0, round(y1) + ry0)
+
+    def _ae_rect_in_sensor_px(self) -> tuple[int, int, int, int] | None:
+        return self._rect_in_sensor_px(self._ae_rect)
+
+    def _base_rect_in_sensor_px(self) -> tuple[int, int, int, int] | None:
+        return self._rect_in_sensor_px(self._base_rect)
 
     def _update_zoom_note(self) -> None:
         w, h = self._last_source_size()
@@ -885,6 +932,112 @@ class CaptureWindow(QMainWindow):
             f"AE výřez {w}×{h} px senzoru — měří a audituje jen uvnitř "
             "(pravé tlačítko zruší)", 6000
         )
+
+    def _on_base_rect(self, rect) -> None:
+        if rect is None:
+            self._base_rect = None
+            self.statusBar().showMessage("Rámeček min point zrušen", 2500)
+            return
+        self._base_rect = (rect.x(), rect.y(),
+                           rect.x() + rect.width(), rect.y() + rect.height())
+        sensor = self._base_rect_in_sensor_px()
+        w = sensor[2] - sensor[0] if sensor else rect.width()
+        h = sensor[3] - sensor[1] if sensor else rect.height()
+        self.statusBar().showMessage(
+            f"Min point {w}×{h} px senzoru — míří na čirou základnu; "
+            "měřit tlačítkem v Kalibraci (pravé tlačítko zruší)", 6000
+        )
+
+    # ----------------------------------------------------- film base / min point
+
+    def _on_base_mode_toggled(self, on: bool) -> None:
+        """Shift-drag draws the blue base rect or the red AE rect."""
+        self.view.set_rect_mode("base" if on else "ae")
+        self.statusBar().showMessage(
+            "Tažení kreslí modrý rámeček film base / min point"
+            if on else "Tažení kreslí červený AE rámeček", 4000)
+
+    def _base_rect_missing_note(self) -> str | None:
+        """Why a base measurement must refuse, or None when it may run."""
+        if self.session is None:
+            return "Nejdřív vytvoř film — měření se ukládá do projektu."
+        if self._base_rect is None:
+            return ("Zaškrtni 'Režim min point' a tažením SHIFT+mýš vymeď "
+                    "modrý obdélník na čirou základnu filmu.")
+        return None
+
+    def _measure_base_from_stream(self) -> None:
+        """Mean DN of the blue rect on a fresh Live View frame — no new exposure.
+
+        The frame's own stamp (``expotime_us``) is the exposure the reading
+        belongs to; settings and sensor temperature ride along so the stored
+        sample can be shutter-scaled onto the frames, which may well be
+        exposed differently. Metering needs a frame grab, so the poller yields
+        the camera to the worker thread (one thread on the camera at a time).
+        """
+        if self.camera is None:
+            return
+        note = self._base_rect_missing_note()
+        if note is not None:
+            self.statusBar().showMessage(note, 6000)
+            return
+        rect = self._base_rect      # stream px — the stream's own grid, 1:1
+        meter = self._meter
+
+        def job():
+            frame = fresh_live_frame(self.camera)
+            data = LiveMeter.decode_live_frame(frame)
+            black, white = meter.frame_levels(frame)
+            mean = region_mean(data, rect)
+            settings = self.camera.get_settings()
+            temperature = None
+            try:
+                temperature = self.camera.get_temperature_c()
+            except Exception:  # noqa: BLE001 - temperature is provenance, not fatal
+                pass
+            shutter = settings.shutter
+            reported = getattr(frame, "expotime_us", None)
+            if reported:
+                shutter = reported / 1e6     # what this frame was really shot at
+            return FilmBaseSample(
+                kind="stream", mean_dn=mean,
+                black_level=black, white_level=white,
+                shutter=shutter, gain=settings.gain,
+                sensor_temperature_c=temperature,
+                rect=self._base_rect_in_sensor_px(),
+                source="stream",
+                captured_at=datetime.now().astimezone(),
+            )
+
+        self._set_actions_busy(True)
+        if self._worker is not None:
+            self._worker.leave_live_view = True
+        self._pause_live_view()
+        self.statusBar().showMessage("Měřím film base z proudu…")
+        self._start_worker(job, self._on_base_measured)
+
+    def _capture_base_frame(self) -> None:
+        """Real exposure, archived like a dark/flat; the rect is measured on
+        the full-size frame (sensor px — the frame's own grid)."""
+        note = self._base_rect_missing_note()
+        if note is not None:
+            self.statusBar().showMessage(note, 6000)
+            return
+        self._capture(kind="base")
+
+    def _on_base_measured(self, sample: FilmBaseSample) -> None:
+        self._set_actions_busy(False)
+        self._resume_live_view()
+        path = self.session.record_base_sample(sample)
+        shutter = ExposureSettings(shutter=sample.shutter, iso=None,
+                                   gain=sample.gain)
+        self._log(f"film base {sample.mean_dn:.1f} DN @ "
+                  f"{shutter.shutter_string()} · {sample.source} "
+                  f"→ {path.name}")
+        self.statusBar().showMessage(
+            f"Film base: {sample.mean_dn:.1f} DN (black {sample.black_level:.0f}, "
+            f"čas {shutter.shutter_string()}) — uloženo do film_base.json", 8000)
+        self._refresh_stage()
 
     def _meter_source(self):
         """Metering callable for Auto Exposure: whole frame or the red rect.
@@ -1069,13 +1222,16 @@ class CaptureWindow(QMainWindow):
             from filmscan_studio.core.exposure import measure
             reading = measure(region, 0.0, 1.0, self._meter.percentile)
         self.histogram.set_histogram(hist)
-        total = max(hist.total, 1)
-        # The clip report the brief asks for: both rails, as a share of pixels.
-        # Red bar (blown) and blue bar (crushed) are drawn on the histogram
-        # itself; this is their numeric counterpart.
+        # The clip report the brief asks for: both rails, as a share of pixels,
+        # each in the colour of the bar it counts — red bar (blown) and blue
+        # bar (crushed) are drawn on the histogram itself; this is their
+        # numeric counterpart. Rich text is what paints the numbers in those
+        # colours instead of just naming them.
         self.clip_label.setText(
-            f"clip: bílá {hist.clipped_high / total:.3%} (červeně) · "
-            f"černá {hist.clipped_low / total:.3%} (modře)"
+            f"clip: <span style='color:#e55'>bílá "
+            f"{hist.clipped_high_fraction:.3%}</span> · "
+            f"<span style='color:#58f'>černá "
+            f"{hist.clipped_low_fraction:.3%}</span>"
         )
         scope = "AE výřez" if self._ae_rect is not None else "celý snímek"
         source = f"lineární data proudu · {scope}"
@@ -1098,9 +1254,16 @@ class CaptureWindow(QMainWindow):
 
     def _update_meter_label(self, reading: MeterReading) -> None:
         util = reading.highlight_utilisation
+        # Both rails get a flag in their own colour: red blown base, blue
+        # crushed density (the underexposure mirror the 2026-09 request asked
+        # for — "když je nula, svítit modře").
+        flags = ""
+        if reading.clipped:
+            flags += "  · <span style='color:#e55'>PŘEPAL</span>"
+        if reading.crushed:
+            flags += "  · <span style='color:#58f'>PODEXP</span>"
         self.meter_label.setText(
-            f"p99.9 {util:6.1%} plného rozsahu"
-            + ("  · PŘEPAL" if reading.clipped else "")
+            f"p99.9 {util:6.1%} plného rozsahu{flags}"
         )
 
     # ------------------------------------------------------------------ modes
@@ -1166,6 +1329,12 @@ class CaptureWindow(QMainWindow):
             number = self.frame_number.value() if self.frame_number.value() > 0 else None
             fn, args = self.session.capture_scan, (number,)
             label = "Snímek"
+        elif kind == "base":
+            # The frame is full-size, so the rect must arrive in sensor px —
+            # the same conversion the audit uses.
+            fn = self.session.capture_base
+            args = (self._base_rect_in_sensor_px(),)
+            label = "Film base"
         else:
             fn = self.session.capture_dark if kind == "dark" else self.session.capture_flat
             args = ()
@@ -1182,6 +1351,11 @@ class CaptureWindow(QMainWindow):
         self._set_actions_busy(False)
         self._resume_live_view()
         first = results[0] if isinstance(results, list) else results
+        # capture_base returns (result, sample) — the capture result is the
+        # first half; the sample's own numbers get their own log line below.
+        sample = None
+        if label == "Film base" and isinstance(first, tuple):
+            first, sample = first
         self.statusBar().showMessage(
             f"{label} uložen: {first.path.name} ({first.size_bytes / 1e6:.1f} MB, {first.elapsed:.1f} s)"
         )
@@ -1189,6 +1363,9 @@ class CaptureWindow(QMainWindow):
                 if first.sensor_temperature_c is not None else "")
         self._log(f"{label}: {first.path.name} · {first.settings.shutter_string()} "
                   f"· {first.settings.sensitivity_string()}{temp}")
+        if sample is not None:
+            self._log(f"  min point {sample.mean_dn:.1f} DN v rámečku "
+                      f"{sample.rect} → film_base.json")
         for note in first.notes:
             self._log(f"  pozn.: {note}")
         self._refresh_settings()
@@ -1433,7 +1610,8 @@ class CaptureWindow(QMainWindow):
 
     def _set_actions_busy(self, busy: bool) -> None:
         buttons = (self.btn_capture, self.btn_autoexposure,
-                   self.btn_dark, self.btn_flat)
+                   self.btn_dark, self.btn_flat,
+                   self.btn_base_stream, self.btn_base_frame)
         if busy:
             for button in buttons:
                 button.setEnabled(False)
@@ -1475,7 +1653,8 @@ class CaptureWindow(QMainWindow):
         stage = {"dark": "1) Dark frame", "flat": "2) Flat field", "frames": "3) Snímání filmů"}[state.stage]
         self.stage_label.setText(
             f"Fáze: {stage} · dark {state.dark_count} · flat {state.flat_count} · "
-            f"snímků {state.scan_count} · další #{state.next_frame_number}"
+            f"base {state.base_count} · snímků {state.scan_count} · "
+            f"další #{state.next_frame_number}"
         )
         self.frame_number.setValue(0)
         self.frame_number.setMinimum(0)
@@ -1485,6 +1664,13 @@ class CaptureWindow(QMainWindow):
         has_session = self.session is not None
         for button in (self.btn_dark, self.btn_flat):
             button.setEnabled(has_camera and has_session)
+        # The base frame is a real exposure under the film, so it obeys the
+        # same session requirement as dark/flat. The stream reading needs no
+        # session for the camera work but its sample must be stored somewhere
+        # — same gate, and the blue drag toggle needs only the view.
+        self.btn_base_frame.setEnabled(has_camera and has_session)
+        self.btn_base_stream.setEnabled(has_camera and has_session)
+        self.btn_base_mode.setEnabled(has_camera)
         # The archival gain rule (2026-09, carried over): no scan at any
         # sensitivity but the floor one. The tooltip states why, so the
         # greyed button is an explanation and not a mystery.

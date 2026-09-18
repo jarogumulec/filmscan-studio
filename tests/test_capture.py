@@ -285,6 +285,44 @@ class TestSessionWorkflow:
         with pytest.raises(ValueError):
             session.capture_scan(0)
 
+    def test_base_capture_archives_and_measures(self, session: CaptureSession) -> None:
+        """A base frame is a full archive capture *plus* the rect measurement.
+
+        Sidecar like a dark's (kind, exposure), and the mean DN over the
+        requested sensor-px rect lands in film_base.json with the exposure it
+        was taken at — the pair the scaling rule needs later.
+        """
+        session.camera.set_shutter(4.0)
+        rect = (100, 100, 600, 500)
+        result, sample = session.capture_base(rect)
+        payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["kind"] == "base"
+        assert payload["acquisition"]["exposure_time"] == pytest.approx(4.0)
+        assert session.state.base_count == 1
+        stored = session.base_samples()
+        assert len(stored) == 1
+        assert stored[0].kind == "frame"
+        assert stored[0].shutter == pytest.approx(4.0)
+        assert stored[0].rect == rect
+        assert stored[0].mean_dn == pytest.approx(sample.mean_dn)
+        # The measured mean must equal the frame's own region mean — proving
+        # the rect was interpreted on the full-size frame, not the stream.
+        frame = open_frame(result.path)
+        assert sample.mean_dn == pytest.approx(
+            float(frame.data[100:500, 100:600].mean()))
+
+    def test_base_samples_append_in_order(self, session: CaptureSession) -> None:
+        from filmscan_studio.core.filmbase import FilmBaseSample
+
+        session.record_base_sample(FilmBaseSample(
+            kind="stream", mean_dn=4000.0, black_level=0.0,
+            white_level=65535.0, shutter=1.0, gain=1.0))
+        session.record_base_sample(FilmBaseSample(
+            kind="stream", mean_dn=8000.0, black_level=0.0,
+            white_level=65535.0, shutter=2.0, gain=1.0))
+        stored = session.base_samples()
+        assert [s.mean_dn for s in stored] == [4000.0, 8000.0]
+
     def test_export_project_writes_json(self, session: CaptureSession) -> None:
         session.capture_dark(1)
         session.capture_flat(2)
@@ -292,7 +330,7 @@ class TestSessionWorkflow:
         path, unmatched = session.export_project()
         assert unmatched == []   # mock temperature is stable: darks match
         payload = json.loads(path.read_text(encoding="utf-8"))
-        assert payload["counts"] == {"scans": 1, "dark": 1, "flat": 2}
+        assert payload["counts"] == {"scans": 1, "dark": 1, "flat": 2, "base": 0}
         assert payload["film"]["film_id"] == "HP5_001"
         assert payload["operator"] == "JG"
 
