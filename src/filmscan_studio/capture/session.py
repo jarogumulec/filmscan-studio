@@ -197,8 +197,17 @@ class CaptureSession:
     def base_samples(self) -> list[FilmBaseSample]:
         return load_samples(self.paths.film_base)
 
-    def capture_scan(self, frame_number: int | None = None) -> CaptureResult:
-        """Capture one film frame under its film-advance number."""
+    def capture_scan(self, frame_number: int | None = None,
+                     crop_rect: tuple[int, int, int, int] | None = None,
+                     ) -> CaptureResult:
+        """Capture one film frame under its film-advance number.
+
+        ``crop_rect`` is the operator's red frame (= the picture's edge) in
+        *full-size frame* pixels — the GUI converts from stream px before
+        calling, the same contract as :meth:`capture_base`'s rect. It rides
+        into the sidecar (``CaptureRecord.crop_rect``) so the developer GUI
+        can crop by it without re-measuring.
+        """
         number = (
             frame_number
             if frame_number is not None
@@ -206,12 +215,15 @@ class CaptureSession:
         )
         if number < 1:
             raise ValueError("frame numbers start at 1")
-        return self._capture_frames(1, FrameKind.SCAN, frame_number=number)[0]
+        return self._capture_frames(
+            1, FrameKind.SCAN, frame_number=number, crop_rect=crop_rect
+        )[0]
 
     # ----------------------------------------------------------------- internals
 
     def _capture_frames(
-        self, count: int, kind: FrameKind, frame_number: int | None = None
+        self, count: int, kind: FrameKind, frame_number: int | None = None,
+        crop_rect: tuple[int, int, int, int] | None = None,
     ) -> list[CaptureResult]:
         results: list[CaptureResult] = []
         for _ in range(count):
@@ -232,12 +244,13 @@ class CaptureSession:
                 self._last_error = str(exc)
                 log.exception("capture failed")
                 raise
-            self._record(result, kind, number)
+            self._record(result, kind, number, crop_rect=crop_rect)
             results.append(result)
         return results
 
     def _record(
-        self, result: CaptureResult, kind: FrameKind, frame_number: int | None
+        self, result: CaptureResult, kind: FrameKind, frame_number: int | None,
+        crop_rect: tuple[int, int, int, int] | None = None,
     ) -> CaptureRecord:
         """Write the JSON sidecar and the catalog row for one captured file."""
         frame = self._safe_read(result.path)
@@ -268,6 +281,7 @@ class CaptureSession:
             sensor_temperature_c=result.sensor_temperature_c,
             film=self.film,
             acquisition=acquisition,
+            crop_rect=crop_rect,
         )
         self.paths.sidecar(result.path).write_text(
             json.dumps(to_json_dict(record), indent=2, ensure_ascii=False), encoding="utf-8"

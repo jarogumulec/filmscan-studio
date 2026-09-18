@@ -52,7 +52,7 @@ def window(qtbot, camera) -> CaptureWindow:
 class TestModes:
     def test_modes_show_different_images(self, window, qtbot):
         raw_display = window._display_for(window._last_linear).copy()
-        window.mode_positive.setChecked(True)
+        window.neg_toggle.setChecked(True)
         positive_display = window._display_for(window._last_linear)
         # The fast positive renders 3-channel (the mono frame repeats), the
         # raw view stays 2-D — and the picture itself differs too: a negative
@@ -85,10 +85,15 @@ class TestModes:
         assert "křivka" in window.histogram_label.text()
 
     def test_mode_checkboxes_are_mutually_exclusive(self, window):
-        window.mode_positive.setChecked(True)
-        assert not window.mode_raw.isChecked()
+        # The reported bug (2026-09): clicking Negativ unticked RAW View but
+        # also ticked the (now removed) Positive box — two modes at once. The
+        # row is two boxes now and exactly one is ever ticked.
+        assert not hasattr(window, "mode_positive")
+        assert window.mode_raw.isChecked() and not window.neg_toggle.isChecked()
+        window.neg_toggle.setChecked(True)
+        assert window.neg_toggle.isChecked() and not window.mode_raw.isChecked()
         # Unchecking the active mode must not leave the app with no mode.
-        window.mode_positive.setChecked(False)
+        window.neg_toggle.setChecked(False)
         assert window.mode_raw.isChecked()
 
     def test_invert_checkbox_follows_the_mode(self, window):
@@ -97,27 +102,26 @@ class TestModes:
         # so it must agree with what the picture is actually doing.
         assert window.raw_view
         assert not window.filmic.invert.isChecked()
-        window.mode_positive.setChecked(True)
-        assert window.filmic.invert.isChecked()
-        window.mode_raw.setChecked(True)
-        assert not window.filmic.invert.isChecked()
-        # Driving it through the Negativ switch agrees too.
         window.neg_toggle.setChecked(True)
         assert window.filmic.invert.isChecked() and not window.raw_view
         window.neg_toggle.setChecked(False)
+        assert not window.filmic.invert.isChecked() and window.raw_view
+        # Driving it from the RAW View side agrees too.
+        window.neg_toggle.setChecked(True)
+        window.mode_raw.setChecked(True)
         assert not window.filmic.invert.isChecked() and window.raw_view
 
     def test_positive_param_invert_tracks_the_mode(self, window):
         # invert is baked into PositiveParams; a RAW View that ignores it must
         # not leave positive.invert lying about the displayed frame.
-        window.mode_positive.setChecked(True)
+        window.neg_toggle.setChecked(True)
         assert window.positive.invert is True
         window.mode_raw.setChecked(True)
         assert window.positive.invert is False
 
     def test_filmic_panel_disabled_in_raw_view(self, window):
         assert not window.filmic.isEnabled()
-        window.mode_positive.setChecked(True)
+        window.neg_toggle.setChecked(True)
         assert window.filmic.isEnabled()
 
     def test_meter_label_reports_utilisation(self, window):
@@ -203,6 +207,31 @@ class TestCaptureWorkflow:
         assert window._last_audit is None           # audit genuinely failed
         assert any(p.suffix == ".jpg" for p in paths.frames.iterdir())
 
+    def test_scan_stores_drawn_rect_as_crop_in_full_px(self, window, tmp_path,
+                                                       qtbot):
+        """The red frame doubles as the crop cue for the developer GUI: it is
+        drawn on the 3×3-binned overview stream but must reach the sidecar in
+        *full-size frame* px — storing stream px would crop a third of a third
+        of the picture."""
+        import json
+
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="HP5_004", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        assert window._stream_binned          # overview: the stream is 3×3 binned
+        window._on_ae_rect(QRect(100, 80, 1800, 1200))
+        expected = window._ae_rect_in_sensor_px()
+        assert expected is not None
+        window._capture(scan=True)
+        qtbot.waitUntil(lambda: window.session.state.scan_count == 1, timeout=10000)
+        sidecar = next(p for p in paths.frames.glob("*.json"))
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert payload["crop_rect"] == list(expected)
+        # Explicitly *not* the stream-px rect the operator dragged.
+        assert payload["crop_rect"] != [100, 80, 1900, 1280]
+
     def test_capture_button_stays_disabled_while_busy(self, window, tmp_path, qtbot):
         from filmscan_studio.capture.session import CaptureSession, SessionPaths
 
@@ -237,7 +266,7 @@ class TestConnect:
         w._on_connected(camera)
         assert w.camera is camera
         assert w.info == camera.info  # MockCamera.info is a property, not identity-stable
-        assert w.btn_autoexposure.isEnabled()
+        assert w.act_new_film.isEnabled()  # the connected state is really applied
 
     def test_connect_failure_names_the_power_hint(self, qtbot, monkeypatch):
         w = CaptureWindow()
@@ -496,68 +525,55 @@ class TestAeRectMetering:
         window._ae_rect = None
         assert window._ae_rect_in_sensor_px() is None
 
-    def test_meter_source_meters_only_the_rect(self, window):
-        # A frame that is dark everywhere except the rect: whole-frame and
-        # rect metering must disagree, proving the crop is applied.
-        data = np.zeros((200, 200), dtype=np.uint16)
-        # Bright patch must be < 0.1% of the frame or p99.9 of the whole
-        # frame would hit it too and the test would prove nothing.
-        data[100:105, 100:105] = 65000
-
-        class RectCamera:
-            def next_live_frame(self):
-                return LiveFrame(data=data, width=200, height=200,
-                                 black_level=0.0, white_level=65535.0)
-
-            def get_settings(self):   # freshness helper reads the shutter
-                from filmscan_studio.core.exposure import ExposureSettings
-                return ExposureSettings(1.0, iso=None, gain=1.0)
-
-            def disconnect(self):  # window teardown calls it
-                pass
-
-        window.camera = RectCamera()
-        window._ae_rect = (100, 100, 105, 105)
-        reading = window._meter_source()()
-        assert reading.signal_p999 > 0.9
-
-        window._ae_rect = None
-        whole = window._meter_source()()
-        assert whole.signal_p999 < reading.signal_p999 / 3
-
 
 class TestExposureControls:
     def test_gain_spin_applies_to_camera(self, window):
         window.gain_spin.setValue(4.0)
         window.gain_spin.editingFinished.emit()
         assert window.camera.get_settings().gain == pytest.approx(4.0)
-        assert not window.btn_gain_base.isChecked()
 
-    def test_gain_base_button_pins_archival_gain(self, window):
-        # Archival rule carried to the Touptek: the scan is one transmission
-        # measurement at the sensor's noise floor — gain 1.00×, exposure in time.
+    def test_gain_button_is_gone_but_archival_rule_stays(self, window):
+        # 2026-09: the "Gain 1.00× (archiv)" and "Auto Exposure" buttons are
+        # out of the UI (manual-only rig). The archival *rule* still guards
+        # Capture — it just reads the camera directly now.
+        assert not hasattr(window, "btn_gain_base")
+        assert not hasattr(window, "btn_autoexposure")
         window.camera.set_gain(4.0)
-        window._refresh_settings()
-        assert not window.btn_gain_base.isChecked()
-        window.btn_gain_base.setChecked(True)
-        assert window.camera.get_settings().gain == pytest.approx(1.0)
+        window._refresh_settings()   # syncs the gain spin to 4.00
+        assert window.gain_spin.value() == pytest.approx(4.0)
 
     def test_capture_blocked_until_gain_base(self, window):
         # "při gain 1.00 a nastavuj jen expozici": at any other sensitivity
-        # the Capture button is grey and _capture_block_reason says why.
+        # the Capture button is grey and _capture_block_reason says why. The
+        # gain spin is the way back to 1.00× now (there is no archive button).
         window.camera.set_gain(4.0)
-        window._refresh_settings()   # syncs widgets -> the base button unchecks
+        window._refresh_settings()
         window._refresh_buttons()
         reason = window._capture_block_reason()
         assert reason is not None and "gain 1.00" in reason and "4.00" in reason
         assert not window.btn_capture.isEnabled()
-        window.btn_gain_base.setChecked(True)
+        window.gain_spin.setValue(1.0)
+        window.gain_spin.editingFinished.emit()
         assert window._capture_block_reason() is None
 
     def test_shutter_text_edit_applies(self, window):
         window.shutter_edit.setEditText("1/125")
         window.shutter_edit.lineEdit().editingFinished.emit()
         assert window.camera.get_settings().shutter == pytest.approx(1 / 125)
+
+    def test_short_shutter_presets_exist(self, window):
+        # 2026-09: "ať pokračují i kratší než 1/10" — the preset ladder now
+        # runs to 1/200 (the sensor delivers down to 300 µs).
+        from filmscan_studio.gui.capture_window import SHUTTER_PRESETS
+
+        assert min(SHUTTER_PRESETS) <= 1 / 200
+        labels = [window.shutter_edit.itemText(i)
+                  for i in range(window.shutter_edit.count())]
+        assert "1/200" in labels and "1/50" in labels and "1/25" in labels
+        # And a preset actually applies:
+        window.shutter_edit.setEditText("1/50")
+        window.shutter_edit.lineEdit().editingFinished.emit()
+        assert window.camera.get_settings().shutter == pytest.approx(1 / 50)
 
     def test_unparseable_shutter_text_is_rejected(self, window):
         # The mock accepts any shutter (the real backend clamps to its range);
@@ -638,7 +654,7 @@ class TestHistogramFollowsAeRect:
         # The returned reading follows the rect too (p99.9 inside is 0.05),
         # and says so — the operator must know which area the numbers lie about.
         assert returned.signal_p999 < 0.2
-        assert "AE výřez" in window.histogram_label.text()
+        assert "měřicí výřez" in window.histogram_label.text()
 
     def test_stale_rect_outside_frame_falls_back_to_whole(self, window):
         from filmscan_studio.core.exposure import measure
@@ -705,53 +721,40 @@ class TestNegativeQuickToggle:
         window.neg_toggle.setChecked(False)
         assert window.raw_view
 
-    def test_mode_checkboxes_sync_the_toggle(self, window):
-        window.mode_positive.setChecked(True)
-        assert window.neg_toggle.isChecked()
+    def test_mode_checkboxes_sync_each_other(self, window):
+        # The removed Positive box used to be synced here; its bug (staying
+        # ticked next to Negativ) is what shrank the row to two boxes.
+        window.neg_toggle.setChecked(True)
+        assert window.neg_toggle.isChecked() and not window.mode_raw.isChecked()
         window.mode_raw.setChecked(True)
-        assert not window.neg_toggle.isChecked()
+        assert window.mode_raw.isChecked() and not window.neg_toggle.isChecked()
 
 
-class TestAutoExposure:
-    def test_failed_run_re_enables_buttons_without_session(self, window):
-        """2026-09 bug: after 1–2 AE runs the button greyed out forever —
-        end-of-run un-busy checked for a film session AE never needed."""
-        window.btn_autoexposure.setEnabled(False)
-        window._set_actions_busy(False)
-        assert window.btn_autoexposure.isEnabled()
-        # Captures still require the session:
-        assert not window.btn_capture.isEnabled()
+class TestHistogramRect:
+    def test_histogram_meters_only_the_rect(self, window):
+        # A frame that is dark everywhere except the rect: whole-frame and
+        # rect histograming must disagree, proving the crop is applied.
+        # (The red-rect metering outlived the Auto Exposure button — the
+        # histogram and the post-capture audit still honour the rect.)
+        data = np.zeros((200, 200), dtype=np.uint16)
+        # Bright patch must be < 0.1% of the frame or p99.9 of the whole
+        # frame would hit it too and the test would prove nothing.
+        data[100:105, 100:105] = 65000
+        frame = LiveFrame(data=data, width=200, height=200,
+                          black_level=0.0, white_level=65535.0)
+        image, reading = window._meter.normalized_frame(frame)
 
-    def test_ae_keeps_stream_up_and_solves_with_shutter_only(self, window, qtbot,
-                                                             monkeypatch):
-        """AE keeps polling after the worker stops — the worker's teardown
-        must not stop the stream it is metering from. And with the archival
-        gain button checked the solve is shutter-only."""
-        monkeypatch.setattr(
-            "filmscan_studio.gui.capture_window.QMessageBox.warning",
-            staticmethod(lambda *a, **k: None),   # never hang on a modal dialog
-        )
-        calls: list[str] = []
-        window.camera.stop_live_view = lambda: calls.append("stop")
-        assert window._worker is not None and window._worker.running
-        window._auto_exposure()
-        # worker.stop() joins the thread, so its finally has run by now:
-        assert calls == []          # AE left the stream up
-        qtbot.waitUntil(lambda: not window._camera_queue.busy, timeout=15000)
-        qtbot.wait(200)             # deliver the queued result callback
-        assert window.camera.gain_history == []   # gain lock held
-        assert window.camera.shutter_history      # the shutter did the work
-        assert "converged=True" in window.log_view.text()
-        assert window.btn_autoexposure.isEnabled()
-        # A normally-stopped worker does turn the stream off:
-        w = window._worker          # the worker AE's resume restarted
-        assert w is not None and w.running
-        w.leave_live_view = False
-        w.stop()
-        window._worker = None
-        assert calls == ["stop"]
-        window.close()
-        window._camera_queue.stop(wait_ms=8000)
+        window._ae_rect = (100, 100, 105, 105)
+        window._update_histogram(image, reading)
+        rect_hist = window.histogram._hist
+        assert "měřicí výřez" in window.histogram_label.text()
+
+        window._ae_rect = None
+        window._update_histogram(image, reading)
+        whole_hist = window.histogram._hist
+        assert rect_hist.counts.max() > 0
+        assert not np.array_equal(rect_hist.counts, whole_hist.counts)
+        assert "celý snímek" in window.histogram_label.text()
 
 
 class TestExportWarning:
@@ -774,6 +777,58 @@ class TestExportWarning:
         )
         window._export_project()
         assert "3, 7" in shown["text"]
+
+
+class TestFilmDialogOrientation:
+    """2026-09: atributy orientace filmu v dialogu Nový film."""
+
+    def _dialog(self, qtbot):
+        from filmscan_studio.gui.filmdialog import FilmDialog
+
+        d = FilmDialog()
+        qtbot.addWidget(d)
+        d.film_id.setText("O1")
+        return d
+
+    def test_flags_round_trip_through_metadata(self, qtbot):
+        d = self._dialog(qtbot)
+        d.mirrored_horizontal.setChecked(True)
+        d.rotated_180.setChecked(True)
+        film = d.metadata()
+        assert film.mirrored_horizontal and film.rotated_180
+        assert not film.mirrored_vertical
+
+    def test_defaults_off_and_not_inherited_from_rig(self, qtbot):
+        from filmscan_studio.core.models import FilmMetadata
+
+        prev = FilmMetadata(film_id="PREV", mirrored_vertical=True)
+        # rig_defaults (film N+1) must NOT carry the previous strip's
+        # orientation — only the edited film's own record does.
+        from filmscan_studio.gui.filmdialog import FilmDialog
+
+        d = FilmDialog(rig_defaults=prev)
+        qtbot.addWidget(d)
+        assert not d.mirrored_vertical.isChecked()
+        d2 = FilmDialog(defaults=prev)
+        qtbot.addWidget(d2)
+        assert d2.mirrored_vertical.isChecked()
+
+    def test_all_three_refuses_accept(self, qtbot, monkeypatch):
+        # H+V is the 180° rotation — all three is identity and the model
+        # refuses; the dialog must show a warning instead of closing.
+        shown = {}
+        monkeypatch.setattr(
+            "filmscan_studio.gui.filmdialog.QMessageBox.warning",
+            staticmethod(lambda *a, **k: shown.setdefault("text", a[2])),
+        )
+        d = self._dialog(qtbot)
+        d.mirrored_horizontal.setChecked(True)
+        d.mirrored_vertical.setChecked(True)
+        d.rotated_180.setChecked(True)
+        d._accept()
+        assert "text" in shown
+        # accept() never ran: the dialog's result is still the rejected 0.
+        assert d.result() == 0
 
 
 class TestHistogramWidget:

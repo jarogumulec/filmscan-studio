@@ -39,6 +39,9 @@ RETIRED_ACQUISITION_FIELDS: tuple[str, ...] = (
     "white_balance",
     "raw_developer",
 )
+#: The old single boolean only. The 2026-09 orientation attributes
+#: (``mirrored_horizontal`` / ``mirrored_vertical`` / ``rotated_180``) are new
+#: field names by direct user instruction and are *not* retired.
 RETIRED_FILM_FIELDS: tuple[str, ...] = ("mirrored",)
 
 
@@ -153,6 +156,17 @@ class FilmMetadata(BaseModel):
     digitising_lens: str | None = None
     digitising_light: str | None = None
     digitising_holder: str | None = None
+    #: How the strip sits in the holder, recorded (not applied) — the operator
+    #: notes the orientation and post-production flips accordingly. Freely
+    #: combinable, but ``mirrored_horizontal`` + ``mirrored_vertical`` *is*
+    #: ``rotated_180``, so all three at once is a no-op (identity) and is
+    #: rejected (see :meth:`_orientation_not_identity`). Re-introduced 2026-09
+    #: by direct user instruction; these are NEW field names, distinct from the
+    #: retired boolean ``mirrored`` (still stripped on load, see
+    #: :data:`RETIRED_FILM_FIELDS`), so old archives stay readable.
+    mirrored_horizontal: bool = False
+    mirrored_vertical: bool = False
+    rotated_180: bool = False
     #: Also free text, but the dialog offers today's date as the default.
     digitisation_date: str | None = None
     operator: str | None = None
@@ -160,6 +174,25 @@ class FilmMetadata(BaseModel):
     expiry: str | None = None
     pushed_stops: float = 0.0
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def _orientation_not_identity(self) -> "FilmMetadata":
+        """All three orientation flags at once is the identity — refuse it.
+
+        Mirror H composed with mirror V *is* the 180° rotation, so
+        H+V+rot180 undoes itself and a record claiming all three describes a
+        strip sitting straight. The operator then has to say what they mean.
+        H+V alone stays valid: it is the 180° rotation, just expressed through
+        the two mirrors.
+        """
+        if self.mirrored_horizontal and self.mirrored_vertical \
+                and self.rotated_180:
+            raise ValueError(
+                "mirrored_horizontal + mirrored_vertical je rotace 180° — "
+                "se všemi třemi atributy se orientace vyruší (identity); "
+                "zakřehni rotated_180, nebo nech jen jeden z mirrorů"
+            )
+        return self
 
     def label(self) -> str:
         return self.film_name or self.film_id
@@ -271,6 +304,12 @@ class CaptureRecord(BaseModel):
     acquisition: AcquisitionMetadata = Field(default_factory=AcquisitionMetadata)
     created_at: datetime = Field(default_factory=_now)
     notes: str | None = None
+    #: Crop rectangle the operator drew (the red frame = the picture's edge),
+    #: as ``(x0, y0, x1, y1)`` in *full-size frame* pixels — the frame file's
+    #: own grid, never the binned stream (the GUI converts before recording).
+    #: A later developer GUI crops the frame by it. ``None`` = no crop asked
+    #: for; the frame stands as captured.
+    crop_rect: tuple[int, int, int, int] | None = None
 
     @property
     def path_like(self) -> Path:

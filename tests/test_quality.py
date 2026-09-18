@@ -151,7 +151,7 @@ class TestAudit:
         result = audit_frame(_tiff(tmp_path, data), (0, 0, 200, 200),
                              (300, 200), _settings())
         assert isinstance(result, AuditResult)
-        assert "AE výřez" in result.message
+        assert "měřicí výřez" in result.message
 
 
 class TestPreviewJpeg:

@@ -22,10 +22,15 @@ than left to the operator:
 
 * **RAW View** shows the frame with display gamma only, and the histogram is
   computed from linear sensor signal. Exposure judgements happen here.
-* **Working Positive** shows inversion + base subtraction + preview exposure +
-  filmic, for judging the *picture*. The histogram does not change: it keeps
-  describing linear data even in this mode, because a histogram of an inverted,
-  tone-curled preview is decorative.
+* **Negativ** (Working Positive) shows inversion + base subtraction + preview
+  exposure + filmic, for judging the *picture*. The histogram does not change:
+  it keeps describing linear data even in this mode, because a histogram of an
+  inverted, tone-curled preview is decorative.
+
+(2026-09: the third „Positive" checkbox is gone — it set invert=False while
+still entering this same Working Positive branch, so it rendered a differently
+treated picture than the Negativ switch implied and let two mode boxes be
+ticked at once. Two mutually exclusive states replaced three tangled ones.)
 
 The D750-era "histogram = NEF prediction via body meter" is gone by design:
 the Touptek stream is itself linear, un-tone-curled sensor data, so what the
@@ -38,8 +43,8 @@ Nothing in this window can write to a stored archive file: captures go through
 One rule governs the threads: **only one thread may touch the camera at a
 time**. The worker queue serialises every call, and the Touptek SDK forbids
 BINNING/ROI writes from its own callback context — so Live View is paused (or
-its stream simply reconfigured through the queue) before Auto Exposure or a
-still capture runs.
+its stream simply reconfigured through the queue) before a still capture or a
+stream frame grab runs.
 """
 
 from __future__ import annotations
@@ -72,11 +77,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from filmscan_studio.capture.autoexposure import (
-    AutoExposureController,
-    LiveMeter,
-    fresh_live_frame,
-)
+# LiveMeter / fresh_live_frame meter the Live View stream (film-base sampling
+# uses them); the AutoExposureController that also lived here is unhooked from
+# the UI (manual-only rig, 2026-09) but stays in the module with its tests.
+from filmscan_studio.capture.autoexposure import LiveMeter, fresh_live_frame
 from filmscan_studio.capture.camera import CameraBackend, CameraError, CameraInfo
 from filmscan_studio.capture.mock import MockCamera
 from filmscan_studio.capture.quality import audit_frame, render_preview_jpeg
@@ -84,7 +88,6 @@ from filmscan_studio.capture.session import CaptureSession, SessionPaths
 from filmscan_studio.capture.touptek import TouptekCamera
 from filmscan_studio.core.exposure import (
     ARCHIVE_GAIN,
-    DEFAULT_HEADROOM_EV,
     ExposureSettings,
     MeterReading,
     parse_shutter,
@@ -123,8 +126,12 @@ COOLING_SEMAPHORE_TOLERANCE_C = 2.0
 
 #: Shutter presets for the editable combo of a continuous (microsecond)
 #: shutter — film digitising lives in whole seconds, unlike the D750 ladder.
+#: 2026-09: the short end was extended below 1/10 (bright light / thin
+#: negatives want 1/50–1/200 too); the sensor goes to 300 µs, so these are all
+#: deliverable. Anything finer stays typeable — the combo is editable.
 SHUTTER_PRESETS: tuple[float, ...] = (
-    0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 120.0, 300.0,
+    1 / 200, 1 / 100, 1 / 50, 1 / 25, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0,
+    15.0, 30.0, 60.0, 120.0, 300.0,
 )
 
 
@@ -345,33 +352,22 @@ class CaptureWindow(QMainWindow):
         # the two widgets it names, and both say what they are once touched.
         exposure_form.addRow(row)
 
-        self.btn_gain_base = QPushButton("Gain 1.00× (archiv)", checkable=True)
-        self.btn_gain_base.setChecked(True)
-        self.btn_gain_base.setToolTip(
-            "Archivní sken se exponuje při gain 1.00× (noise floor IMX571) — "
-            "expozice se pak řeší jen časem. Odškrtnutí odemkne i Auto "
-            "Exposure gainu (jen pro ostření/zašmutování, ne pro archiv)."
-        )
-        self.btn_gain_base.toggled.connect(self._set_gain_base)
-        exposure_form.addRow(self.btn_gain_base)
-
-        self.btn_autoexposure = QPushButton("Auto Exposure")
-        self.btn_autoexposure.clicked.connect(self._auto_exposure)
-        self.btn_autoexposure.setToolTip(
-            "Řeší expozici z lineárního proudu — stiskni jednou a hotovo. "
-            "Změníš-li pak ručně čas/gain nebo osvětlení, stiskni znovu "
-            "(histogram = přímá data senzoru, žádná predikce)."
-        )
+        # The „Gain 1.00× (archiv)" button and the „Auto Exposure" button are
+        # gone (2026-09): the rig runs manual-only now — the archival gain rule
+        # still guards Capture (via _capture_block_reason, which reads the
+        # camera directly), and exposure is solved by the operator from the
+        # honest linear histogram, not by a closed loop. The gain spin stays:
+        # it is how a non-1.00× gain gets *back* to the archival 1.00×.
         self.ae_hint = QLabel(
-            "AE rámeček: drž SHIFT a přetáhni myší — histogram, Auto Exposure "
-            "i audit pak měří jen uvnitř (mimo něj nic nevidí). Pravé tlačítko "
-            "ho zruší. Vystříhněný rámeček zmizí z pohledu, ale měří dál — "
-            "velikost ukáže stavový řádek. Tažení bez Shiftu při zoomu "
+            "Měřicí rámeček: drž SHIFT a přetáhni myší — histogram i audit "
+            "pak měří jen uvnitř (mimo něj nic nevidí). Při snímku se uloží "
+            "do sidecaru jako ořez (přepočten na plné rozlišení). Pravé "
+            "tlačítko ho zruší. Vystříhněný rámeček zmizí z pohledu, ale měří "
+            "dál — velikost ukáže stavový řádek. Tažení bez Shiftu při zoomu "
             "posouvá, klik = vycentrovat."
         )
         self.ae_hint.setWordWrap(True)
         self.ae_hint.setStyleSheet("color: #9a9; font-size: 11px;")
-        exposure_box.body_layout().addWidget(self.btn_autoexposure)
         exposure_box.body_layout().addWidget(self.ae_hint)
         right_layout.addWidget(exposure_box)
 
@@ -417,25 +413,24 @@ class CaptureWindow(QMainWindow):
         self.cool_box.setVisible(False)
 
         # ------------------------------------------------------- preview layer
-        # The negative toggle sits in the panel header row next to the mode
-        # checkboxes — same layer, one line, no click-through-collapse maze.
+        # Two mutually exclusive preview states, one row. The old third box
+        # „Positive" is gone (2026-09): it set invert=False yet still rendered
+        # the Working Positive branch, so clicking „Negativ" left *both* it and
+        # „Positive" ticked — a picture that contradicted its own checkboxes.
         self.preview_box = CollapsibleBox(
             "Náhled — expozice & křivka (NEOVlivňuje focení)", expanded=False
         )
         mode_row = QHBoxLayout()
-        self.neg_toggle = QCheckBox("Negativ")
-        self.neg_toggle.setToolTip(
-            "Invertuje a aplikuje křivku na náhled. Uložený snímek se nemění."
-        )
-        self.neg_toggle.toggled.connect(self._toggle_negative_preview)
-        mode_row.addWidget(self.neg_toggle)
         self.mode_raw = QCheckBox("RAW View")
         self.mode_raw.setChecked(True)
         self.mode_raw.toggled.connect(lambda on: self._set_mode(raw_view=on))
         mode_row.addWidget(self.mode_raw)
-        self.mode_positive = QCheckBox("Positive")
-        self.mode_positive.toggled.connect(lambda on: self._set_mode(raw_view=not on))
-        mode_row.addWidget(self.mode_positive)
+        self.neg_toggle = QCheckBox("Negativ")
+        self.neg_toggle.setToolTip(
+            "Invertuje a aplikuje křivku na náhled. Uložený snímek se nemění."
+        )
+        self.neg_toggle.toggled.connect(lambda on: self._set_mode(raw_view=not on))
+        mode_row.addWidget(self.neg_toggle)
         mode_row.addStretch()
         right_layout.addLayout(mode_row)
         self.filmic = FilmicPanel()
@@ -490,7 +485,7 @@ class CaptureWindow(QMainWindow):
         self.btn_base_mode.setCheckable(True)
         self.btn_base_mode.setToolTip(
             "Přepne tažení SHIFT+mýší na modrý obdélník film base / min point "
-            "(červený AE rámeček zůstává a dál měří expozici). Modrý rámeček "
+            "(červený měřicí rámeček zůstává a dál měří expozici). Modrý rámeček "
             "vezmi na čirou základnu filmu (okraj bez obrazu)."
         )
         self.btn_base_mode.toggled.connect(self._on_base_mode_toggled)
@@ -696,20 +691,6 @@ class CaptureWindow(QMainWindow):
         self._refresh_settings()
         self._refresh_buttons()
 
-    def _set_gain_base(self, on: bool) -> None:
-        """Archival gain: the scan is a transmission measurement at the noise
-        floor — 1.00× on the IMX571 — exposure lives in time. Unchecking only
-        unlocks the *AE's* hands; Capture still refuses a raised gain."""
-        if self.camera is None:
-            return
-        if on:
-            try:
-                self.camera.set_gain(ARCHIVE_GAIN)
-            except CameraError as exc:
-                QMessageBox.warning(self, "Gain", str(exc))
-        self._refresh_settings()
-        self._refresh_buttons()
-
     def _capture_block_reason(self) -> str | None:
         """Why Capture must refuse right now, or None when it may run.
 
@@ -726,7 +707,7 @@ class CaptureWindow(QMainWindow):
             return None       # never block a shot on a settings read that hiccuped
         if gain is not None and abs(gain - ARCHIVE_GAIN) > 1e-3:
             return (f"Archivní sken vyžaduje gain {ARCHIVE_GAIN:.2f}× (teď "
-                    f"{gain:.2f}×) — stiskni 'Gain 1.00×' a exponuj jen časem.")
+                    f"{gain:.2f}×) — vrať gain na 1.00× a exponuj jen časem.")
         return None
 
     # ------------------------------------------------------------- cooling UI
@@ -918,7 +899,7 @@ class CaptureWindow(QMainWindow):
     def _on_ae_rect(self, rect) -> None:
         if rect is None:
             self._ae_rect = None
-            self.statusBar().showMessage("AE výřez zrušen", 2500)
+            self.statusBar().showMessage("Měřicí rámeček zrušen", 2500)
             return
         self._ae_rect = (rect.x(), rect.y(),
                          rect.x() + rect.width(), rect.y() + rect.height())
@@ -929,7 +910,8 @@ class CaptureWindow(QMainWindow):
         w = sensor[2] - sensor[0] if sensor else rect.width()
         h = sensor[3] - sensor[1] if sensor else rect.height()
         self.statusBar().showMessage(
-            f"AE výřez {w}×{h} px senzoru — měří a audituje jen uvnitř "
+            f"Měřicí rámeček {w}×{h} px senzoru — histogram a audit měří jen "
+            "uvnitř; při snímku se uloží do sidecaru jako ořez "
             "(pravé tlačítko zruší)", 6000
         )
 
@@ -955,7 +937,7 @@ class CaptureWindow(QMainWindow):
         self.view.set_rect_mode("base" if on else "ae")
         self.statusBar().showMessage(
             "Tažení kreslí modrý rámeček film base / min point"
-            if on else "Tažení kreslí červený AE rámeček", 4000)
+            if on else "Tažení kreslí červený měřicí rámeček", 4000)
 
     def _base_rect_missing_note(self) -> str | None:
         """Why a base measurement must refuse, or None when it may run."""
@@ -1038,34 +1020,6 @@ class CaptureWindow(QMainWindow):
             f"Film base: {sample.mean_dn:.1f} DN (black {sample.black_level:.0f}, "
             f"čas {shutter.shutter_string()}) — uloženo do film_base.json", 8000)
         self._refresh_stage()
-
-    def _meter_source(self):
-        """Metering callable for Auto Exposure: whole frame or the red rect.
-
-        Reads frames itself (the poller is stopped during AE). The stream is
-        linear DN — one division normalises it and the reading's own black/
-        white describe the same scale the histogram uses.
-        """
-        rect = self._ae_rect
-
-        def read():
-            # Same freshness rule as the controller: never meter a frame the
-            # old shutter exposed — the AE rect must aim where the meter says.
-            frame = fresh_live_frame(self.camera)
-            data = LiveMeter.decode_live_frame(frame)
-            if rect is not None:
-                x0, y0, x1, y1 = rect
-                h, w = data.shape[:2]
-                x0, y0 = max(int(x0), 0), max(int(y0), 0)
-                x1, y1 = min(int(x1), w), min(int(y1), h)
-                if x1 <= x0 or y1 <= y0:
-                    raise RuntimeError("AE výřez leží mimo snímek")
-                data = data[y0:y1, x0:x1]
-            black, white = self._meter.frame_levels(frame)
-            from filmscan_studio.core.exposure import measure
-            return measure(data, black, white, self._meter.percentile)
-
-        return read
 
     def _pause_live_view(self) -> None:
         """Stop the poller so a blocking camera call owns the session."""
@@ -1233,7 +1187,7 @@ class CaptureWindow(QMainWindow):
             f"<span style='color:#58f'>černá "
             f"{hist.clipped_low_fraction:.3%}</span>"
         )
-        scope = "AE výřez" if self._ae_rect is not None else "celý snímek"
+        scope = "měřicí výřez" if self._ae_rect is not None else "celý snímek"
         source = f"lineární data proudu · {scope}"
         if self.raw_view:
             self.histogram.set_curve(None)
@@ -1244,13 +1198,6 @@ class CaptureWindow(QMainWindow):
                 f"histogram: {source} — křivka je jen přiložený model"
             )
         return reading
-
-    def _toggle_negative_preview(self, on: bool) -> None:
-        """One-switch negative → picture preview; the filmic settings stay in
-        the collapsed panel. The captured frame is untouched — this only
-        repaints. _set_mode owns the invert checkbox, so nothing is synced
-        here."""
-        self._set_mode(raw_view=not on)
 
     def _update_meter_label(self, reading: MeterReading) -> None:
         util = reading.highlight_utilisation
@@ -1270,16 +1217,15 @@ class CaptureWindow(QMainWindow):
 
     def _set_mode(self, raw_view: bool) -> None:
         self.raw_view = raw_view
-        sender = self.sender()
-        # The two checkboxes are mutually exclusive; block the echo toggle.
-        if sender is not self.mode_raw:
-            self.mode_raw.setChecked(raw_view)
-        if sender is not self.mode_positive:
-            self.mode_positive.setChecked(not raw_view)
-        # Keep the one-switch negative toggle honest whichever way we got here.
-        self.neg_toggle.blockSignals(True)
-        self.neg_toggle.setChecked(not raw_view)
-        self.neg_toggle.blockSignals(False)
+        # Mutually exclusive: exactly one box is ever ticked. setChecked is
+        # signal-blocked, so the sibling's toggled handler never bounces a
+        # second _set_mode call back (the old row's echo maze — and, with the
+        # removed Positive box gone, the source of its double tick).
+        for box, state in ((self.mode_raw, raw_view),
+                           (self.neg_toggle, not raw_view)):
+            box.blockSignals(True)
+            box.setChecked(state)
+            box.blockSignals(False)
         # The panel's invert checkbox must say what the picture is doing. It
         # defaulted to checked and never followed the mode, so a RAW View —
         # which ignores invert and paints un-inverted — sat under a ticked
@@ -1327,7 +1273,11 @@ class CaptureWindow(QMainWindow):
             return
         if scan:
             number = self.frame_number.value() if self.frame_number.value() > 0 else None
-            fn, args = self.session.capture_scan, (number,)
+            # The red frame doubles as the crop cue: stored in sensor px —
+            # the full-size frame's own grid, never the 3×3-binned stream —
+            # so the developer GUI can crop by it directly. No rect, no crop.
+            crop = self._ae_rect_in_sensor_px()
+            fn, args = self.session.capture_scan, (number, crop)
             label = "Snímek"
         elif kind == "base":
             # The frame is full-size, so the rect must arrive in sensor px —
@@ -1456,78 +1406,11 @@ class CaptureWindow(QMainWindow):
             audit.message + applied + " — tento snímek zopakuj", 10000
         )
 
-    def _auto_exposure(self) -> None:
-        if self.camera is None or self._worker is None:
-            QMessageBox.information(self, "Auto Exposure", "Musí běžet Live View.")
-            return
-        controller = AutoExposureController(
-            self.camera, self._meter, headroom_ev=DEFAULT_HEADROOM_EV,
-            # Archival rule: with the gain base locked, AE solves with the
-            # shutter alone; the checkbox hands it gain when unlocked.
-            gain_lock=self.btn_gain_base.isChecked(),
-        )
-        self._set_actions_busy(True)
-        if self._worker is not None:
-            # AE keeps grabbing frames after the worker stops — the stream
-            # must stay up through the worker's teardown for that to work.
-            self._worker.leave_live_view = True
-        self._pause_live_view()
-        # Metering is the stream itself; the red AE rect aims the meter by
-        # cropping (no body meter to bias — the stream *is* the capture).
-        self.statusBar().showMessage(
-            "Auto Exposure: řeším z lineárního proudu…"
-            + (", AE výřez" if self._ae_rect is not None else "")
-        )
-
-        # The controller offers per-step feedback; using it is the difference
-        # between "řeším…" and a visibly working loop. At long shutters one
-        # step legitimately takes seconds — silence looked like a hang.
-        def report_step(settings: ExposureSettings) -> None:
-            text = (f"Auto Exposure: zkouším {settings.shutter_string()} "
-                    f"({settings.sensitivity_string()})…")
-            self._relay.send(lambda _u: self.statusBar().showMessage(text),
-                             None)
-
-        self._start_worker(controller.run, self._on_auto_exposure_done,
-                           self._meter_source(), report_step)
-
-    def _on_auto_exposure_done(self, result) -> None:
-        self._set_actions_busy(False)
-        self._resume_live_view()
-        self._refresh_settings()
-        # The controller converged from the stream: one press solves the whole
-        # move. If it stopped short, it names the concrete shutter end and the
-        # residual EV — show exactly that, never a canned sentence.
-        if not result.converged:
-            QMessageBox.warning(
-                self,
-                "Auto Exposure",
-                result.limit_note
-                or "Nastavení kamery nestačí — scéna mimo rozsah.",
-            )
-        elif result.clipped:
-            # Converged on the residual but the frame still rides the rail:
-            # the meter is blind above clipping, so "done" here would be a
-            # lie — the scan would be blown and the operator must know.
-            QMessageBox.warning(
-                self,
-                "Auto Exposure",
-                f"I po vyřešení ({result.settings.shutter_string()}) je "
-                f"scéna na hranici přepálení "
-                f"({result.reading.clipped_fraction:.3%} pixelů na bílé) — "
-                "změň expozici ručně nebo ztmavi scénu.",
-            )
-        else:
-            self.statusBar().showMessage(
-                f"Auto Exposure: {result.settings.shutter_string()} · "
-                f"{result.settings.sensitivity_string()} — vyřešeno v "
-                f"{result.iterations} krocích"
-            )
-        self._log(
-            f"AE: {result.settings.shutter_string()} "
-            f"{result.settings.sensitivity_string()} converged={result.converged}"
-            + (f" · {result.limit_note}" if result.limit_note else "")
-        )
+    # Auto Exposure's GUI wrapper is gone (2026-09): the rig is operated
+    # manually and the operator solves exposure from the honest linear
+    # histogram. The controller itself (capture/autoexposure.py) stays in the
+    # codebase with its tests — LiveMeter and fresh_live_frame, which the Live
+    # View worker and the film-base stream measurement both use, live there.
 
     # ------------------------------------------------------------------ film
 
@@ -1609,7 +1492,7 @@ class CaptureWindow(QMainWindow):
         self._log(f"CHYBA: {message}")
 
     def _set_actions_busy(self, busy: bool) -> None:
-        buttons = (self.btn_capture, self.btn_autoexposure,
+        buttons = (self.btn_capture,
                    self.btn_dark, self.btn_flat,
                    self.btn_base_stream, self.btn_base_frame)
         if busy:
@@ -1617,9 +1500,7 @@ class CaptureWindow(QMainWindow):
                 button.setEnabled(False)
         else:
             # _refresh_buttons is the single source of truth for who may be
-            # enabled — Auto Exposure needs only the camera, the captures also
-            # need a film. Disabling with a blanket session check here is what
-            # left Auto Exposure greyed out after its first (failed) run.
+            # enabled: captures need a camera and a film.
             self._refresh_buttons()
 
     # -------------------------------------------------------------- indicators
@@ -1637,11 +1518,6 @@ class CaptureWindow(QMainWindow):
             if settings.gain is not None:
                 self.gain_spin.setValue(settings.gain)
             self.shutter_edit.setCurrentText(settings.shutter_string())
-            locked = (settings.gain is None
-                      or abs(settings.gain - ARCHIVE_GAIN) <= 1e-3)
-            self.btn_gain_base.blockSignals(True)
-            self.btn_gain_base.setChecked(locked)
-            self.btn_gain_base.blockSignals(False)
         finally:
             self._echo = False
 
@@ -1679,10 +1555,9 @@ class CaptureWindow(QMainWindow):
         self.btn_capture.setEnabled(scans_allowed)
         self.btn_capture.setToolTip(
             "" if scans_allowed else
-            "Archivní sken se exponuje při gain 1.00× — stiskni 'Gain 1.00×' "
+            "Archivní sken se exponuje při gain 1.00× — vrať gain na 1.00× "
             "a nastavuj jen čas."
         )
-        self.btn_autoexposure.setEnabled(has_camera)
 
     def _log(self, line: str) -> None:
         current = self.log_view.text()

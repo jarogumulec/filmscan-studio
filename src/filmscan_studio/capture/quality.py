@@ -28,6 +28,7 @@ from pathlib import Path
 import numpy as np
 
 from filmscan_studio.core.exposure import (
+    CLIP_TOLERANCE_FRACTION,
     DEFAULT_HEADROOM_EV,
     ExposureSettings,
     choose_shutter,
@@ -38,10 +39,10 @@ from filmscan_studio.core.rawio import open_frame
 
 log = logging.getLogger(__name__)
 
-#: Above this clipped-pixel fraction the frame is over. One ten-thousandth is
-#: the same bar MeterReading.clipped uses — enough that dust/hot pixels do not
-#: trip it, low enough that real blown base does.
-CLIP_TOLERANCE = 0.0001
+#: Above this clipped-pixel fraction the frame is over. One class with the
+#: live meter's bar (``CLIP_TOLERANCE_FRACTION``, tightened 2026-09-18 to
+#: 5e-6): ~130 clipped px on a full frame trip it, a lone hot pixel does not.
+CLIP_TOLERANCE = CLIP_TOLERANCE_FRACTION
 #: Residuals under this are ladder granularity, not an exposure mistake.
 EV_TOLERANCE = 0.25
 
@@ -100,7 +101,7 @@ def audit_frame(
     reading = measure(region.astype(np.float64), frame.black_level,
                       frame.white_level)
     clipped = reading.clipped_fraction
-    scope = "AE výřez" if mapped else "celý snímek"
+    scope = "měřicí výřez" if mapped else "celý snímek"
 
     if clipped > CLIP_TOLERANCE:
         ev = required_ev_change(reading, headroom_ev)

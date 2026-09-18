@@ -311,6 +311,25 @@ class TestSessionWorkflow:
         assert sample.mean_dn == pytest.approx(
             float(frame.data[100:500, 100:600].mean()))
 
+    def test_scan_records_crop_rect_in_sidecar(self, session: CaptureSession) -> None:
+        """The red frame the operator drew rides into the scan's sidecar so the
+        developer GUI can crop by it — stored in the full-size frame's own px,
+        which is the grid the frame file is written at."""
+        crop = (512, 300, 5800, 3900)
+        result = session.capture_scan(1, crop_rect=crop)
+        payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["crop_rect"] == list(crop)
+        # And it survives the catalog round-trip the developer GUI reads from.
+        scan = session.catalog.captures("HP5_001", FrameKind.SCAN)[0]
+        assert scan.crop_rect == crop
+
+    def test_scan_without_crop_rect_is_null(self, session: CaptureSession) -> None:
+        """No rect drawn = no crop claim in the sidecar, not a whole-frame
+        sentinel a later tool would have to second-guess."""
+        result = session.capture_scan(1)
+        payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["crop_rect"] is None
+
     def test_base_samples_append_in_order(self, session: CaptureSession) -> None:
         from filmscan_studio.core.filmbase import FilmBaseSample
 
@@ -633,6 +652,50 @@ def _reading_of_dn(dn: float) -> MeterReading:
         clipped_fraction=util >= 1.0 and 0.01 or 0.0,
         near_black_fraction=0.0,
     )
+
+
+class TestFilmOrientation:
+    """2026-09 (uživatel): volně kombinovatelné atributy orientace filmu.
+
+    Zrcadlo H + zrcadlo V JE rotace 180° — proto všechen najednou zakazuje
+    model (vyrušilo by se to v identitu). Dva najednou zůstávají platné.
+    """
+
+    def test_defaults_are_all_off(self):
+        film = FilmMetadata(film_id="O1")
+        assert not film.mirrored_horizontal
+        assert not film.mirrored_vertical
+        assert not film.rotated_180
+
+    def test_each_flag_alone_is_valid(self):
+        for flag in ("mirrored_horizontal", "mirrored_vertical", "rotated_180"):
+            film = FilmMetadata(film_id="O1", **{flag: True})
+            assert getattr(film, flag) is True
+
+    def test_any_two_flags_combine(self):
+        # H+V = rotace 180 vyjádřená přes zrcadla — platná kombinace.
+        FilmMetadata(film_id="O1", mirrored_horizontal=True,
+                     mirrored_vertical=True)
+        FilmMetadata(film_id="O1", mirrored_horizontal=True, rotated_180=True)
+        FilmMetadata(film_id="O1", mirrored_vertical=True, rotated_180=True)
+
+    def test_all_three_rejected_as_identity(self):
+        # H+V je 180°; přidat rot_180 navzáď = nic (identita).
+        with pytest.raises(Exception, match="vyru"):
+            FilmMetadata(film_id="O1", mirrored_horizontal=True,
+                         mirrored_vertical=True, rotated_180=True)
+
+    def test_roundtrip_and_retired_mirrored_still_stripped(self):
+        film = FilmMetadata(film_id="O1", mirrored_horizontal=True)
+        again = FilmMetadata.model_validate_json(film.model_dump_json())
+        assert again == film and again.mirrored_horizontal
+        # Staré jednopříznakové „mirrored" se stále maže při načtení —
+        # nové atributy mají jiná jména a zůstávají.
+        old = {"film_id": "OLD", "mirrored": True,
+               "mirrored_horizontal": True}
+        loaded = FilmMetadata.model_validate(old)
+        assert not hasattr(loaded, "mirrored")
+        assert loaded.mirrored_horizontal
 
 
 class TestFilmMetadataV2:

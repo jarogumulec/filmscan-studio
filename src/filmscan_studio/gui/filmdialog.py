@@ -17,12 +17,14 @@ from __future__ import annotations
 from datetime import date
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -146,6 +148,31 @@ class FilmDialog(QDialog):
         self.digitising_holder = _line(rig_src.digitising_holder, "PSI 35mm")
         rig_form.addRow("Držák", self.digitising_holder)
 
+        # How the strip sits in the holder — freely combinable, recorded for
+        # post-production. The forbidden combination is all three at once:
+        # mirror H + mirror V is the 180° rotation, so adding rotated_180 back
+        # cancels everything to identity. Two at a time (H+V = rot 180, or one
+        # mirror + rot 180 = the other mirror) stay allowed.
+        orient_row = QHBoxLayout()
+        self.mirrored_horizontal = QCheckBox("zrcadlit vodorovně")
+        self.mirrored_vertical = QCheckBox("zrcadlit svisle")
+        self.rotated_180 = QCheckBox("rotace 180°")
+        # film_src, not rig_src: how a strip sits in the holder is the strip's
+        # own business — the rig carries over between films, the orientation
+        # of the next strip must never be inherited by accident.
+        for box, value in (
+            (self.mirrored_horizontal, film_src.mirrored_horizontal),
+            (self.mirrored_vertical, film_src.mirrored_vertical),
+            (self.rotated_180, film_src.rotated_180),
+        ):
+            box.setChecked(value)
+            box.setToolTip(
+                "Jak leží film v držáku — zaznamená se, pro postprodukci."
+            )
+            orient_row.addWidget(box)
+        orient_row.addStretch()
+        rig_form.addRow("Orientace filmu", orient_row)
+
         self.digitisation_date = _line(
             film_src.digitisation_date or date.today().isoformat(), "2026-09-15"
         )
@@ -194,6 +221,9 @@ class FilmDialog(QDialog):
             digitising_lens=_text_or_none(self.digitising_lens),
             digitising_light=_text_or_none(self.digitising_light),
             digitising_holder=_text_or_none(self.digitising_holder),
+            mirrored_horizontal=self.mirrored_horizontal.isChecked(),
+            mirrored_vertical=self.mirrored_vertical.isChecked(),
+            rotated_180=self.rotated_180.isChecked(),
             digitisation_date=_text_or_none(self.digitisation_date),
             operator=_text_or_none(self.operator),
             notes=self.notes.toPlainText().strip() or None,

@@ -28,3 +28,4 @@ dev = [
 [project.scripts]
 filmscan-studio = "filmscan_studio.__main__:main"
 filmscan-develop = "filmscan_studio.developer.__main__:main"
+filmscan-develop-gui = "filmscan_studio.developer.gui:main"

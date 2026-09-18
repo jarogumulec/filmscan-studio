@@ -37,6 +37,13 @@ ARCHIVE_GAIN = 1.0
 #: Percentile of the linear signal used as the "brightest real value".
 DEFAULT_METER_PERCENTILE = 99.9
 
+#: Above this clipped-pixel fraction the rails scream — shared by the live
+#: meter (:meth:`MeterReading.clipped` / :attr:`MeterReading.crushed`) and the
+#: post-capture audit. Tightened 2026-09-18 from 1e-4 to 5e-6 (one two-
+#: hundred-thousandth) at the operator's request: on the full 6224×4168 frame
+#: the verdict fires from ~130 clipped px, not ~2 600.
+CLIP_TOLERANCE_FRACTION = 0.000005
+
 #: Fraction of samples allowed to sit below black before black is considered
 #: unreliable (a hint that the dark frame has drifted).
 BLACK_FLOOR_SANITY_RATIO = 0.001
@@ -159,7 +166,7 @@ class MeterReading:
 
     @property
     def clipped(self) -> bool:
-        return self.clipped_fraction > 0.0001
+        return self.clipped_fraction > CLIP_TOLERANCE_FRACTION
 
     @property
     def crushed(self) -> bool:
@@ -168,7 +175,7 @@ class MeterReading:
         Same tolerance: dust and a hot/cold pixel here as there; real density
         crushed to zero is far more common than a tenth of a percent.
         """
-        return self.black_fraction > 0.0001
+        return self.black_fraction > CLIP_TOLERANCE_FRACTION
 
     @property
     def highlights_at_target(self) -> bool:

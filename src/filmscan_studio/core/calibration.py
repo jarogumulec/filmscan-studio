@@ -114,6 +114,33 @@ def correct_dark(
     return scan.astype(np.float64) - scaled
 
 
+def stack_darks(
+    frames: list[np.ndarray], shutters: list[float], black_level: float = 0.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Median-stack dark frames that were shot at *different* shutter times.
+
+    :func:`stack` alone is wrong for mixed-shutter darks: dark current scales
+    with shutter time, so medianing a 1.00 ms and a 1.17 ms dark together mixes
+    two different dark currents into one master (measured on B1: ~44 DN bias,
+    which at D=3 is a ~0.085 density error -- larger than the shot noise there).
+    Each frame is first rescaled onto the *longest* shutter (the reference, so
+    we only ever interpolate downward and never amplify), then medianed; the
+    caller scales the master to the scan with :func:`rescale_dark` as usual.
+
+    The returned spread is in reference-shutter units, like the median.
+    """
+    if len(frames) != len(shutters):
+        raise ValueError("one shutter time required per dark frame")
+    if not frames:
+        raise ValueError("cannot stack an empty list")
+    reference = max(shutters)
+    normalised = [
+        rescale_dark(f, shutter, reference, black_level)
+        for f, shutter in zip(frames, shutters)
+    ]
+    return stack(normalised)
+
+
 def build_flat(
     frames: list[np.ndarray], smooth_sigma: float = FLAT_SMOOTH_SIGMA
 ) -> np.ndarray:

@@ -66,6 +66,11 @@ class FakeHcam:
         self._size = size
         self._gain_range = gain_range
         self._expo_us = 1_000_000
+        #: Hardware-measured 2026-09-18: the real ATR2600M reports
+        #: info.v3.expotime = 0 on every live frame *and* still — it never
+        #: stamps its exposure. The fake defaults to that; a test that wants
+        #: the SDK-documented stamping opts in explicitly.
+        self._stamp_expotime = False
         self._gain_permille = 1000
         self._temperature = -52      # -5.2 °C in 0.1 units
         self._autoexpo = autoexpo    # camera-side AE state, persists in flash
@@ -156,10 +161,11 @@ class FakeHcam:
         np.frombuffer(buf, dtype=np.uint16, count=w * h).reshape(h, w)[:] = 4242
         if info is not None:
             info.v3.width, info.v3.height = w, h
-            # The real SDK stamps each frame with the shutter it was actually
-            # exposed with; the backend forwards it as LiveFrame.expotime_us
-            # so AE can refuse frames the *old* shutter exposed.
-            info.v3.expotime = self._expo_us
+            # The real ATR2600M answers 0 (no stamp) — see __init__. The
+            # backend maps 0 -> None and every metering falls back to the
+            # requested settings; the stamp-propagation path is kept alive
+            # by the opt-in test below.
+            info.v3.expotime = self._expo_us if self._stamp_expotime else 0
 
     def PullStillImageV2(self, buf, bits, info) -> None:
         w, h = self._size
@@ -426,11 +432,32 @@ class TestStreamModes:
         assert size == fake.delivered_size()
 
     def test_frame_carries_reported_expotime(self, fake, camera) -> None:
+        """The 0 -> None / stamp-forward mapping, with the fake opting in.
+
+        Hardware-measured 2026-09-18: the real ATR2600M answers expotime=0
+        on every frame (live *and* still) — see TestNoStampBelow; the fake
+        reproduces that by default and this test turns the stamping on to
+        keep the forwarding path covered.
+        """
+        fake._stamp_expotime = True
         camera.set_shutter(2.5)
         camera.start_live_view()
         fake.fire_frame()
         frame = camera.next_live_frame()
         assert frame.expotime_us == 2_500_000
+
+    def test_real_camera_stamp_is_none(self, fake, camera) -> None:
+        """Default fake = real ATR2600M: no stamp -> LiveFrame.expotime_us None.
+
+        This is the contract the whole metering chain runs on in practice:
+        fresh_live_frame and the film-base stream reading fall back to the
+        requested settings because the camera never stamps a frame.
+        """
+        camera.set_shutter(2.5)
+        camera.start_live_view()
+        fake.fire_frame()
+        frame = camera.next_live_frame()
+        assert frame.expotime_us is None
 
     def test_silent_stream_times_out_as_camera_error(self, camera, monkeypatch) -> None:
         monkeypatch.setattr(touptek, "FRAME_TIMEOUT_S", 0.01)
@@ -656,7 +683,7 @@ class TestHelpers:
         class LyingHcam(FakeHcam):
             def get_Option(self, opt: int) -> int:
                 value = super().get_Option(opt)
-                return value + 1 if opt == _const("CURVE") else value
+                return value + 1 if opt == _const("LINEAR") else value
 
         notes = apply_raw_contract(LyingHcam(), RAW_OPTIONS)
-        assert any("křivkový" in n and "hlásí" in n for n in notes)
+        assert any("lineární" in n and "hlásí" in n for n in notes)

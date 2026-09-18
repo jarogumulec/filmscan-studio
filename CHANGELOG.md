@@ -3,6 +3,159 @@
 Vše, co se od posledního stavu změnilo, a hlavně: **co nešlo bez fotoaparátu
 ověřit** a jak to poznat při prvním zapnutí s tělem.
 
+## 2026-09-18 večer — vyvolávač: pozitiv, per-snímkové nastavení, orientace
+
+393 testů zelených. Zásah jen do developerské vrstvy (`core/render.py`,
+`core/density.py`, `developer/*`) — capture pipeline se nezměnila.
+
+**Inverze na pozitiv.** `render_density` dosud počítal `out = 1 - y`, což je
+**negativ znovu** (u negativu hustota roste tam, kde byla scéna jasná —
+pozitiv musí být světlý TAM TÉŽ). Nyní `out = y`: base (nejméně zákalu) →
+černá, dmax → bílá; expozice +EV jasně zjasňuje. Testy přepsány na fyzikální
+invarianty (bázový black, dmax white, monotónnost D↑ → jasnější).
+
+**Přepaly a neprostupné hustoty už nejsou černé tečky.** Dřív
+saturace i `T <= 0` splývaly v NaN → export je zalil černou a náhled kreslil
+purpurem. Nyní `density()` rozlišuje *směr*: saturace (film světlejší než
+změřitelný) = **−inf D** → po renderu černá (spodek stupnice);
+`T <= 0` (hustší než tmavé reziduum) = **+inf D** → bílá. NaN zůstává jen
+„nedosvětlo" (mimo ozářenou oblast) — purpur v náhledu, černá v exportu,
+a to je poctivá „neměřeno". Nová `illuminated_mask()` odděluje masku
+ozáření od masky měřitelnosti; `valid_mask()` nadále platí pro audit.
+Na test2: 0,45 % pixelů +inf, 0,02 % −inf, 15,3 % skutečné NaN (okraje).
+
+**Per-snímkové parametry + persistence.** Slidery (Dmin/Dmax, expozice,
+křivka) se pamatují zvlášť pro každý snímek do `develop_settings.json`
+ve složce projektu; při přepnutí snímku se nahrají zpět, ROI rámčky také.
+Tlačítko **Proposal** vrátí auto body (Dmin z film base, Dmax z p99,9)
+s lineární křivkou — nový snímek bez historie startuje na Proposalu,
+žádné volitelné S-ko jako výchozina.
+
+**Orientace filmu.** `DevelopProject` čte `mirrored_horizontal` /
+`mirrored_vertical` / `rotated_180` z `project.json` (vynáší capture apka;
+test2 má H+V). Překlopí se náhled i oba exporty; **hustotní archiv zůstává
+v surové orientaci senzoru** (data se nepřepisují, jen se zobrazují).
+Orientace je vidět v levém sloupci.
+
+## 2026-09-18 — fix: vývojářské GUI spadlo na paintEvent
+
+`DensityView` měl `@property rect`, který **clonoval `QWidget.rect()`** —
+každé `self.rect()` v `paintEvent` (i uvnitř Qt) pak zabalovalo ROI tuple
+→ `TypeError: 'tuple' object is not callable`, nekonečné přes kreslení.
+Property se jmenuje `roi` (nikdy ne `rect` — komentář v kódu to hlídá);
+testy v `tests/test_developer_gui.py` přejmenovány. 11 testů zelených.
+
+## 2026-09-18 — červený rámeček se ukládá jako pokyn k ořezu
+
+375 testů zelených. GUI-only + metadata cesta; žádná změna kamery.
+
+**`CaptureRecord.crop_rect`** — nový volitelný field `(x0, y0, x1, y1)` v **px
+plného rámce** (grid TIFF souboru, nikdy ne 3×3 binovaný proud). Při snímání
+(`_capture(scan=True)`) se červený měřicí rámeček transformuje existujícím
+`_ae_rect_in_sensor_px()` — přesně stejná konverze, jakou používá audit i film
+base (overview: škála ×3; ROI: posun o origin) — a přes `capture_scan(crop_rect=…)`
+přijde do sidecaru i katalogu (blob se round-tripuje celý). Developer GUI pak
+ořízne podle `crop_rect`; `null` = bez ořezu, frame stojí jak pořízen.
+Old sidecars bez klíče zůstávají čitelné (default None, `SCHEMA_VERSION`
+nezvýšen — jen přidán nepovinný klíč). Napověď pod ovladačem i stavový řádek
+po tažení říkají, že se rámeček ukládá jako ořez.
+
+## 2026-09-18 (noc) — úklid UI + atributy orientace filmu
+
+315 testů zelených (`.venv/bin/python -m pytest tests/ -q`). Pět bodů přímého
+povelu; žádné změny kamery (hardwarově neověřováno — UI/model-only zásah).
+
+### 1) Tlačítko „Gain 1.00× (archiv)" pryč
+
+Manuální režim: gain se vrací na 1.00× ručně v gain spinu. **Archivní pravidlo
+zůstává** — `_capture_block_reason` čte gain přímo z kamery a Capture při
+gain ≠ 1,00× pořád odmítne (zmizil jen odkaz na tlačítko v hlášce, ta teď
+říká „ vrať gain na 1.00× a exponuj jen časem").
+
+### 2) Tlačítko „Auto Exposure" pryč
+
+`_auto_exposure` / `_on_auto_exposure_done` / `_meter_source` z okna fuč.
+**Motor `capture/autoexposure.py` zůstává** i s testy (uživatel: „nech ať se
+rozbi") — `LiveMeter` a `fresh_live_frame` z něj používá Live View i měření
+film base z proudu. Červený měřicí rámeček zůstává a dál omezuje histogram +
+post-capture audit; přejmenován z „AE výřez" na „měřicí výřez / rámeček",
+aby texty neodkazovaly na mrté tlačítko.
+
+### 3) Přepínač náhledu: ze tří boxů dva
+
+Byl problém: klik na **Negativ** odškrnul RAW View (správně) ale **zaškrnul
+i Positive** — dva režimy naráz. Positive navíc nastavil `invert=False` a
+přesto šel do stejné Working Positive větve, takže kreslil jinak než Negativ.
+**Positive odstraněn úplně** (na žádost): zbyly dva stavové boxy
+`RAW View` | `Negativ`, vzájemně výlučné, vždy právě jeden zaškrtnutý
+(`_set_mode` synchronizuje oba přes `blockSignals`).
+
+### 4) kratší časy
+
+`SHUTTER_PRESETS` pokračují pod 1/10: `1/200, 1/100, 1/50, 1/25` před `0.1`.
+Senzor zvládá od 300 µs. Volný vstup (`1/125`) fungoval i dřív.
+
+### 5) Nový film: atributy orientace
+
+Do `FilmMetadata` (a dialogu, skupina Digitalizační sestava) tři volně
+kombinovatelné přepínače: **zrcadlit vodorovně / zrcadlit svisle / rotace
+180°**. Zaznamenávají se, nepoužívají (postprodukce). **H+V JE rotace 180** —
+proto všechny tři najednou model i dialog zakazují (vyrušily by se v
+identitu); dva najednou zůstávají platné. Jsou to **nová jména polí**, ne
+obnovení starého `mirrored` — to se pořád maže při načtení
+(`RETIRED_FILM_FIELDS`), staré archivy zůstávají čitelné, `SCHEMA_VERSION`
+se nemění. Orientace se nedědí z předchozího filmu přes rig (patří k
+proužku, ne k sestavě).
+
+## 2026-09-18 (večer) — hardwarové ověření obou „ne-testnuto" commitů
+
+`76647ed` (manuální expozice) a `b43b55c` (histogram black + film base)
+odtestovány na připojeném ATR2600M. Sondu drží `scripts/manual_filmbase_probe.py`
+(15/15 PASS, 308 testů zelených).
+
+### 1) Kamera **neoznačuje snímky expozicí** — fallback na settings je jediná cesta
+
+`info.v3.expotime` je na reálné kameře **vždy 0**, ať live rámec nebo still.
+Dvojice předchozích „ověřit na těle" se tak zavřela překvapivě: stamp proudu,
+na který spoléhaly `fresh_live_frame` i měření film base z proudu, kamera
+nedodává nikdy. Obě cesty padají na požadované `settings` — což je chování,
+na které jsou napsané a na hardwaru fyzikálně sedí (signál roste 3,86× se
+4× časem; expozice stillu u 60 s trvala 60 s). FakeHcam byl **spořádanější
+než hardware**: stamp dodával. Nyní ve výchozím stavu napodobuje realitu
+(expotime=0 → `LiveFrame.expotime_us=None`); stampování je opt-in pro test,
+který forwardování drží pod krytím (`test_frame_carries_reported_expotime`,
+nový `test_real_camera_stamp_is_none`).
+
+### 2) CURVE na mono kameře neexistuje — poznámka „odmítnuto" mizí z každého snímku
+
+ATR2600M odpovídá na `put_Option(CURVE)` E_INVALIDARG (0x80070057): mono tělo
+nemá tónovou křivku, které by se dalo vypnout. RAW/BITDEPTH/LINEAR kontrakt
+zůstává, CURVE přesunuto do `CURVE_OPTION` a ptá se jen u barevných těl.
+Ověřeno na kameře: capture notes jsou nyní **prázdné** — dřív se „vestavěný
+křivkový tone-mapping: odmítnuto" lepila na každý still i connect.
+
+### 3) Odškrtáno na hardwaru (bez změny kódu)
+
+- **Strop expozice:** firmware žádný pod 200 s nemá — `set_shutter(200)` se
+  vrací 200 s a still při 60 s expozici dorazil po 61 s (ne po readoutu),
+  tzn. expozice se skutečně/exponují celá. Prvotní „>50 s oříznuté" z prvního
+  dne byla tehdejší hardwarová AE, ne strop; readback disciplína platí dál.
+- **Kamera si expozici napříč spojeními nepamatuje:** po `set_gain(2.5)` +
+  3 s a novém connectu vrátí kamera **0,1× / 10 ms**. GUI tomu čelí správně —
+  `_refresh_settings` po connectu čte skutečný stav (tlačítko archivu se
+  odškrtne) a Capture při gain ≠ 1,00× odmítne.
+- **Stop při 8 s expozici:** `next_live_frame` se vrátil do 0,5 s — krácení
+  pollu z `76647ed` na hardwaru sedí.
+- **Obnova binningu po capture** se zastaveným proudem: další Live View je
+  2074×1388, ne 26 Mpx — původní zmrazující bug doopravdy zavřen.
+- **ROI proud:** 1200×1200 na [1000, 800] dorazil přesně 1:1 — geometrie pro
+  převody AE/min-point rámečků platí i v ROI režimu.
+- **`capture_base` end-to-end:** still → TIFF → sidecar se skutečným
+  časem/gainem/teplotou → `film_base.json`; `region_mean` na archivu sedí se
+  vzorkem do 0,1 DN a měření je v rozsahu (3712 DN @ 0,5 ms, bez filmu).
+- **Kadence proudu:** readout floor ~0,29 s (3,4 fps); nad ním kadence
+  sleduje shutter (0,40 s @ 0,4 s).
+
 ## 2026-09-18 — podexpozice modře + film base / min point (třetí kalibrace)
 
 (307 testů zelených.)

@@ -108,7 +108,13 @@ RAW_OPTIONS: tuple[tuple[str, int, str], ...] = (
     ("RAW", 1, "RAW mód (bez ISP)"),
     ("BITDEPTH", 1, "16bitová hloubka"),
     ("LINEAR", 0, "vestavěný lineární tone-mapping vypnutý"),
-    ("CURVE", 0, "vestavěný křivkový tone-mapping vypnutý"),
+)
+
+#: Tone-curve kill for colour bodies only: the mono ATR2600M refuses CURVE
+#: with E_INVALIDARG (hardware-measured 2026-09-18) — asking it there was a
+#: refused-write note on *every* capture.
+CURVE_OPTION: tuple[str, int, str] = (
+    "CURVE", 0, "vestavěný křivkový tone-mapping vypnutý",
 )
 
 #: Options that exist only on a colour camera. The mono ATR2600M has no
@@ -135,12 +141,14 @@ def options_for_flags(flags: int) -> tuple[tuple[str, int, str], ...]:
     """The raw contract for a camera with these EnumV2 capability flags.
 
     A mono camera (the IMX571 in the ATR2600M) is asked for Grey16 and
-    nothing colour-related; a colour camera keeps the colour-pipeline kills
-    and is left with the SDK's default RGB format.
+    nothing colour-related — not even the tone CURVE, which a mono body
+    refuses outright (hardware-measured); a colour camera keeps the
+    colour-pipeline kills, the curve included, and is left with the SDK's
+    default RGB format.
     """
     if flags & sdk.TOUPCAM_FLAG_MONO:
         return RAW_OPTIONS + MONO_ONLY_OPTIONS
-    return RAW_OPTIONS + COLOR_ONLY_OPTIONS
+    return RAW_OPTIONS + (CURVE_OPTION,) + COLOR_ONLY_OPTIONS
 
 
 def apply_raw_contract(hcam, options: tuple[tuple[str, int, str], ...]
