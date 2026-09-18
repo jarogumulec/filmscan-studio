@@ -16,7 +16,6 @@ def _run_capture(args: argparse.Namespace) -> int:
     from PySide6.QtWidgets import QApplication
 
     from filmscan_studio.capture.mock import MockCamera
-    from filmscan_studio.capture.touptek import TouptekCamera
     from filmscan_studio.gui.capture_window import CaptureWindow
 
     app = QApplication(sys.argv)
@@ -25,7 +24,9 @@ def _run_capture(args: argparse.Namespace) -> int:
         camera.connect()
     else:
         # Not opened yet: the connect dialog enumerates and opens on demand.
-        camera = TouptekCamera()
+        # Passing an unopened TouptekCamera here would trip CaptureWindow's
+        # "already connected" path, which reads camera.info.
+        camera = None
     window = CaptureWindow(camera=camera)
     window.show()
     return app.exec()

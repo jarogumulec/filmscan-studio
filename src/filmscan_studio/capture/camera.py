@@ -76,6 +76,12 @@ class LiveFrame:
     height: int
     black_level: float = 0.0
     white_level: float = 65535.0
+    #: Exposure the frame was *actually shot with*, µs, as reported in the
+    #: frame's own SDK info record — None when the backend does not report it.
+    #: A frame pulled right after ``set_shutter`` was still exposed with the
+    #: old shutter (it was in flight over USB when the setting landed); AE
+    #: must not meter those, or every reading lags one frame behind.
+    expotime_us: int | None = None
 
 
 @dataclass

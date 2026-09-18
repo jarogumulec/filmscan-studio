@@ -74,6 +74,7 @@ from PySide6.QtWidgets import (
 from filmscan_studio.capture.autoexposure import (
     AutoExposureController,
     LiveMeter,
+    fresh_live_frame,
 )
 from filmscan_studio.capture.camera import CameraBackend, CameraError, CameraInfo
 from filmscan_studio.capture.mock import MockCamera
@@ -858,9 +859,9 @@ class CaptureWindow(QMainWindow):
         rect = self._ae_rect
 
         def read():
-            frame = self.camera.next_live_frame()
-            if frame is None:
-                raise RuntimeError("Live View neběží – nelze měřit")
+            # Same freshness rule as the controller: never meter a frame the
+            # old shutter exposed — the AE rect must aim where the meter says.
+            frame = fresh_live_frame(self.camera)
             data = LiveMeter.decode_live_frame(frame)
             if rect is not None:
                 x0, y0, x1, y1 = rect
@@ -1175,8 +1176,18 @@ class CaptureWindow(QMainWindow):
             "Auto Exposure: řeším z lineárního proudu…"
             + (", AE výřez" if self._ae_rect is not None else "")
         )
+
+        # The controller offers per-step feedback; using it is the difference
+        # between "řeším…" and a visibly working loop. At long shutters one
+        # step legitimately takes seconds — silence looked like a hang.
+        def report_step(settings: ExposureSettings) -> None:
+            text = (f"Auto Exposure: zkouším {settings.shutter_string()} "
+                    f"({settings.sensitivity_string()})…")
+            self._relay.send(lambda _u: self.statusBar().showMessage(text),
+                             None)
+
         self._start_worker(controller.run, self._on_auto_exposure_done,
-                           self._meter_source())
+                           self._meter_source(), report_step)
 
     def _on_auto_exposure_done(self, result) -> None:
         self._set_actions_busy(False)
@@ -1279,6 +1290,8 @@ class CaptureWindow(QMainWindow):
         )
 
     def _on_worker_failed(self, message: str) -> None:
+        # A failed AE/capture run must hand the buttons back and restart the
+        # poller: the status bar alone leaves the window looking wedged.
         self._set_actions_busy(False)
         self._resume_live_view()
         self.statusBar().showMessage(f"Chyba: {message}")

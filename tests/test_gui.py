@@ -9,6 +9,8 @@ the UI thread.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pytest
 
@@ -415,6 +417,10 @@ class TestAeRectMetering:
                 return LiveFrame(data=data, width=200, height=200,
                                  black_level=0.0, white_level=65535.0)
 
+            def get_settings(self):   # freshness helper reads the shutter
+                from filmscan_studio.core.exposure import ExposureSettings
+                return ExposureSettings(1.0, iso=None, gain=1.0)
+
             def disconnect(self):  # window teardown calls it
                 pass
 
@@ -530,7 +536,9 @@ class TestCoolingPanel:
         w = CaptureWindow(camera=cam)
         qtbot.addWidget(w)
         w._poll_temperature()
-        assert "mimo cíl o 25.0" in w.cool_note.text()
+        # The mock's temperature drifts with wall-clock time, so by the poll
+        # the gap is 25.0 or a hair less — match the magnitude, not the digit.
+        assert re.search(r"mimo cíl o 2[45]\.\d °C", w.cool_note.text())
 
     def test_target_spin_reaches_the_camera(self, window):
         window.target_spin.setValue(-12.0)

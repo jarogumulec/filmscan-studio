@@ -12,6 +12,8 @@ matching test must fail, not silently pass.
 from __future__ import annotations
 
 
+import queue
+
 import numpy as np
 import pytest
 
@@ -19,13 +21,16 @@ from filmscan_studio.capture import touptek
 from filmscan_studio.capture._toupcam import toupcam as sdk
 from filmscan_studio.capture.camera import CameraError, NotConnectedError
 from filmscan_studio.capture.touptek import (
+    COLOR_ONLY_OPTIONS,
     EXPO_TIME_RANGE_US,
+    MONO_ONLY_OPTIONS,
     RAW_OPTIONS,
     TouptekCamera,
-    audit_options,
-    configure_raw_stream,
+    apply_raw_contract,
+    disable_camera_autoexposure,
     even_roi,
     gain_to_permille,
+    options_for_flags,
     parse_gain_range,
     sensor_from_device,
     shutter_to_us,
@@ -50,7 +55,8 @@ class FakeHcam:
 
     def __init__(self, *, options: dict[int, int] | None = None,
                  size: tuple[int, int] = (6224, 4168),
-                 gain_range=(1000, 8000, 1000), refuse_options=()) -> None:
+                 gain_range=(1000, 8000, 1000), refuse_options=(),
+                 autoexpo: int = 0) -> None:
         # size is what get_Size answers — hardware: always the sensor
         # resolution, binning/ROI notwithstanding. Delivered frames come
         # from delivered_size().
@@ -62,6 +68,11 @@ class FakeHcam:
         self._expo_us = 1_000_000
         self._gain_permille = 1000
         self._temperature = -52      # -5.2 °C in 0.1 units
+        self._autoexpo = autoexpo    # camera-side AE state, persists in flash
+        # A mono camera has no colour pipeline: reads of colour options fail
+        # the way they fail on the real ATR2600M.
+        self.unreadable_options = {getattr(sdk, f"TOUPCAM_OPTION_{name}")
+                                   for name, _, _ in COLOR_ONLY_OPTIONS}
         self.stream_running = False
         self.roi: tuple[int, int, int, int] | None = None
         self.pulls: list[tuple] = []
@@ -76,9 +87,17 @@ class FakeHcam:
         self._check_not_running(opt)
 
     def get_Option(self, opt: int) -> int:
-        if opt not in self.options:
+        if opt in self.unreadable_options or opt not in self.options:
             raise sdk.HRESULTException(0x8000FFFF)
         return self.options[opt]
+
+    # -- camera-side auto exposure ------------------------------------------
+    def put_AutoExpoEnable(self, mode: int) -> None:
+        self.calls.append(("put_AutoExpoEnable", mode))
+        self._autoexpo = mode
+
+    def get_AutoExpoEnable(self) -> int:
+        return self._autoexpo
 
     # -- exposure -----------------------------------------------------------
     def put_ExpoTime(self, us: int) -> None:
@@ -137,6 +156,10 @@ class FakeHcam:
         np.frombuffer(buf, dtype=np.uint16, count=w * h).reshape(h, w)[:] = 4242
         if info is not None:
             info.v3.width, info.v3.height = w, h
+            # The real SDK stamps each frame with the shutter it was actually
+            # exposed with; the backend forwards it as LiveFrame.expotime_us
+            # so AE can refuse frames the *old* shutter exposed.
+            info.v3.expotime = self._expo_us
 
     def PullStillImageV2(self, buf, bits, info) -> None:
         w, h = self._size
@@ -192,7 +215,8 @@ class FakeDevice:
             self.name, self.res = name, res
             self.still, self.preview, self.flag = still, preview, flag
 
-    def __init__(self, dev_id="usb:1", name=b"ATR2600M", flag=sdk.TOUPCAM_FLAG_TEC):
+    def __init__(self, dev_id="usb:1", name=b"ATR2600M",
+                 flag=sdk.TOUPCAM_FLAG_TEC | sdk.TOUPCAM_FLAG_MONO):
         self.id = dev_id
         self.displayname = name
         self.model = FakeDevice._Model(
@@ -226,9 +250,42 @@ def camera(fake):
 class TestConnect:
     def test_raw_options_all_written_and_verified(self, fake, camera) -> None:
         written = {c[1]: c[2] for c in fake.calls if c[0] == "put_Option"}
-        for name, wanted, _label in RAW_OPTIONS:
+        for name, wanted, _label in RAW_OPTIONS + MONO_ONLY_OPTIONS:
             assert written[_const(name)] == wanted, name
-        assert audit_options(fake) == []
+
+    def test_mono_camera_never_asked_for_colour_options(self, fake) -> None:
+        """Hardware-measured: the mono ATR2600M refuses CURVE (E_INVALIDARG)
+        and has no colour pipeline at all — writing that wall of options was
+        the source of the connect-time warning spam."""
+        written = {c[1] for c in fake.calls if c[0] == "put_Option"}
+        for name, _wanted, _label in COLOR_ONLY_OPTIONS:
+            assert _const(name) not in written
+
+    def test_options_for_flags_splits_mono_from_colour(self) -> None:
+        mono = options_for_flags(sdk.TOUPCAM_FLAG_MONO)
+        assert ("RGB", 4, "16bit Grey (mono)") in mono
+        assert not any(name.startswith(("COLORMATIX", "WBGAIN", "DEMOSAIC"))
+                       for name, _, _ in mono)
+        colour = options_for_flags(0)
+        assert not any(name == "RGB" for name, _, _ in colour)
+        assert any(name == "COLORMATIX" for name, _, _ in colour)
+
+    def test_camera_autoexposure_is_killed_at_connect(self, fake, camera) -> None:
+        """A camera left in hardware AE by any other program overwrites every
+        put_ExpoTime — the manual shutter then visibly does nothing."""
+        assert ("put_AutoExpoEnable", 0) in fake.calls
+        assert fake._autoexpo == 0
+
+    def test_persisted_camera_autoexposure_is_reported(self, monkeypatch) -> None:
+        hcam = FakeHcam(autoexpo=1)
+        # The fake honours the write; make it *stubborn* instead: put says 0,
+        # get still answers 1 — a camera that must be named, not quietly fought.
+        hcam.put_AutoExpoEnable = lambda mode: None
+        monkeypatch.setattr(sdk.Toupcam, "EnumV2",
+                            staticmethod(lambda: [FakeDevice()]))
+        monkeypatch.setattr(sdk.Toupcam, "Open", staticmethod(lambda _id: hcam))
+        notes = disable_camera_autoexposure(hcam)
+        assert notes and "kamera měnit sama" in notes[0]
 
     def test_refused_option_reported_not_fatal(self, monkeypatch) -> None:
         hcam = FakeHcam(refuse_options={_const("LINEAR")})
@@ -350,14 +407,40 @@ class TestStreamModes:
         camera.start_live_view()
         fake.fire_frame()
         fake.fire_frame()
-        _data, size = camera._frames.get_nowait()   # queue maxsize=1
+        _data, size, _expo = camera._frames.get_nowait()   # queue maxsize=1
         assert size == fake.delivered_size()
+
+    def test_frame_carries_reported_expotime(self, fake, camera) -> None:
+        camera.set_shutter(2.5)
+        camera.start_live_view()
+        fake.fire_frame()
+        frame = camera.next_live_frame()
+        assert frame.expotime_us == 2_500_000
 
     def test_silent_stream_times_out_as_camera_error(self, camera, monkeypatch) -> None:
         monkeypatch.setattr(touptek, "FRAME_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(touptek, "FRAME_TIMEOUT_SLACK_S", 0.01)
         camera.start_live_view()
         with pytest.raises(CameraError, match="přestal"):
             camera.next_live_frame()
+
+    def test_long_exposure_widens_the_frame_timeout(self, camera, monkeypatch) -> None:
+        # A 10 s shutter means the stream is legitimately silent for 10 s;
+        # the poll must wait it out, not declare the stream dead (which is
+        # how a 3× AE killed Live View on hardware).
+        waits: list[float] = []
+
+        def spy_get(timeout=None):
+            waits.append(timeout)
+            raise queue.Empty
+
+        monkeypatch.setattr(camera._frames, "get", spy_get)
+        monkeypatch.setattr(touptek, "FRAME_TIMEOUT_S", 5.0)
+        camera.set_shutter(10.0)
+        camera._live_view = True
+        with pytest.raises(CameraError, match="přestal"):
+            camera.next_live_frame()
+        assert waits[0] == pytest.approx(12.0)   # shutter + slack
 
     def test_non_image_events_ignored(self, fake, camera) -> None:
         camera.start_live_view()
@@ -488,9 +571,18 @@ class TestHelpers:
         with pytest.raises(NotConnectedError):
             cam.get_settings()
 
-    def test_configure_raw_stream_survives_refusals(self) -> None:
+    def test_apply_raw_contract_survives_refusals(self) -> None:
         hcam = FakeHcam(refuse_options={_const("RGB")})
-        notes = configure_raw_stream(hcam)
-        assert any("RGB" in n or "Grey" in n for n in notes)
-        problems = audit_options(hcam)
-        assert any("nejde ověřit" in p or "hlásí" in p for p in problems)
+        notes = apply_raw_contract(hcam, RAW_OPTIONS + MONO_ONLY_OPTIONS)
+        assert any("Grey" in n and "odmítnuto" in n for n in notes)
+        # The refused option is not re-audited into a second, duplicate note.
+        assert sum("Grey" in n for n in notes) == 1
+
+    def test_apply_raw_contract_names_a_lying_camera(self) -> None:
+        class LyingHcam(FakeHcam):
+            def get_Option(self, opt: int) -> int:
+                value = super().get_Option(opt)
+                return value + 1 if opt == _const("CURVE") else value
+
+        notes = apply_raw_contract(LyingHcam(), RAW_OPTIONS)
+        assert any("křivkový" in n and "hlásí" in n for n in notes)

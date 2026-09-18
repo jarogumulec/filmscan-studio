@@ -9,9 +9,17 @@ What this module adds on top of the raw SDK:
 
 * **Raw honesty.** Every option that could put a tone curve between the
   sensor and the file is switched off at connect (RAW mode, builtin linear
-  and curve tone mapping off) and *verified* — :func:`audit_options` returns
-  what the camera actually accepted, because option writes are advisory on
-  some models. The IMX571 is mono, so ``RGB=4`` selects 16-bit Grey.
+  and curve tone mapping off) and *verified* — :func:`apply_raw_contract`
+  reports what the camera actually accepted, because option writes are
+  advisory on some models. The contract is built from the camera's reported
+  flags: the mono IMX571 gets ``RGB=4`` (16-bit Grey) and no colour-pipeline
+  options at all — they do not exist on a mono camera and writing them was
+  a wall of spurious warnings.
+* **Manual exposure, enforced.** The SDK's camera-side auto exposure is
+  switched off at connect and *verified*: it survives in camera flash between
+  applications, and a camera still running AE silently overwrites every
+  ``put_ExpoTime`` — the operator turns the shutter dial and the histogram
+  does not move.
 * **Stream modes** (see :mod:`filmscan_studio.core.zoom`): overview is
   3x3 *average* binning (``0x83`` — depth-preserving, so the stream stays
   linear and meters honestly); zoom is no-binning plus a hardware ROI. The
@@ -78,21 +86,33 @@ EXPO_TIME_RANGE_US = (300, 1_800_000_000)
 GAIN_UNIT = 1000.0
 #: How long the live-view poll tolerates a silent stream before erroring.
 FRAME_TIMEOUT_S = 5.0
+#: Grace on top of the current exposure: a frame cannot arrive faster than
+#: the shutter lets it, so the effective timeout is shutter + this slack.
+FRAME_TIMEOUT_SLACK_S = 2.0
 #: Still-event wait on top of the exposure itself (ATR2600M: 1 s still
 #: arrived ~0.9 s after Snap — readout + USB download).
 STILL_WAIT_HEADROOM_S = 15.0
 
-#: Option writes the raw contract consists of, as (option, wanted, label).
-#: Verified after connect (and before every capture) by :func:`audit_options`;
-#: a mismatch is a warning in ``CaptureResult.notes``, never a hard failure —
-#: the operator still gets frames, and the quality check sees the damage if
-#: the camera lied.
+#: The raw contract, as (option, wanted, label). Verified write-after-write
+#: by :func:`apply_raw_contract`; a mismatch is a warning in
+#: ``CaptureResult.notes``, never a hard failure — the operator still gets
+#: frames, and the quality check sees the damage if the camera lied.
 RAW_OPTIONS: tuple[tuple[str, int, str], ...] = (
     ("RAW", 1, "RAW mód (bez ISP)"),
     ("BITDEPTH", 1, "16bitová hloubka"),
-    ("RGB", 4, "16bit Grey (mono)"),
     ("LINEAR", 0, "vestavěný lineární tone-mapping vypnutý"),
     ("CURVE", 0, "vestavěný křivkový tone-mapping vypnutý"),
+)
+
+#: Options that exist only on a colour camera. The mono ATR2600M has no
+#: colour pipeline at all: ``RGB=4`` selects its 16-bit Grey output, and the
+#: colour-matrix / WB / demosaic options are not implemented there (hardware
+#: measured: refused or unreadable — writing them was the source of the
+#: connect-time E_INVALIDARG and the "nejde ověřit" warning wall).
+MONO_ONLY_OPTIONS: tuple[tuple[str, int, str], ...] = (
+    ("RGB", 4, "16bit Grey (mono)"),
+)
+COLOR_ONLY_OPTIONS: tuple[tuple[str, int, str], ...] = (
     ("COLORMATIX", 0, "barevná matice vypnutá"),
     ("WBGAIN", 0, "white-balance gain vypnutý"),
     ("DEMOSAIC_VIDEO", 0, "žádný demosaic proudu"),
@@ -104,29 +124,70 @@ def _option_const(name: str) -> int:
     return getattr(sdk, f"TOUPCAM_OPTION_{name}")
 
 
-def configure_raw_stream(hcam) -> list[str]:
-    """Apply :data:`RAW_OPTIONS` to an open handle; returns notes on writes."""
+def options_for_flags(flags: int) -> tuple[tuple[str, int, str], ...]:
+    """The raw contract for a camera with these EnumV2 capability flags.
+
+    A mono camera (the IMX571 in the ATR2600M) is asked for Grey16 and
+    nothing colour-related; a colour camera keeps the colour-pipeline kills
+    and is left with the SDK's default RGB format.
+    """
+    if flags & sdk.TOUPCAM_FLAG_MONO:
+        return RAW_OPTIONS + MONO_ONLY_OPTIONS
+    return RAW_OPTIONS + COLOR_ONLY_OPTIONS
+
+
+def apply_raw_contract(hcam, options: tuple[tuple[str, int, str], ...]
+                       ) -> list[str]:
+    """Write each option, then read it straight back; returns notes, [] = pure.
+
+    One pass per option, deliberately: an option whose write the camera
+    refused is not implemented on this model, and reading it back would only
+    add a second, duplicate complaint about the same absence.
+    """
     notes: list[str] = []
-    for name, value, label in RAW_OPTIONS:
+    for name, wanted, label in options:
+        const = _option_const(name)
         try:
-            hcam.put_Option(_option_const(name), value)
+            hcam.put_Option(const, wanted)
         except sdk.HRESULTException as exc:
             notes.append(f"{label}: odmítnuto (hr=0x{exc.hr & 0xffffffff:x})")
+            continue
+        try:
+            got = hcam.get_Option(const)
+        except sdk.HRESULTException:
+            notes.append(f"{label}: nejde ověřit")
+            continue
+        if got != wanted:
+            notes.append(f"{label}: kamera hlásí {got}, žádáno {wanted}")
     return notes
 
 
-def audit_options(hcam) -> list[str]:
-    """Read back the raw contract; returns human-readable problems, [] = pure."""
-    problems: list[str] = []
-    for name, wanted, label in RAW_OPTIONS:
-        try:
-            got = hcam.get_Option(_option_const(name))
-        except sdk.HRESULTException:
-            problems.append(f"{label}: nejde ověřit")
-            continue
-        if got != wanted:
-            problems.append(f"{label}: kamera hlásí {got}, žádáno {wanted}")
-    return problems
+def disable_camera_autoexposure(hcam) -> list[str]:
+    """Force the SDK's camera-side auto exposure off; returns notes, [] = off.
+
+    The setting persists in the camera's firmware between applications, so a
+    camera left in AE by any other program (ToupView, TWAIN, a factory test)
+    silently rewrites every ``put_ExpoTime`` the moment the stream runs: the
+    operator turns the shutter dial and the histogram does not move, and the
+    app's own closed-loop AE measures frames whose ``expotime`` stamp never
+    matches the requested shutter — which is how AE appears to hang. Writing
+    0 is not enough; the read-back is the contract, because a camera that
+    ignored the write must be *named*, not quietly fought every frame.
+    """
+    notes: list[str] = []
+    try:
+        hcam.put_AutoExpoEnable(0)
+    except sdk.HRESULTException as exc:
+        notes.append(f"hardwarová autoexpozice odmítla vypnutí (hr="
+                     f"0x{exc.hr & 0xffffffff:x}) — čas může kamera měnit sama")
+        return notes
+    try:
+        if hcam.get_AutoExpoEnable() != 0:
+            notes.append("hardwarová autoexpozice hlásí zapnuto i po vypnutí "
+                         "— čas může kamera měnit sama")
+    except sdk.HRESULTException:
+        notes.append("hardwarová autoexpozice: vypnuta, ale nejde ověřit")
+    return notes
 
 
 def _decode_name(raw: object) -> str:
@@ -217,6 +278,8 @@ class TouptekCamera(CameraBackend):
         self._info: CameraInfo | None = None
         self._sensor = DEFAULT_SENSOR
         self._settings = ExposureSettings(1.0, iso=None, gain=ARCHIVE_GAIN)
+        #: Raw contract for this camera's flags; rebuilt at connect.
+        self._raw_options = options_for_flags(sdk.TOUPCAM_FLAG_MONO)
         self._live_view = False
         self._cooling = False
         self._frames: queue.Queue = queue.Queue(maxsize=1)
@@ -260,8 +323,14 @@ class TouptekCamera(CameraBackend):
             dev = next((d for d in devices if d.id == self._cam_id),
                        devices[0] if (devices and self._cam_id is None) else None)
             sensor = sensor_from_device(dev) if dev is not None else DEFAULT_SENSOR
-            notes = configure_raw_stream(hcam)
-            problems = audit_options(hcam)
+            # No enumeration record (Open by id with a stale list): assume
+            # mono — that is every camera this app has ever driven, and the
+            # wrong guess here is a wall of refused-colour-option warnings.
+            flags = (int(getattr(dev.model, "flag", 0)) if dev is not None
+                     else sdk.TOUPCAM_FLAG_MONO)
+            self._raw_options = options_for_flags(flags)
+            notes = disable_camera_autoexposure(hcam)
+            notes += apply_raw_contract(hcam, self._raw_options)
             gain_range = parse_gain_range(hcam.get_ExpoAGainRange())
             try:
                 hcam.get_Option(_option_const("TECTARGET"))
@@ -290,7 +359,7 @@ class TouptekCamera(CameraBackend):
             sensor_width=sensor.width,
             sensor_height=sensor.height,
         )
-        for note in notes + problems:
+        for note in notes:
             log.warning("Touptek: %s", note)
         return self._info
 
@@ -433,7 +502,7 @@ class TouptekCamera(CameraBackend):
         # buffer for the next frame while the UI reads this one.
         data = (np.frombuffer(buf, dtype=np.uint16, count=width * height)
                 .reshape(height, width).copy())
-        frame = (data, (width, height))
+        frame = (data, (width, height), int(info.v3.expotime) or None)
         try:
             self._frames.put_nowait(frame)
         except queue.Full:
@@ -447,12 +516,19 @@ class TouptekCamera(CameraBackend):
         if not self._live_view:
             return None
         self._require()
+        # The frame cadence is the exposure: at a 10 s shutter the stream
+        # legitimately goes silent for 10 s. A fixed 5 s timeout would call
+        # that a dead stream — and after AE clamped the shutter long, the
+        # resurrected poller would die on every frame for the rest of the
+        # session.
+        budget = max(FRAME_TIMEOUT_S, self._settings.shutter + FRAME_TIMEOUT_SLACK_S)
         try:
-            data, (width, height) = self._frames.get(timeout=FRAME_TIMEOUT_S)
+            data, (width, height), expotime_us = self._frames.get(timeout=budget)
         except queue.Empty:
             raise CameraError("proud kamery přestal dodávat snímky")
         return LiveFrame(data=data, width=width, height=height,
-                         black_level=0.0, white_level=WHITE_LEVEL_16BIT)
+                         black_level=0.0, white_level=WHITE_LEVEL_16BIT,
+                         expotime_us=expotime_us)
 
     def _drain_frames(self) -> None:
         while True:
@@ -487,8 +563,7 @@ class TouptekCamera(CameraBackend):
             self._live_view = False
             self._drain_frames()
         try:
-            notes += configure_raw_stream(self._hcam)
-            notes += audit_options(self._hcam)
+            notes += apply_raw_contract(self._hcam, self._raw_options)
             self._binning, self._roi = NO_BINNING, None
             self._configure_stream()
             self._hcam.put_Size(self._sensor.width, self._sensor.height)

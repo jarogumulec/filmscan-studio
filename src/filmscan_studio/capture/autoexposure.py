@@ -136,6 +136,34 @@ def _snap(value: float, ladder: list[float]) -> float:
     return min(ladder, key=lambda rung: abs(math.log2(rung / value)))
 
 
+def fresh_live_frame(camera: CameraBackend, max_frames: int = 3):
+    """The next Live View frame that was exposed with the *current* shutter.
+
+    A frame pulled straight after ``set_shutter`` was in flight over USB when
+    the setting landed — it carries the old exposure (at 3,4 fps overview one
+    is ~300 ms old; at long shutters far more). Metering it makes every AE
+    reading lag its setting by a frame: the residual oscillates, the
+    getting-worse guard breaks the loop and the operator is told it did not
+    converge. The SDK stamps each frame's own info record with its true
+    ``expotime`` — swap frames until one matches what the camera is set to.
+    Backends that report no expotime (None) deliver as before.
+    """
+    want_s = camera.get_settings().shutter
+    frame = None
+    for _ in range(max_frames):
+        frame = camera.next_live_frame()
+        if frame is None:
+            raise RuntimeError("Live View neběží – nelze měřit")
+        reported = getattr(frame, "expotime_us", None)
+        if reported is None:
+            return frame
+        if abs(reported / 1e6 - want_s) <= max(1e-5, 0.02 * want_s):
+            return frame
+    # The camera never agreed within max_frames — meter the last one rather
+    # than fail the whole measurement over a stamp nobody can satisfy.
+    return frame
+
+
 @dataclass
 class AutoExposureController:
     """Closed-loop exposure from the Live View stream's own linear data.
@@ -158,10 +186,7 @@ class AutoExposureController:
     gain_lock: bool = False
 
     def next_live_reading(self) -> MeterReading:
-        frame = self.camera.next_live_frame()
-        if frame is None:
-            raise RuntimeError("Live View neběží - nelze měřit")
-        return self.meter.meter_frame(frame)
+        return self.meter.meter_frame(fresh_live_frame(self.camera))
 
     # ---------------------------------------------------------------- entry
 
@@ -264,7 +289,7 @@ class AutoExposureController:
                 note = (f"AE neskonvergovalo — zůstává {abs(residuals[-1]):.1f} EV "
                         f"({settings.shutter_string()}); zkus Auto Exposure znovu")
         final_reading = reading or self.meter.meter_frame(
-            self.camera.next_live_frame()
+            fresh_live_frame(self.camera)
         )
         return self._result(
             settings, requested or 0.0, start, final_reading, len(residuals),

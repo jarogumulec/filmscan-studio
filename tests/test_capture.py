@@ -508,6 +508,46 @@ class TestAutoExposure:
         controller.run(read=lambda: self._reading(0.01))
         assert camera.gain_history == []
 
+    def test_meters_only_frames_exposed_with_the_current_shutter(self) -> None:
+        """The hardware-caused non-convergence: a frame pulled right after
+        set_shutter was still exposed with the *old* shutter (it was in
+        flight over USB). The controller must swap past it via the frame's
+        own expotime stamp, or every reading lags one setting behind and the
+        loop oscillates instead of converging."""
+        from filmscan_studio.capture.autoexposure import fresh_live_frame
+        from filmscan_studio.capture.camera import LiveFrame
+
+        class StampingCamera(MockCamera):
+            """Mock that stamps each frame with the shutter at *shot* time
+            and delays a frame's exposure update by one frame, like USB."""
+
+            def next_live_frame(self):
+                frame = super().next_live_frame()
+                if frame is not None:
+                    frame = LiveFrame(
+                        data=frame.data, width=frame.width, height=frame.height,
+                        black_level=frame.black_level,
+                        white_level=frame.white_level,
+                        expotime_us=int(self._shot_shutter * 1e6))
+                    self._shot_shutter = self.get_settings().shutter
+                return frame
+
+        cam = StampingCamera(settings=ExposureSettings(1.0, iso=None, gain=1.0))
+        cam._shot_shutter = 1.0          # frames so far shot at 1 s
+        cam.connect()
+        cam.start_live_view()
+        cam.set_shutter(4.0)             # in-flight frames still carry 1 s
+        frame = fresh_live_frame(cam)
+        assert frame.expotime_us == 4_000_000
+
+    def test_fresh_frame_helper_passes_through_unstamped_backends(self) -> None:
+        from filmscan_studio.capture.autoexposure import fresh_live_frame
+
+        cam = MockCamera()
+        cam.connect()
+        cam.start_live_view()
+        assert fresh_live_frame(cam).expotime_us is None
+
     def test_headroom_is_configurable(self) -> None:
         camera = MockCamera(settings=ExposureSettings(1.0, iso=None, gain=1.0))
         camera.connect()
