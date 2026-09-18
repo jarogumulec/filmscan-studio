@@ -259,7 +259,6 @@ class AutoExposureController:
                 gain=(self.camera.set_gain(gain)
                       if gain is not None and gain != settings.gain
                       else settings.gain),
-                aperture=settings.aperture,
             )
             if on_step is not None:
                 on_step(settings)

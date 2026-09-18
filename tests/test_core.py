@@ -60,6 +60,22 @@ class TestExposureSettings:
             exposure.ExposureSettings(0, 100)
         with pytest.raises(ValueError):
             exposure.ExposureSettings(1, 0)
+        with pytest.raises(ValueError):
+            # NaN slipped past ``<=`` (every NaN comparison is False) and the
+            # combo then displayed "1/nan" — 2026-09 round-trip sweep.
+            exposure.ExposureSettings(float("nan"), 100)
+
+    def test_shutter_string_round_trips(self) -> None:
+        """The combo echoes the applied shutter back; parse(shutter_string())
+        must land within a two-percent tick for every speed the rig shoots."""
+        for seconds in (3e-4, 0.001, 1 / 125, 1 / 60, 0.1, 1 / 3, 0.9999,
+                        1.0, 2.5, 15.0, 52.0, 1800.0):
+            text = exposure.ExposureSettings(seconds, 100).shutter_string()
+            back = exposure.parse_shutter(text)
+            assert back is not None, text
+            assert abs(back - seconds) / seconds < 0.02, f"{seconds} -> {text}"
+        # A denominator of zero is nonsense, not a speed:
+        assert exposure.parse_shutter("1/0") is None
 
 
 class TestMetering:

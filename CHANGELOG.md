@@ -3,6 +3,82 @@
 Vše, co se od posledního stavu změnilo, a hlavně: **co nešlo bez fotoaparátu
 ověřit** a jak to poznat při prvním zapnutí s tělem.
 
+## 2026-09-18 — zmrazení po dlouhé expozici: příčina nalezena a zavřena
+
+Dlouhé trápení: po Auto Exposure + expozici v desítkách sekund se
+**celá aplikace zmrazila** a pomohl jen kill. (283 testů zelených.)
+
+### 1) Zmrazení — tři chyby najednou, všechny v `touptek.py`
+
+- `capture()` vracel režim senzoru (binning/ROI) jen když Live View
+  **běžel**. GUI ho ale před každým capture vypíná, takže se `_binning`
+  navždy nechal v NO_BINNING → **každá další Live View streamovala
+  26 Mpx senzor donekonečna**. Přesně „špatně se vypíná plný režim
+  zobrazování" z uživatelova tipu.
+- `next_live_frame()` čekal na jeden `queue.get(timeout=shutter+2 s)`,
+  který **ignoroval Stop()** — starý poller závodil s dalším Snapem
+  a zablokoval CameraWorker (žádná kamera akce se už nedostala na řadu).
+  Nyní se čekání krájí po 0,25 s a kontroluje `_live_view`; po Stop()
+  se vrací `None` do čtvrtiny sekundy.
+- Výjimka ze `Stop()` uvnitř starého `finally` přeskočila obnovu režimu.
+  Nové `_force_stream_off()` nikdy nevyhazuje; obnova režimu je
+  bezpodmínečná.
+
+Návratové testy: `test_capture_restores_binning_when_stream_was_stopped_first`,
+`test_stopped_stream_returns_promptly_not_after_full_exposure`,
+`test_capture_error_still_restores_binning`.
+
+### 2) Záchrana bez killu: tlačítko „Restartovat proud"
+
+I kdyby se proud zasekl, aplikace neumře: toolbar má **Restartovat proud**
+a stejnou volbu nabízí chybová hláška Live View. Přepojí SDK na worker
+vlákně (klidný `Close()` nezmrazí GUI) a `session.camera` se přesměruje —
+rozpracovaný film přežije.
+
+### 3) RAW View a Negative už se nikdy nemohou zapnout současně
+
+Zaškrtnutí Negative ponechalo `filmic.invert` (zápojný invert náhledu)
+v rozporu s režimem. `_set_mode` ho nyní vždy synchronizuje; dva
+regresní testy (+ test, že selhání auditu nesmí zabít náhled).
+
+### 4) Retirovaná metadata — WB, objektiv, clona, zrcadlo — PRYČ
+
+Monokrystal IMX571 nemá white balance; rig má pevný manuální objektiv;
+zrcadlo se opravuje v postprodukci. Z metadat i UI odešly:
+`white_balance`, `raw_developer`, `lens`, `lens_serial`, `f_number`,
+`focus_distance_m` (`AcquisitionMetadata`), `mirrored` (`FilmMetadata`
++ dialog + log), a **clona úplně všude** — i z `ExposureSettings`,
+`CalibrationStack` a `CameraCapabilities` (vždy byla `None`; AE
+matematika ji potřebovat nemohla). `digitising_lens` ZŮSTÁVÁ (přenáší
+se mezi filmy). `ev100()` zemřel s `f_number`.
+
+**Staré archivy zůstávají čitelné**: `SCHEMA_VERSION` se nezvyšuje —
+místo migrace mode-before validator retirované klíče při načtení
+**zahodí** (`_strip_retired`) a validace proběhne na čistých datech.
+Skutečně překlepený klíč pořád padá nahlas. Ověřeno na reálném
+archivu (sidecar i katalog se otevírají, `mirrored`/`f_number` zmizely).
+
+### 5) „52 s → 50 s“ a tiché ořeznutí — konečně s hlasem
+
+Auditový verdikt pro další snímek počítá `shutter · 2^EV` a firmware
+kamery má **vlastní strop expozice** — dřív se oříznutí ztratilo
+stmlky v combo boxu (scéna chtěla 52 s+, kamera dala 50 s, uživatel
+viděl skok bez vysvětlení). `set_shutter` nyní čte přijatý čas
+*zpět* (stejná disciplína jako u gainu) a stavový řádek pojmenuje
+obě čísla: *„scéna chtěla 56.6, kamera umí max 50“*. NaN shutter už neprojde
+`__post_init__` (kontrola `not > 0` místo `<= 0`) a round-trip
+`shutter_string ↔ parse_shutter` drží nový test přes celou ladder
+i pod 1 ms.
+
+### 6) AE výřez mluví jednou řečí — pixely senzoru
+
+Říkal „px proudu“, audit ale měřil v px senzoru — a nad ROI se naopak
+vzdal celého rámu. GUI nyní převádí obdélník na **px senzoru** přesně
+u obou režimů (overview ×3, ROI + offset) a audit dostává škálu 1:1:
+**AE výřez nad posunutým ROI ahora měří to, co vidíš**. Stavový řádek
+i nápověda pod tlačítky to říkají stejně. AE converged do přeepáleného
+rámu už není ticho — `result.clipped` konečně oznamuje dialog.
+
 ## 2026-09-17 (večer) — první světlo: reálný ATR2600M
 
 Checklist §11 instrukcí odškrtán na hardware. Tři kontrakty, které fake

@@ -269,6 +269,15 @@ class CaptureWindow(QMainWindow):
         top.setMovable(False)
         self.addToolBar(top)
         self.act_connect = top.addAction("Připojit fotoaparát", self._connect_prompt)
+        # Standalone stream restart: the wedge this escapes used to require
+        # killing the app. It sits next to Connect so "proud se zasekl →
+        # restartuj tady" needs no discover guesswork.
+        self.act_restart = top.addAction("Restartovat proud", self._restart_stream)
+        self.act_restart.setEnabled(False)
+        self.act_restart.setToolTip(
+            "Zavře a znovu otevře kanál kamery, když zasekne proud nebo "
+            "zmraze náhled. Film i snímky na disku zůstanou."
+        )
         self.act_new_film = top.addAction("Nový film", self._new_film)
         self.act_new_film.setEnabled(False)
         self.act_export = top.addAction("Exportovat projekt", self._export_project)
@@ -348,9 +357,11 @@ class CaptureWindow(QMainWindow):
             "(histogram = přímá data senzoru, žádná predikce)."
         )
         self.ae_hint = QLabel(
-            "Shift+tažení: červený AE rámeček (histogram měří uvnitř; pravé "
-            "tlačítko zruší). Tažení bez Shiftu při zoomu posouvá, klik = "
-            "vycentrovat."
+            "AE rámeček: drž SHIFT a přetáhni myší — histogram, Auto Exposure "
+            "i audit pak měří jen uvnitř (mimo něj nic nevidí). Pravé tlačítko "
+            "ho zruší. Vystříhněný rámeček zmizí z pohledu, ale měří dál — "
+            "velikost ukáže stavový řádek. Tažení bez Shiftu při zoomu "
+            "posouvá, klik = vycentrovat."
         )
         self.ae_hint.setWordWrap(True)
         self.ae_hint.setStyleSheet("color: #9a9; font-size: 11px;")
@@ -358,7 +369,7 @@ class CaptureWindow(QMainWindow):
         exposure_box.body_layout().addWidget(self.ae_hint)
         right_layout.addWidget(exposure_box)
 
-        self.settings_label = QLabel("gain —   čas —   clona —")
+        self.settings_label = QLabel("gain —   čas —")
         self.settings_label.setStyleSheet("font-family: Menlo, monospace; font-size: 13px;")
         self.meter_label = QLabel("—")
         self.meter_label.setStyleSheet("font-family: Menlo, monospace;")
@@ -561,6 +572,7 @@ class CaptureWindow(QMainWindow):
         info = camera.info
         self.info = info
         self.act_connect.setEnabled(False)
+        self.act_restart.setEnabled(True)
         self.setWindowTitle(f"FilmScan Studio — Capture — {info.model}")
         self.act_new_film.setEnabled(True)
         gain_note = ""
@@ -569,9 +581,6 @@ class CaptureWindow(QMainWindow):
         self._log(f"{info.manufacturer or ''} {info.model}{gain_note} · "
                   f"senzor {info.sensor_width}×{info.sensor_height}")
         caps = camera.capabilities()
-        if not caps.aperture:
-            self._log("Clona není přes USB ovladatelná (manuální objektiv) — "
-                      "nastavuje se na objektivu.")
         self.cool_box.setVisible(caps.cooling)
         if caps.cooling:
             target = camera.get_target_temperature_c()
@@ -814,6 +823,28 @@ class CaptureWindow(QMainWindow):
             return self._stream_size
         return (self._sensor_size().width // 3, self._sensor_size().height // 3)
 
+    def _ae_rect_in_sensor_px(self) -> tuple[int, int, int, int] | None:
+        """The AE rect (stream px) expressed in full-sensor px.
+
+        Overview: one stream px is exactly the 3×3 bin of its sensor px.
+        ROI mode: the stream *is* the ROI window 1:1, so add the ROI origin.
+        Both are exact — no guessing, which is what lets the audit meter the
+        same film area the red rect covers even over a moved ROI.
+        """
+        if self._ae_rect is None:
+            return None
+        x0, y0, x1, y1 = self._ae_rect
+        if self._stream_binned:
+            sw, sh = self._last_source_size()
+            sensor = self._sensor_size()
+            sx = sensor.width / max(sw, 1)
+            sy = sensor.height / max(sh, 1)
+            return (round(x0 * sx), round(y0 * sy),
+                    round(x1 * sx), round(y1 * sy))
+        rx0, ry0, _, _ = self._roi_applied or (0, 0, 0, 0)
+        return (round(x0) + rx0, round(y0) + ry0,
+                round(x1) + rx0, round(y1) + ry0)
+
     def _update_zoom_note(self) -> None:
         w, h = self._last_source_size()
         zoom = self.view.zoom()
@@ -844,9 +875,15 @@ class CaptureWindow(QMainWindow):
             return
         self._ae_rect = (rect.x(), rect.y(),
                          rect.x() + rect.width(), rect.y() + rect.height())
+        # Report in sensor px — the unit the audit meters in and the only one
+        # that means the same thing over overview and ROI. "px proudu" read as
+        # a claim about the picture; operators think in the film's frame.
+        sensor = self._ae_rect_in_sensor_px()
+        w = sensor[2] - sensor[0] if sensor else rect.width()
+        h = sensor[3] - sensor[1] if sensor else rect.height()
         self.statusBar().showMessage(
-            f"AE výřez {rect.width()}×{rect.height()} px proudu "
-            "(pravé tlačítko zruší)", 4000
+            f"AE výřez {w}×{h} px senzoru — měří a audituje jen uvnitř "
+            "(pravé tlačítko zruší)", 6000
         )
 
     def _meter_source(self):
@@ -943,6 +980,73 @@ class CaptureWindow(QMainWindow):
         if self._worker is not None:
             self._worker.stop()
             self._worker = None
+        # Self-help restart (2026-09): the operator's workaround for a wedged
+        # stream was to kill the app and relaunch. Offer the same recovery in
+        # one click — close the handle and reopen it — instead of leaving a
+        # dead preview with no way back short of a restart.
+        box = QMessageBox(self)
+        box.setWindowTitle("Live View se zastavilo")
+        box.setText(f"Proud kamery přestal: {message}")
+        box.setInformativeText(
+            "Zkusit kameru znovu spustit (zavřít a otevřít)? Rozpracovaný film "
+            "i snímky na disku zůstanou."
+        )
+        retry = box.addButton("Restartovat proud", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Zavřít", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is retry:
+            self._restart_stream()
+
+    def _restart_stream(self) -> None:
+        """Close the camera handle and reopen a fresh one, keeping the film.
+
+        A stream wedged deep in the SDK (a full-sensor readout that never
+        settles) is not recoverable by another ``put_*`` on the same handle —
+        the handle has to be closed and reopened. Both the close and the reopen
+        run on the camera worker thread: a handle wedged in the SDK can block
+        ``Close()`` indefinitely, and doing that on the UI thread is exactly the
+        freeze this button exists to escape. On success the open session is
+        re-pointed at the new handle so the digitised frames and numbering
+        continue; a MockCamera just relaunches its stream.
+        """
+        if self._connecting:
+            return
+        old = self.camera
+        if isinstance(old, MockCamera):
+            self._pause_live_view()
+            self.start_live_view()
+            self.statusBar().showMessage("Mock proud restartován", 3000)
+            return
+        self._pause_live_view()
+        self._temp_timer.stop()
+        self._connecting = True
+        self.act_connect.setEnabled(False)
+        self.act_restart.setEnabled(False)
+        self.statusBar().showMessage("Restartuji proud kamery…")
+
+        def job() -> TouptekCamera:
+            # Runs on the worker thread, so a wedged Close() stalls only this
+            # job — the window keeps painting and closing.
+            if old is not None:
+                try:
+                    old.disconnect()
+                except Exception:  # noqa: BLE001 - best effort on a wedged handle
+                    log.exception("disconnect při obnově selhal")
+            camera = TouptekCamera()
+            camera.connect()
+            return camera
+
+        self._start_worker(job, self._on_stream_restarted,
+                           on_failed=self._on_connect_failed)
+
+    def _on_stream_restarted(self, camera: CameraBackend) -> None:
+        if self.session is not None:
+            # The session captured through the (now closed) handle; re-point it
+            # so the film continues on the fresh one. Catalog and files on disk
+            # are untouched — only the live camera reference changes.
+            self.session.camera = camera
+        self._on_camera_connected(camera)
+        self.statusBar().showMessage("Proud obnoven", 4000)
 
     def _update_histogram(self, image: np.ndarray,
                           reading: MeterReading) -> MeterReading:
@@ -988,10 +1092,9 @@ class CaptureWindow(QMainWindow):
     def _toggle_negative_preview(self, on: bool) -> None:
         """One-switch negative → picture preview; the filmic settings stay in
         the collapsed panel. The captured frame is untouched — this only
-        repaints."""
+        repaints. _set_mode owns the invert checkbox, so nothing is synced
+        here."""
         self._set_mode(raw_view=not on)
-        if on and not self.filmic.invert.isChecked():
-            self.filmic.invert.setChecked(True)   # fires _on_filmic_changed
 
     def _update_meter_label(self, reading: MeterReading) -> None:
         util = reading.highlight_utilisation
@@ -1014,6 +1117,18 @@ class CaptureWindow(QMainWindow):
         self.neg_toggle.blockSignals(True)
         self.neg_toggle.setChecked(not raw_view)
         self.neg_toggle.blockSignals(False)
+        # The panel's invert checkbox must say what the picture is doing. It
+        # defaulted to checked and never followed the mode, so a RAW View —
+        # which ignores invert and paints un-inverted — sat under a ticked
+        # "Invertovat (negativ)": the "RAW View + Negative najedou" complaint
+        # (2026-09). Syncing it here keeps one truth per mode, and a RAW View
+        # frame keeps its own per-channel DMax even though invert is now off.
+        self.filmic.invert.blockSignals(True)
+        self.filmic.invert.setChecked(not raw_view)
+        self.filmic.invert.blockSignals(False)
+        if self.positive.invert != (not raw_view):
+            self.positive = replace(self.positive, invert=not raw_view)
+            self._fast_preview.set_params(self.positive)
         self.filmic.setEnabled(not raw_view)
         # Repaint the last frame now, so switching modes is instant even with
         # Live View stopped.
@@ -1098,12 +1213,15 @@ class CaptureWindow(QMainWindow):
         """
         if self.session is None:
             return
-        # Rect→sensor mapping in the audit is a plain scale, true for the
-        # binned overview. Over a moved ROI the rect's sensor position carries
-        # an offset the audit cannot know about — meter the whole frame
-        # instead of guessing (audit_frame documents the same refusal).
-        rect = self._ae_rect if self._stream_binned else None
-        lv_size = self._last_source_size()
+        # audit_frame maps its rect by a plain scale from the stream size it
+        # is given — true for the binned overview, wrong for a moved ROI
+        # (whose stream px carry an origin offset it cannot know). So the GUI
+        # converts the rect to *sensor* px here, where both stream modes map
+        # identically, and hands the audit the sensor size: the scale becomes
+        # 1:1 and the ROI's offset is folded in.
+        rect = self._ae_rect_in_sensor_px()
+        sensor = self._sensor_size()
+        lv_size = (sensor.width, sensor.height)
         settings = result.settings
         # Snapshot for the JPEG: the same look the live preview is showing.
         params = self.positive
@@ -1148,6 +1266,13 @@ class CaptureWindow(QMainWindow):
                 self._refresh_settings()
                 applied = (" — čas pro další snímek nastaven na "
                            f"{ExposureSettings(shutter=got).shutter_string()}")
+                if abs(got - suggested) / max(suggested, 1e-9) > 0.02:
+                    # The camera clamped: it could not deliver what the verdict
+                    # asked for. Say so — the silent difference used to read as
+                    # "applied" while the scene stayed out of range.
+                    asked = ExposureSettings(shutter=suggested).shutter_string()
+                    applied += (f" (scéna chtěla {asked}, kamera umí max "
+                                f"{ExposureSettings(shutter=got).shutter_string()})")
             except Exception as exc:  # noqa: BLE001 - the verdict still stands
                 applied = f" (čas se nepodařilo nastavit: {exc})"
         self.statusBar().showMessage(
@@ -1203,6 +1328,18 @@ class CaptureWindow(QMainWindow):
                 result.limit_note
                 or "Nastavení kamery nestačí — scéna mimo rozsah.",
             )
+        elif result.clipped:
+            # Converged on the residual but the frame still rides the rail:
+            # the meter is blind above clipping, so "done" here would be a
+            # lie — the scan would be blown and the operator must know.
+            QMessageBox.warning(
+                self,
+                "Auto Exposure",
+                f"I po vyřešení ({result.settings.shutter_string()}) je "
+                f"scéna na hranici přepálení "
+                f"({result.reading.clipped_fraction:.3%} pixelů na bílé) — "
+                "změň expozici ručně nebo ztmavi scénu.",
+            )
         else:
             self.statusBar().showMessage(
                 f"Auto Exposure: {result.settings.shutter_string()} · "
@@ -1218,7 +1355,7 @@ class CaptureWindow(QMainWindow):
     # ------------------------------------------------------------------ film
 
     def _new_film(self) -> None:
-        # The rig (camera, lens, light, holder, mirroring) carries over from the
+        # The rig (camera, lens, light, holder) carries over from the
         # last film — light settings etc. are deliberately reused; the film's
         # own identity and development log never do.
         dialog = FilmDialog(self, rig_defaults=self._last_film)
@@ -1240,9 +1377,6 @@ class CaptureWindow(QMainWindow):
         self.act_export.setEnabled(True)
         self.statusBar().showMessage(f"Film {film.film_id}: {paths.root}")
         self._log(f"nový film {film.label()} ({film.film_type_class.value})")
-        if film.mirrored:
-            self._log("snímky označeny jako zrcadlově — zatím pouze v metadatech, "
-                      "převracení obrazů zatím neběží (CHANGELOG TODO).")
         self._refresh_stage()
         self._refresh_buttons()
 
@@ -1316,9 +1450,8 @@ class CaptureWindow(QMainWindow):
         if self.camera is None:
             return
         settings: ExposureSettings = self.camera.get_settings()
-        aperture = f"f/{settings.aperture:g}" if settings.aperture else "clona — (na objektivu)"
         self.settings_label.setText(
-            f"{settings.sensitivity_string()}   čas {settings.shutter_string()}   {aperture}"
+            f"{settings.sensitivity_string()}   čas {settings.shutter_string()}"
         )
         # Echo-guarded so syncing the widgets never re-applies to the camera.
         self._echo = True

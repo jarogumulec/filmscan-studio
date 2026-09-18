@@ -92,6 +92,13 @@ FRAME_TIMEOUT_SLACK_S = 2.0
 #: Still-event wait on top of the exposure itself (ATR2600M: 1 s still
 #: arrived ~0.9 s after Snap — readout + USB download).
 STILL_WAIT_HEADROOM_S = 15.0
+#: How often ``next_live_frame`` re-checks the live-view flag. The stream
+#: cadence is the shutter, so one long ``queue.get`` timeout would sit out the
+#: whole exposure *after* Stop() has already drained the queue: the GUI's
+#: ``_pause_live_view`` (QThread.wait 3 s) then races the old poller's teardown
+#: against the next Snap, and the operator's "freeze after capture" lived here.
+#: Polling the flag bounds stop latency to one slice instead.
+FRAME_POLL_SLICE_S = 0.25
 
 #: The raw contract, as (option, wanted, label). Verified write-after-write
 #: by :func:`apply_raw_contract`; a mismatch is a warning in
@@ -394,8 +401,13 @@ class TouptekCamera(CameraBackend):
         lo_us, hi_us = EXPO_TIME_RANGE_US
         us = min(hi_us, max(lo_us, shutter_to_us(seconds)))
         self._hcam.put_ExpoTime(us)
-        self._settings = self._settings.with_shutter(us / 1e6)
-        return us / 1e6
+        # Read the accepted time back — the firmware has its own ceiling
+        # (first light 2026-09: a >50 s request came back exposure-capped),
+        # and the GUI must show what the sensor will really expose, not what
+        # we asked for. Same readback discipline as set_gain.
+        accepted = self._hcam.get_ExpoTime() / 1e6
+        self._settings = self._settings.with_shutter(accepted)
+        return accepted
 
     def set_gain(self, gain: float) -> float:
         self._require()
@@ -522,10 +534,23 @@ class TouptekCamera(CameraBackend):
         # resurrected poller would die on every frame for the rest of the
         # session.
         budget = max(FRAME_TIMEOUT_S, self._settings.shutter + FRAME_TIMEOUT_SLACK_S)
-        try:
-            data, (width, height), expotime_us = self._frames.get(timeout=budget)
-        except queue.Empty:
-            raise CameraError("proud kamery přestal dodávat snímky")
+        # One blocking get for the whole budget would ignore Stop() for the
+        # duration of a long exposure (Stop drains the queue, Empty then
+        # follows only after the shutter has run out). Slice the wait so a
+        # stopped stream is noticed within FRAME_POLL_SLICE_S and the worker
+        # exits promptly.
+        waited = 0.0
+        while True:
+            if not self._live_view:
+                return None
+            try:
+                data, (width, height), expotime_us = self._frames.get(
+                    timeout=min(FRAME_POLL_SLICE_S, budget - waited))
+                break
+            except queue.Empty:
+                waited += FRAME_POLL_SLICE_S
+                if waited >= budget:
+                    raise CameraError("proud kamery přestal dodávat snímky")
         return LiveFrame(data=data, width=width, height=height,
                          black_level=0.0, white_level=WHITE_LEVEL_16BIT,
                          expotime_us=expotime_us)
@@ -536,6 +561,21 @@ class TouptekCamera(CameraBackend):
                 self._frames.get_nowait()
             except queue.Empty:
                 return
+
+    def _force_stream_off(self) -> None:
+        """Stop the stream and empty the queue, never raising.
+
+        Used on the way out of ``capture``: the exposed frame is already on
+        disk by then (or a clearer error is already in flight), and a Stop()
+        that threw used to skip the mode restore entirely — leaving the sensor
+        in full-sensor readout, which is the freeze the operator sees.
+        """
+        self._live_view = False
+        try:
+            self._hcam.Stop()
+        except Exception:  # noqa: BLE001 - teardown must not mask the real error
+            log.exception("Stop po still expozici selhal")
+        self._drain_frames()
 
     # ------------------------------------------------------------------ capture
 
@@ -558,6 +598,7 @@ class TouptekCamera(CameraBackend):
         notes: list[str] = []
         was_live = self._live_view
         restore = (self._binning, self._roi)      # Live View mode to come back to
+        still_error: CameraError | None = None
         if was_live:
             self._hcam.Stop()
             self._live_view = False
@@ -593,14 +634,16 @@ class TouptekCamera(CameraBackend):
                         arrived = True
                         break
                 if not arrived:
-                    raise CameraError(
+                    still_error = CameraError(
                         f"still expozice {self._settings.shutter:g} s "
                         "nedodala snímek (do 15 s žádná STILLIMAGE událost) "
                         "— zkontroluj napájení a kabel")
+                    raise still_error
                 self._hcam.PullStillImageV2(buf, 16, info)
             except sdk.HRESULTException as exc:
-                raise CameraError(
+                still_error = CameraError(
                     f"exposice nedodala snímek (hr=0x{exc.hr & 0xffffffff:x})")
+                raise still_error
             still = (np.frombuffer(buf, dtype=np.uint16, count=width * height)
                      .reshape(height, width))
             temp = self.get_temperature_c()
@@ -619,13 +662,23 @@ class TouptekCamera(CameraBackend):
             if info.v3.expotime:
                 notes.append(f"expotime hlášen {info.v3.expotime} us")
         finally:
-            try:
-                self._hcam.Stop()
-            finally:
-                if keep_live_view and was_live:
-                    self._binning, self._roi = restore
+            # The still left the sensor in full-sensor NO_BINNING mode. Restore
+            # the *mode state* unconditionally — the GUI stops the stream before
+            # every capture, so `was_live` is normally False and a conditional
+            # restore used to leave _binning at NO_BINNING: the next
+            # start_live_view then streamed the whole 26 MP sensor forever (the
+            # "full-res view never switches off" freeze). The stream itself is
+            # only restarted when it was live and asked to resume.
+            self._binning, self._roi = restore
+            self._force_stream_off()
+            if keep_live_view and was_live:
+                try:
                     self._start_stream()
                     self._live_view = True
+                except Exception:  # noqa: BLE001 - the exposure error outranks this
+                    log.exception("návrat Live View po stillu selhal")
+            if still_error is not None:
+                raise still_error
         return CaptureResult(
             path=target,
             size_bytes=target.stat().st_size,

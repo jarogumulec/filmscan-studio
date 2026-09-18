@@ -73,11 +73,11 @@ def audit_frame(
 ) -> AuditResult:
     """Meter one captured frame and judge it.
 
-    ``ae_rect`` is the red rectangle in Live View *stream* pixels as drawn;
-    ``lv_size`` the stream size those coordinates belong to. The map to sensor
-    pixels is the plain scale between the two — true for the binned overview
-    (uniform 3:1) and for a hardware ROI (the GUI keeps the rect in stream
-    coordinates of the current stream, whatever it is).
+    ``ae_rect`` is a rectangle in the pixel grid of the stream of size
+    ``lv_size``; the map to sensor pixels is the plain scale between the two.
+    The GUI therefore converts its red rect to *sensor* px first (folding in
+    the ROI origin) and passes the sensor size here, so the scale is 1:1 and
+    stays honest over a moved ROI.
     """
     frame = open_frame(path)
     data = frame.data

@@ -10,7 +10,7 @@ development and neither module can corrupt the other's data.
 uv run filmscan-studio          # Capture GUI (PySide6)
 uv run filmscan-studio --mock   #   …with a simulated TS2600MP-G2, no camera needed
 uv run filmscan-develop frameNNN.tif ...  # Developer CLI → 16-bit TIFF + sidecar
-uv run pytest                   # 262 tests
+uv run pytest                   # 283 tests
 ```
 
 ## Design rules the code enforces
@@ -57,8 +57,9 @@ frame-by-frame *Capture* (auto frame numbering matching the canister) →
 Exposure* solves with the shutter alone while the archival-gain button is
 checked. The cooling panel shows current/target temperature with a
 traffic-light semaphore — green means "u cíle — darky platí". After every
-scan the TIFF is **audited** (whole frame, or the red AE rect while streaming
-the overview) and the next frame's shutter is corrected; a positive
+scan the TIFF is **audited** (whole frame, or the red AE rect — converted to
+sensor px, exact over the binned overview and over a moved ROI alike) and the
+next frame's shutter is corrected; a positive
 `frameNNN.jpg` is rendered from the TIFF beside it. The export lists any scan
 whose darks sit further than ±0.5 °C away.
 
@@ -77,7 +78,7 @@ bit-identically).
 
 ## Status
 
-- **This code:** Capture GUI + Touptek backend + test suite (262 tests)
+- **This code:** Capture GUI + Touptek backend + test suite (283 tests)
   complete against MockCamera; Developer CLI complete on mono TIFFs.
 - **Pending hardware verification** (`INSTRUCTIONS_TOUPTEK_CAMERA.md` §11):
   real fps at the 0x83 binning, Snap-in-RAW-mode behaviour, ExpoAGain units,

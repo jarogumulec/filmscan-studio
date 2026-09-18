@@ -35,7 +35,7 @@ def _tiff(tmp_path: Path, data: np.ndarray, name: str = "f.tif") -> Path:
 
 
 def _settings(shutter: float = 1.0, gain: float = 1.0) -> ExposureSettings:
-    return ExposureSettings(shutter=shutter, iso=None, gain=gain, aperture=8.0)
+    return ExposureSettings(shutter=shutter, iso=None, gain=gain)
 
 
 LADDER = [1 / 8, 1 / 4, 1 / 2, 1.0, 2.0, 4.0]

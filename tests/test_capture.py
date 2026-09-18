@@ -35,7 +35,12 @@ from filmscan_studio.core.exposure import (
     MeterReading,
     parse_shutter,
 )
-from filmscan_studio.core.models import FilmMetadata, FilmType, FrameKind
+from filmscan_studio.core.models import (
+    AcquisitionMetadata,
+    FilmMetadata,
+    FilmType,
+    FrameKind,
+)
 from filmscan_studio.core.rawio import open_frame
 from filmscan_studio.core.zoom import (
     MIN_ROI_PX,
@@ -117,10 +122,6 @@ class TestCameraContract:
                 camera.set_iso(100)
             assert camera.capabilities().iso is False
             assert camera.capabilities().gain is True
-
-    def test_aperture_is_not_offered(self) -> None:
-        with MockCamera() as camera:
-            assert camera.capabilities().aperture is False
 
     def test_live_frames_only_while_running(self) -> None:
         with MockCamera(live_fps=200) as camera:
@@ -634,13 +635,12 @@ class TestFilmMetadataV2:
     def test_rig_defaults_subset(self):
         film = FilmMetadata(
             film_id="F1", film_name="Fomapan 100", camera="TS2600MP-G2",
-            digitising_light="CRS LED", mirrored=True, development="R09 8 min",
+            digitising_light="CRS LED", development="R09 8 min",
             content="hrady",
         )
         rig = film.rig_defaults()
         assert rig["camera"] == "TS2600MP-G2"
         assert rig["digitising_light"] == "CRS LED"
-        assert rig["mirrored"] is True
         # The film's own identity and its development log never carry over.
         assert "film_name" not in rig
         assert "development" not in rig
@@ -648,12 +648,37 @@ class TestFilmMetadataV2:
 
     def test_all_optional_fields_may_stay_empty(self):
         film = FilmMetadata(film_id="F1")
-        assert film.film_name is None and not film.mirrored
+        assert film.film_name is None
         assert film.digitisation_date is None
 
     def test_roundtrip_json(self):
         film = FilmMetadata(film_id="F2", film_name="Astia 100",
                             film_type_class=FilmType.COLOR_NEGATIVE,
-                            development_start="asi 12/25", mirrored=True)
+                            development_start="asi 12/25")
         again = FilmMetadata.model_validate_json(film.model_dump_json())
         assert again == film
+
+    def test_retired_dslr_keys_migrate_on_load(self, tmp_path):
+        """Archived sidecars still carry the fields the mono Touptek made
+        meaningless. extra="forbid" would reject them and lock the operator out
+        of old projects, so they are stripped on load — but only *those* keys;
+        a genuine typo must still fail loudly."""
+        old_film = {"film_id": "OLD_1", "mirrored": True,
+                    "manufacturer": "Foma", "film_type": "400 Classic"}
+        film = FilmMetadata.model_validate(old_film)
+        assert not hasattr(film, "mirrored")
+        assert film.film_name == "Foma 400 Classic"    # v1 merge still works
+
+        old_acq = {"camera": "D750", "lens": "Nikon 50/1.8", "lens_serial": "123",
+                   "f_number": 8.0, "focus_distance_m": 0.5,
+                   "white_balance": "daylight", "raw_developer": "Camera Neutral",
+                   "exposure_time": 4.0}
+        acq = AcquisitionMetadata.model_validate(old_acq)
+        assert acq.exposure_time == 4.0
+        for gone in ("lens", "lens_serial", "f_number", "focus_distance_m",
+                     "white_balance", "raw_developer"):
+            assert not hasattr(acq, gone)
+
+        # The guard that makes the migration safe: an unknown key is an error.
+        with pytest.raises(Exception, match="typo"):
+            AcquisitionMetadata.model_validate({"typo_field": 1})

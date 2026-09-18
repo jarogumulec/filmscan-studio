@@ -3,8 +3,8 @@
 The database mirrors the JSON sidecars rather than replacing them. Both are
 written because they serve different purposes: the sidecar travels with the file
 and survives the database being lost, while the database is what makes a session
-queryable ("every frame of HP5_001 shot at f/8", "all dark frames usable at this
-shutter speed").
+queryable ("every frame of HP5_001", "all dark frames usable at this shutter
+speed").
 
 Schema is versioned so a project archived today can be migrated in five years.
 """
@@ -54,7 +54,6 @@ CREATE TABLE IF NOT EXISTS captures (
     white_level     REAL,
     shutter         REAL,
     iso             INTEGER,
-    f_number        REAL,
     captured_at     TEXT,
     metadata        TEXT NOT NULL,          -- full CaptureRecord as JSON
     created_at      TEXT NOT NULL,
@@ -141,9 +140,9 @@ class Catalog:
                 """
                 INSERT INTO captures(
                     capture_id, film_id, frame_number, kind, filename, file_format,
-                    width, height, black_level, white_level, shutter, iso, f_number,
+                    width, height, black_level, white_level, shutter, iso,
                     captured_at, metadata, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(capture_id) DO UPDATE SET
                     frame_number = excluded.frame_number,
                     kind = excluded.kind,
@@ -162,7 +161,6 @@ class Catalog:
                     record.white_level,
                     acq.exposure_time,
                     acq.iso,
-                    acq.f_number,
                     acq.capture_date.isoformat() if acq.capture_date else None,
                     json.dumps(to_json_dict(record)),
                     record.created_at.isoformat(),

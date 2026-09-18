@@ -192,13 +192,14 @@ class CaptureSession:
         height = frame.height if frame else None
         acquisition = (frame.acquisition if frame else None) or AcquisitionMetadata()
         # Settings at release win over anything embedded in the file: they are
-        # what the operator asked for at the moment of exposure.
+        # what the operator asked for at the moment of exposure. (Aperture is
+        # not recorded: the rig's lens is manual and the mono body never learns
+        # an f-number — the D750-era f_number field is retired.)
         acquisition = acquisition.model_copy(
             update={
                 "exposure_time": result.settings.shutter,
                 "iso": result.settings.iso,
                 "gain": result.settings.gain,
-                "f_number": acquisition.f_number or result.settings.aperture,
                 "capture_date": acquisition.capture_date or datetime.now().astimezone(),
             }
         )

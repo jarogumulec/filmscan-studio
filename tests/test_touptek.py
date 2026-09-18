@@ -337,6 +337,21 @@ class TestExposureUnits:
         assert camera.set_shutter(1e-9) == EXPO_TIME_RANGE_US[0] / 1e6
         assert camera.set_shutter(1e9) == EXPO_TIME_RANGE_US[1] / 1e6
 
+    def test_shutter_reports_what_firmware_accepted(self, fake, camera) -> None:
+        """First light 2026-09: the firmware has its own exposure ceiling —
+        the GUI must show the accepted time, not the requested one (the
+        silent 52 s → 50 s combo jump)."""
+        cap_us = 50_000_000
+        original_put = fake.put_ExpoTime
+
+        def capping_put(us: int) -> None:
+            original_put(min(us, cap_us))
+
+        fake.put_ExpoTime = capping_put
+        applied = camera.set_shutter(52.0)
+        assert applied == pytest.approx(50.0)
+        assert camera.get_settings().shutter == pytest.approx(50.0)
+
     def test_gain_exchanged_in_permille(self, fake, camera) -> None:
         applied = camera.set_gain(2.5)
         assert ("put_ExpoAGain", 2500) in fake.calls
@@ -425,9 +440,11 @@ class TestStreamModes:
             camera.next_live_frame()
 
     def test_long_exposure_widens_the_frame_timeout(self, camera, monkeypatch) -> None:
-        # A 10 s shutter means the stream is legitimately silent for 10 s;
-        # the poll must wait it out, not declare the stream dead (which is
-        # how a 3× AE killed Live View on hardware).
+        # A 10 s shutter means the stream is legitimately silent for 10 s; the
+        # poll must wait the whole shutter+slack out, not declare the stream
+        # dead after one slice (which is how a 3× AE killed Live View on
+        # hardware). The wait is now sliced so Stop() is honoured mid-exposure,
+        # so the assertion is on the CUMULATIVE budget, not a single get().
         waits: list[float] = []
 
         def spy_get(timeout=None):
@@ -436,11 +453,38 @@ class TestStreamModes:
 
         monkeypatch.setattr(camera._frames, "get", spy_get)
         monkeypatch.setattr(touptek, "FRAME_TIMEOUT_S", 5.0)
+        monkeypatch.setattr(touptek, "FRAME_POLL_SLICE_S", 1.0)
         camera.set_shutter(10.0)
         camera._live_view = True
         with pytest.raises(CameraError, match="přestal"):
             camera.next_live_frame()
-        assert waits[0] == pytest.approx(12.0)   # shutter + slack
+        # Every slice is short (so a Stop is seen fast) but they sum to the
+        # full shutter+slack budget the long exposure is owed.
+        assert max(waits) <= 1.0
+        assert sum(waits) == pytest.approx(12.0)   # shutter + slack
+
+    def test_stopped_stream_returns_promptly_not_after_full_exposure(
+        self, camera, monkeypatch
+    ) -> None:
+        # The freeze's second half: at a 52 s shutter the old single blocking
+        # get() sat out the whole exposure even after Stop() had drained the
+        # queue, so the previous Live View worker's teardown raced the next
+        # Snap. Stop() now flips the flag out from under a waiting poll and it
+        # returns None within a slice, never the whole shutter.
+        import threading
+
+        monkeypatch.setattr(touptek, "FRAME_TIMEOUT_S", 30.0)
+        monkeypatch.setattr(touptek, "FRAME_TIMEOUT_SLACK_S", 30.0)
+        monkeypatch.setattr(touptek, "FRAME_POLL_SLICE_S", 0.02)
+        camera.set_shutter(52.0)
+        camera._live_view = True
+        out: list = []
+        poll = threading.Thread(target=lambda: out.append(camera.next_live_frame()))
+        poll.start()
+        camera.stop_live_view()      # clears the flag + drains
+        poll.join(timeout=2.0)
+        assert not poll.is_alive(), "poll outlived its slice budget after Stop"
+        assert out == [None]
 
     def test_non_image_events_ignored(self, fake, camera) -> None:
         camera.start_live_view()
@@ -493,6 +537,36 @@ class TestCapture:
         camera.start_live_view()
         camera.capture(tmp_path, "f", keep_live_view=False)
         assert fake.stream_running is False
+
+    def test_capture_restores_binning_when_stream_was_stopped_first(
+        self, fake, camera, tmp_path
+    ) -> None:
+        # THE freeze. The GUI stops the stream (_pause_live_view) *before* it
+        # queues a capture, so capture() sees was_live=False. The old restore
+        # was guarded by `if keep_live_view and was_live`, so it never ran on
+        # this — the normal — path and left _binning at NO_BINNING: the next
+        # start_live_view then streamed the whole 26 MP sensor forever (the
+        # "full-res view never switches off" freeze). The mode state must be
+        # restored regardless of whether the stream happened to be up.
+        camera.start_live_view()                    # overview (3x3 binned)
+        camera.stop_live_view()                     # GUI pause before capture
+        assert camera._live_view is False
+        camera.capture(tmp_path, "f", keep_live_view=False)
+        assert camera._binning == OVERVIEW_BINNING  # not stranded at NO_BINNING
+        assert camera._roi is None
+
+    def test_capture_error_still_restores_binning(
+        self, fake, camera, tmp_path, monkeypatch
+    ) -> None:
+        # A dead cable mid-exposure raised out of the old finally *before* the
+        # Stop, skipping the restore entirely. Even on failure the binning must
+        # not be left at full-sensor NO_BINNING.
+        monkeypatch.setattr(touptek, "STILL_WAIT_HEADROOM_S", 0.05)
+        fake.Snap = lambda flag: fake.calls.append(("Snap", flag))  # never fires
+        camera.start_live_view()
+        with pytest.raises(CameraError, match="STILLIMAGE"):
+            camera.capture(tmp_path, "f", keep_live_view=True)
+        assert camera._binning == OVERVIEW_BINNING
 
     def test_pull_refusal_surfaces_as_camera_error(
         self, fake, camera, tmp_path

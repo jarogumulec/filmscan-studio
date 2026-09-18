@@ -91,6 +91,30 @@ class TestModes:
         window.mode_positive.setChecked(False)
         assert window.mode_raw.isChecked()
 
+    def test_invert_checkbox_follows_the_mode(self, window):
+        # The reported contradiction (2026-09): a RAW View sat under a ticked
+        # "Invertovat (negativ)". The invert checkbox is a *view* of the mode,
+        # so it must agree with what the picture is actually doing.
+        assert window.raw_view
+        assert not window.filmic.invert.isChecked()
+        window.mode_positive.setChecked(True)
+        assert window.filmic.invert.isChecked()
+        window.mode_raw.setChecked(True)
+        assert not window.filmic.invert.isChecked()
+        # Driving it through the Negativ switch agrees too.
+        window.neg_toggle.setChecked(True)
+        assert window.filmic.invert.isChecked() and not window.raw_view
+        window.neg_toggle.setChecked(False)
+        assert not window.filmic.invert.isChecked() and window.raw_view
+
+    def test_positive_param_invert_tracks_the_mode(self, window):
+        # invert is baked into PositiveParams; a RAW View that ignores it must
+        # not leave positive.invert lying about the displayed frame.
+        window.mode_positive.setChecked(True)
+        assert window.positive.invert is True
+        window.mode_raw.setChecked(True)
+        assert window.positive.invert is False
+
     def test_filmic_panel_disabled_in_raw_view(self, window):
         assert not window.filmic.isEnabled()
         window.mode_positive.setChecked(True)
@@ -139,6 +163,29 @@ class TestCaptureWorkflow:
         # shutter underexposes scene 0.3); any verdict proves the audit ran.
         assert "EV" in window._last_audit
         assert "náhled" in window.log_view.text()   # preview JPEG was rendered
+
+    def test_preview_renders_even_when_audit_fails(self, window, tmp_path, qtbot,
+                                                   monkeypatch):
+        """The old D750 pipeline bailed out of the whole post-capture job when
+        the audit raised, so a corrupt/oversize TIFF left the operator without
+        a JPEG of a frame they actually took. Audit and JPEG are independent
+        try/excepts now — a dead audit must still paint the preview."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+        from filmscan_studio.gui import capture_window as cw
+
+        def exploding_audit(*_args, **_kwargs):
+            raise RuntimeError("audit schytal výjimku")
+
+        monkeypatch.setattr(cw, "audit_frame", exploding_audit)
+        film = FilmMetadata(film_id="HP5_003", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window._capture(scan=True)
+        # Audit raised -> _last_audit stays None, but the JPEG still renders.
+        qtbot.waitUntil(
+            lambda: "náhled" in window.log_view.text(), timeout=15000)
+        assert window._last_audit is None           # audit genuinely failed
+        assert any(p.suffix == ".jpg" for p in paths.frames.iterdir())
 
     def test_capture_button_stays_disabled_while_busy(self, window, tmp_path, qtbot):
         from filmscan_studio.capture.session import CaptureSession, SessionPaths
@@ -404,6 +451,35 @@ class TestAeRectMetering:
         window._on_ae_rect(None)
         assert window._ae_rect is None
 
+    def test_rect_to_sensor_px_overview_scales_by_three(self, window,
+                                                        monkeypatch):
+        """Overview stream px → sensor px is the exact 3×3 bin scale; the
+        audit is handed sensor px so its 1:1 map cannot lie (2026-09: it used
+        to meter the whole frame in ROI mode instead of guessing)."""
+        from filmscan_studio.core.zoom import SensorSize
+        monkeypatch.setattr(window, "_sensor_size",
+                            lambda: SensorSize(6000, 3000))
+        window._stream_binned = True
+        window._stream_size = (2000, 1000)
+        window._ae_rect = (10, 20, 110, 120)
+        assert window._ae_rect_in_sensor_px() == (30, 60, 330, 360)
+
+    def test_rect_to_sensor_px_in_roi_adds_the_origin(self, window,
+                                                      monkeypatch):
+        """Over a hardware ROI the stream is the ROI window 1:1 — the rect's
+        sensor position is stream px + ROI origin, not a scale."""
+        from filmscan_studio.core.zoom import SensorSize
+        monkeypatch.setattr(window, "_sensor_size",
+                            lambda: SensorSize(6000, 3000))
+        window._stream_binned = False
+        window._roi_applied = (500, 600, 1200, 1200)
+        window._ae_rect = (10, 20, 110, 120)
+        assert window._ae_rect_in_sensor_px() == (510, 620, 610, 720)
+
+    def test_rect_to_sensor_px_without_rect_is_none(self, window):
+        window._ae_rect = None
+        assert window._ae_rect_in_sensor_px() is None
+
     def test_meter_source_meters_only_the_rect(self, window):
         # A frame that is dark everywhere except the rect: whole-frame and
         # rect metering must disagree, proving the crop is applied.
@@ -475,6 +551,43 @@ class TestExposureControls:
         window.shutter_edit.lineEdit().editingFinished.emit()
         assert window.camera.get_settings().shutter == pytest.approx(before)
         assert "nejde pochopit" in window.statusBar().currentMessage()
+
+    def test_audit_clamped_suggestion_is_announced(self, window, monkeypatch):
+        """2026-09: the audit's EV verdict wanted e.g. 52 s+ or a shutter the
+        camera cannot deliver; the silent clamp read as "applied". The status
+        line must name both numbers (52 s → 50 s confusion)."""
+        from filmscan_studio.capture.quality import AuditResult
+        from filmscan_studio.core.exposure import ExposureSettings
+
+        class ClampingCamera:
+            """The real Touptek clamps µs shutters to EXPO_TIME_RANGE_US."""
+            MAX_S = 50.0
+
+            def __init__(self):
+                self.settings = ExposureSettings(10.0, iso=None, gain=1.0)
+
+            def get_settings(self):
+                return self.settings
+
+            def set_shutter(self, seconds):
+                self.settings = self.settings.with_shutter(
+                    min(seconds, self.MAX_S))
+                return self.settings.shutter
+
+            def disconnect(self):  # window teardown calls it
+                pass
+
+        window.camera = ClampingCamera()
+        monkeypatch.setattr(window, "_refresh_settings", lambda: None)
+        # +2.5 EV from 10 s would be 56.6 s — beyond the camera's 50 s end.
+        audit = AuditResult(verdict="under", message="PODEXPOZICOVÁNO",
+                            ev_change=2.5, suggested_shutter=None,
+                            clipped_fraction=0.0)
+        window._on_audit_done((audit, None))
+        msg = window.statusBar().currentMessage()
+        assert "56.5" in msg                      # what the scene asked for
+        assert "max 50" in msg                    # what the camera allowed
+        assert window.camera.get_settings().shutter == pytest.approx(50.0)
 
     def test_refresh_does_not_reapply(self, window):
         window._refresh_settings()

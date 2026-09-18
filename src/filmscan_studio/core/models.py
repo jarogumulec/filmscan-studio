@@ -16,7 +16,42 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+#: v3, unchanged: the acquisition metadata lost the DSLR-era fields
+#: (``lens``, ``lens_serial``, ``f_number``, ``focus_distance_m``,
+#: ``white_balance``, ``raw_developer``) and ``FilmMetadata`` lost ``mirrored``
+#: when the app became mono-Touptek-only. The version is deliberately *not*
+#: bumped: every archived ``catalog.sqlite`` stamps its version and the catalog
+#: refuses a mismatch, so a bump would lock the operator out of their existing
+#: projects. Retirement is handled instead by :func:`_strip_retired`, which
+#: drops the old keys on load; ``SCHEMA_VERSION`` stays a compatibility floor
+#: for genuine format breaks, not for deleting a field nobody reads.
 SCHEMA_VERSION = 3
+
+#: Keys retired from ``AcquisitionMetadata`` and ``FilmMetadata`` across the
+#: D750 -> mono Touptek move. ``extra="forbid"`` would otherwise reject any
+#: sidecar written before they went away, so they are removed before
+#: validation rather than tolerated forever.
+RETIRED_ACQUISITION_FIELDS: tuple[str, ...] = (
+    "lens",
+    "lens_serial",
+    "f_number",
+    "focus_distance_m",
+    "white_balance",
+    "raw_developer",
+)
+RETIRED_FILM_FIELDS: tuple[str, ...] = ("mirrored",)
+
+
+def _strip_retired(data: object, retired: tuple[str, ...]) -> object:
+    """Drop retired keys from a sidecar dict before validation.
+
+    Only rebuilds when something is actually retired-present, so the ordinary
+    (and already-migrated) path pays nothing. A non-dict passes through for
+    pydantic to reject on its own terms.
+    """
+    if not isinstance(data, dict) or not any(k in data for k in retired):
+        return data
+    return {k: v for k, v in data.items() if k not in retired}
 
 
 def _now() -> datetime:
@@ -63,7 +98,6 @@ RIG_FIELDS: tuple[str, ...] = (
     "camera",
     "format",
     "film_type_class",
-    "mirrored",
     "digitising_lens",
     "digitising_light",
     "digitising_holder",
@@ -81,7 +115,7 @@ class FilmMetadata(BaseModel):
     interpretable without knowing anything about the scanner.
 
     Two field groups live here deliberately. The first is the strip and its
-    development; the second (``digitising_*``, ``camera``, ``mirrored``) describes
+    development; the second (``digitising_*``, ``camera``) describes
     the *rig* it was scanned on, which is what makes a scan reproducible and is
     what carries over when a new film is started — see :data:`RIG_FIELDS`.
 
@@ -110,11 +144,6 @@ class FilmMetadata(BaseModel):
     content: str | None = Field(
         default=None, description="What is on the strip."
     )
-    #: True when the strip was digitised emulsion-side to the lens, which flips
-    #: the image horizontally. Recorded, not yet applied anywhere — the flip
-    #: belongs in the developer's output, and applying it to a live preview
-    #: before it is applied to the export would make the two disagree.
-    mirrored: bool = False
     digitising_lens: str | None = None
     digitising_light: str | None = None
     digitising_holder: str | None = None
@@ -135,16 +164,23 @@ class FilmMetadata(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_v1(cls, data: object) -> object:
+    def _migrate(cls, data: object) -> object:
         """Fold schema-v1 sidecars into the current field set.
 
         v1 split the stock name into ``manufacturer`` + ``film_type`` and the
         development log into three columns. Archived projects must stay
         readable without a migration pass over every sidecar on disk, so the
         merge happens here, once, on load; the on-disk v1 files are left as
-        they are. Unknown keys still fail loudly — ``extra="forbid"`` is what
-        catches a typo'd field name, and a migration must not eat that.
+        they are.
+
+        The retired rig flag (``mirrored``) is stripped first, on every load —
+        the emulsion-side flip is corrected in post now and the flag recorded
+        nothing anywhere, so a v3 sidecar carrying it must not trip
+        ``extra="forbid"``. Unknown keys *other* than the retired ones still
+        fail loudly: that is what catches a typo'd field name, and a migration
+        must not eat that.
         """
+        data = _strip_retired(data, RETIRED_FILM_FIELDS)
         if not isinstance(data, dict):
             return data
         if not any(k in data for k in ("manufacturer", "film_type",
@@ -170,9 +206,12 @@ class FilmMetadata(BaseModel):
 class AcquisitionMetadata(BaseModel):
     """How a single frame was photographed.
 
-    Normally filled from EXIF and then trusted; camera settings that EXIF cannot
-    report (notably aperture on manual lenses) are entered by the operator and
-    take precedence when present.
+    The mono Touptek reports only these: the body, its serial, the shutter, the
+    analog gain and the moment of exposure. The D750-era fields (lens and its
+    serial, ``f_number``, focus distance, white balance, camera-side raw
+    developer) are gone — a fixed manual prime lens and a mono sensor give none
+    of them a value, and sidecars that still carry them are migrated on load
+    (see :data:`RETIRED_ACQUISITION_FIELDS`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -180,21 +219,19 @@ class AcquisitionMetadata(BaseModel):
     schema_version: int = SCHEMA_VERSION
     camera: str | None = None
     camera_serial: str | None = None
-    lens: str | None = None
-    lens_serial: str | None = None
     #: Legacy bodies only; gain cameras (Touptek) leave this None.
     iso: int | None = None
     #: Analog gain as a linear multiplier (1.0 = 1x), the Touptek's sensitivity.
     gain: float | None = None
     exposure_time: float | None = Field(default=None, description="Seconds.")
-    f_number: float | None = None
-    focus_distance_m: float | None = None
     capture_date: datetime | None = None
     copy_number: int = 1
-    white_balance: str | None = None
-    raw_developer: str | None = Field(
-        default=None, description="Camera-side render settings; irrelevant to raw data."
-    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_retired(cls, data: object) -> object:
+        """Drop the DSLR-era keys archived sidecars still carry."""
+        return _strip_retired(data, RETIRED_ACQUISITION_FIELDS)
 
     @field_validator("exposure_time")
     @classmethod
@@ -202,23 +239,6 @@ class AcquisitionMetadata(BaseModel):
         if v is not None and v <= 0:
             raise ValueError("exposure_time must be positive")
         return v
-
-    def ev100(self) -> float | None:
-        """Exposure value of the capture, or None if settings are incomplete.
-
-        EV100 is the invariant that lets a flat frame shot at a different shutter
-        speed be compared against a scan: radiometrically, sensor signal scales
-        with exposure time at fixed illumination.
-        """
-        # A gain camera's 1.0x plays the role of ISO 100: EV100 compares
-        # exposures, and sensitivity enters as 100/iso == 1.0/gain.
-        sensitivity = self.iso if self.iso is not None else (
-            None if self.gain is None else 100.0 * self.gain)
-        if self.exposure_time is None or sensitivity is None or self.f_number is None:
-            return None
-        import math
-
-        return math.log2(self.f_number**2 / self.exposure_time * 100.0 / sensitivity)
 
 
 class CaptureRecord(BaseModel):

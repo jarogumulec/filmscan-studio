@@ -115,7 +115,6 @@ class CameraCapabilities:
     #: Sensitivity control in use: ISO ladder, analog gain, or neither.
     iso: bool = False
     gain: bool = False
-    aperture: bool = False
     focus_drive: bool = False
     #: Stream can be reframed by the sensor itself (hardware ROI / binning).
     live_view_zoom: bool = True

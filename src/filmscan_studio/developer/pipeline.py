@@ -116,7 +116,6 @@ class DeveloperPipeline:
             dark = CalibrationStack(
                 shutter=dark_exposure.shutter,
                 iso=dark_exposure.iso,
-                aperture=dark_exposure.aperture,
                 data=median,
                 noise=spread,
                 frame_count=len(frames),
@@ -128,7 +127,6 @@ class DeveloperPipeline:
             flat_stack = CalibrationStack(
                 shutter=flat_exposure.shutter,
                 iso=flat_exposure.iso,
-                aperture=flat_exposure.aperture,
                 data=flat,
                 frame_count=len(flat_paths),
             )

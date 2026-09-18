@@ -17,7 +17,6 @@ from __future__ import annotations
 from datetime import date
 
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -108,20 +107,6 @@ class FilmDialog(QDialog):
         self.type_class.setCurrentIndex(max(index, 0))
         film_form.addRow("Třída", self.type_class)
 
-        self.mirrored = QCheckBox(
-            "Zrcadlově (lev/prav) — skenuji matnou stranou k objektivu"
-        )
-        # The operator scans emulsion-side-to-lens as a rule (2026-09 brief):
-        # a first film starts ON; only a prior record that says otherwise — or
-        # an edited film that was explicitly OFF — unchecks it.
-        self.mirrored.setChecked(film_src.mirrored if defaults is not None
-                                 else (rig_defaults.mirrored if rig_defaults else True))
-        self.mirrored.setToolTip(
-            "Oznčí, že snímky jsou vodorovně převrácené. Zatím se pouze "
-            "ukládá do metadat; převracení obrazů zatím neběží."
-        )
-        film_form.addRow(self.mirrored)
-
         # -------------------------------------------------------- development
         dev_box = QGroupBox("Vyvolání")
         dev_form = QFormLayout(dev_box)
@@ -201,7 +186,6 @@ class FilmDialog(QDialog):
             camera=_text_or_none(self.camera),
             format=self.format.currentText().strip() or None,
             film_type_class=self.type_class.currentData(),
-            mirrored=self.mirrored.isChecked(),
             development=_text_or_none(self.development),
             development_start=_text_or_none(self.development_start),
             development_end=_text_or_none(self.development_end),

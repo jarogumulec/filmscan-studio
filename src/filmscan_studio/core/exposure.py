@@ -60,10 +60,13 @@ class ExposureSettings:
     #: Analog gain as a linear multiplier (1.0 = 1x). The Touptek's only
     #: sensitivity control; ``None`` on bodies that speak ISO instead.
     gain: float | None = None
-    aperture: float | None = None
+    #: No aperture: the rig's aperture is fixed on the lens and the acquisition
+    #: camera cannot drive one, so it never entered the exposure math anyway.
 
     def __post_init__(self) -> None:
-        if self.shutter <= 0:
+        # ``<=`` alone lets NaN through (every comparison with NaN is False),
+        # and a NaN shutter renders as the string "1/nan" — reject at the gate.
+        if not self.shutter > 0:
             raise ValueError("shutter must be a positive number of seconds")
         if self.iso is not None and self.iso <= 0:
             raise ValueError("iso must be positive")
@@ -71,16 +74,13 @@ class ExposureSettings:
             raise ValueError("gain must be a positive multiplier")
 
     def with_shutter(self, shutter: float) -> ExposureSettings:
-        return ExposureSettings(shutter, self.iso, self.gain, self.aperture)
+        return ExposureSettings(shutter, self.iso, self.gain)
 
     def with_iso(self, iso: int) -> ExposureSettings:
-        return ExposureSettings(self.shutter, iso, self.gain, self.aperture)
+        return ExposureSettings(self.shutter, iso, self.gain)
 
     def with_gain(self, gain: float) -> ExposureSettings:
-        return ExposureSettings(self.shutter, self.iso, gain, self.aperture)
-
-    def with_aperture(self, aperture: float | None) -> ExposureSettings:
-        return ExposureSettings(self.shutter, self.iso, self.gain, aperture)
+        return ExposureSettings(self.shutter, self.iso, gain)
 
     def stops_between(self, other: ExposureSettings) -> float:
         """EV difference from this setting to ``other`` (positive = other is brighter)."""
@@ -88,12 +88,10 @@ class ExposureSettings:
 
     @property
     def exposure_factor(self) -> float:
-        """Relative exposure, proportional to shutter/ISO and inversely to N^2."""
+        """Relative exposure, proportional to shutter/ISO (and inverse gain)."""
         base = self.shutter * (100.0 / self.iso if self.iso is not None else 1.0)
         if self.gain is not None:
             base /= self.gain
-        if self.aperture:
-            base /= self.aperture**2
         return base
 
     def shutter_string(self) -> str:
@@ -109,8 +107,7 @@ class ExposureSettings:
         return f"ISO {self.iso}" if self.iso is not None else "citlivost —"
 
     def __str__(self) -> str:
-        ap = f" f/{self.aperture:g}" if self.aperture else ""
-        return f"{self.shutter_string()}s {self.sensitivity_string()}{ap}"
+        return f"{self.shutter_string()}s {self.sensitivity_string()}"
 
 
 #: '1/60', '2.5', '0.0400 s' -> seconds. None for non-numeric speeds ('Bulb').
@@ -244,7 +241,6 @@ def choose_shutter(
     current: ExposureSettings,
     delta_ev: float,
     candidates: list[float],
-    prefer_aperture: float | None = None,
 ) -> float:
     """Pick the closest available shutter speed that applies ``delta_ev``.
 
