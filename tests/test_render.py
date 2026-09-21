@@ -84,6 +84,23 @@ class TestRenderDensity:
         b = render.render_density(d, params.with_exposure(1.0))[1, 1]
         assert b > a
 
+    def test_one_ev_shifts_axis_by_plus_log10_2(self, params) -> None:
+        """Dokument 07 §6: +1 EV = posun o +log10(2) D po hustotní ose.
+
+        Znaménko je kladné, protože pozitiv roste s hustotou (vyšší D =
+        světlejší scéna na negativu); „+EV = světlejší pozitiv" je uživatelský
+        kontrakt. Není to znaménko negadoctor „scan exposure bias" -- ten sits
+        na transmitanční ose před invertou.
+        """
+        d = np.array([[1.0]], dtype=np.float64)
+        x0 = render.positive_x(d, params)[0, 0]
+        x1 = render.positive_x(d, params.with_exposure(1.0))[0, 0]
+        assert x1 - x0 == pytest.approx(render.D_PER_STOP / params.span,
+                                        rel=1e-12)
+        # a D+log10(2) pri ev=0 je totej bod osy (důkaz posunu po ose, ne změny tvaru)
+        x_shift_d = render.positive_x(d + render.D_PER_STOP, params)[0, 0]
+        assert x_shift_d == pytest.approx(x1, rel=1e-12)
+
     def test_one_stop_shifts_net_density_by_log10_2(self, params) -> None:
         # +1 ev == moving both scale points down by one stop of density:
         # the same net-density axis, hence an identical render.
@@ -256,3 +273,76 @@ class TestShadowBand:
         p = render.RenderParams(dmin=0.2, dmax=2.6, shadow_band=0.1)
         out = render.render_density(np.array([[2.6]], dtype=np.float64), p)
         assert out[0, 0] == pytest.approx(1.0)
+
+
+class TestDoc08Acceptance:
+    """Akceptční testy dokumentu 08 (UI ladeni Dmin/Dmax a krivky)."""
+
+    def test_lower_dmax_stretches_mids_and_flags_over_range(self) -> None:
+        """Dmax níž roztáhne střed a světla; hodnoty nad novým Dmax se
+        označí jako ořez (x >= 1), ne zmizí ze světa (08 §6)."""
+        wide = render.RenderParams(dmin=0.6, dmax=3.0,
+                                   profile=FilmicProfile.neutral(),
+                                   shadow_band=0.0)
+        tight = render.RenderParams(dmin=0.6, dmax=2.2,
+                                    profile=FilmicProfile.neutral(),
+                                    shadow_band=0.0)
+        d = np.linspace(0.6, 3.0, 1000)
+        out_w = render.render_density(d, wide)
+        out_t = render.render_density(d, tight)
+        # spodní polovina rozsahu (D 0.6..1.4): užší škála roztáhne
+        mid = (d >= 0.6) & (d <= 1.4)
+        assert (out_t[mid].max() - out_t[mid].min()) > \
+               (out_w[mid].max() - out_w[mid].min())
+        # všechno nad novým Dmax je označeno ořezem na ose x
+        x_t = render.positive_x(d, tight)
+        assert np.all(x_t[d >= 2.2] >= 1.0)
+        assert np.all(x_t[d < 2.2] < 1.0)
+
+    def test_higher_gamma_steepens_mid_and_stays_monotone(self) -> None:
+        """Vyšší gamma zvýší kontrast kolem středu a zachová monotonnost
+        (08 §6)."""
+        lo = FilmicProfile(toe=0.2, gamma=1.0, shoulder=0.2)
+        hi = FilmicProfile(toe=0.2, gamma=2.0, shoulder=0.2)
+        x = np.linspace(0.4, 0.6, 201)     # pás kolem střední šedi
+        slope_lo = np.polyfit(x, lo.apply(x), 1)[0]
+        slope_hi = np.polyfit(x, hi.apply(x), 1)[0]
+        assert slope_hi > slope_lo
+        full = hi.apply(np.linspace(0, 1, 4096))
+        assert np.all(np.diff(full) >= -1e-9)
+
+    def test_shadow_band_is_not_a_second_dmin(self) -> None:
+        """Pás saha jen na oblast kolem a pod Dmin — jeho vliv k Dmax klesá
+        k nule (horní konec škály nehne). Ruční Dmin naproti tomu přesune
+        černý bod: jiná hustota je nový „nejčernější pozitiv" (08 §6)."""
+        span = 2.4
+        base = render.RenderParams(dmin=0.6, dmax=3.0,
+                                   profile=FilmicProfile.neutral(),
+                                   shadow_band=0.0)
+        with_band = render.RenderParams(dmin=0.6, dmax=3.0,
+                                        profile=FilmicProfile.neutral(),
+                                        shadow_band=0.1)
+        d = np.array([0.6, 1.8, 3.0])          # Dmin, střed, Dmax
+        dx = render.positive_x(d, with_band) - render.positive_x(d, base)
+        # účinek pásu je stupňovitý: spodek nejvíc, střed míň, vrchol se nehne
+        assert dx[0] > dx[1] > dx[2]
+        assert dx[2] == pytest.approx(0.0)     # Dmax zůstává přesně na bílé
+        # a ruční Dmin: černý bod sedí jinde — nula platí pro NOVOU hodnotu
+        lower = render.RenderParams(dmin=0.3, dmax=3.0,
+                                    profile=FilmicProfile.neutral(),
+                                    shadow_band=0.0)
+        assert float(render.render_density(np.array([0.3]), lower)[0]) \
+            == pytest.approx(0.0, abs=1e-9)
+        # stará hodnota Dmin je najednou světlejší pixel, ne nula
+        assert float(render.render_density(np.array([0.6]), lower)[0]) > 0.1
+
+    def test_gamma_display_leaves_render_density_alone(self) -> None:
+        """Změna gamma_display nezmění render_density (archivní rendering),
+        pouze render_for_display — tj. náhled a dolní histogram (08 §6)."""
+        d = np.linspace(0.2, 2.8, 256, dtype=np.float64)
+        a = render.RenderParams(dmin=0.2, dmax=2.8, gamma_display=1.0)
+        b = render.RenderParams(dmin=0.2, dmax=2.8, gamma_display=2.2)
+        assert np.allclose(render.render_density(d, a),
+                           render.render_density(d, b))
+        assert not np.allclose(render.render_for_display(d, a),
+                               render.render_for_display(d, b))

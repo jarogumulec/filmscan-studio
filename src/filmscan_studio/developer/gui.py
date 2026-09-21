@@ -32,9 +32,12 @@ Parametry (Dmin/Dmax, expozice, křivka) jsou **per-snímek** a pamatují se do
 zase. Úplně první otevření snímku bez historie používá Proposal (auto Dmin
 z film base, auto Dmax z p99,9, defaultní přirozená S-křivka).
 
-Za tónovou křivkou následuje zobrazovací gamma (``gamma_display``, default
-2,2) — shodná v náhledu i v exportu (WYSIWYG); export JPEG i TIFF se
-kvantizuje až za ní. Flat pro Capture One zůstává bez křivky i bez gammy.
+Za tónovou křivkou následuje zobrazovací gamma 2,2 (``gamma_display``) —
+shodná v náhledu i v exportu (WYSIWYG); export JPEG i TIFF se kvantizuje až
+za ní. Hodnota se v UI **nenastavuje**: je definována ICC profilem
+Gray Gamma 2.2, který exporty nesou (dokument 07; uživatel 2026-09-21).
+Flat pro Capture One zůstává bez křivky, bez gammy i bez profilu — je
+lineární v hustotě.
 """
 
 from __future__ import annotations
@@ -44,19 +47,18 @@ import logging
 import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
-import tifffile
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSlider,
-    QSizePolicy, QSplitter, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea,
+    QSlider, QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
 
 from filmscan_studio.core import density as dens
+from filmscan_studio.core import icc
 from filmscan_studio.core import render as rnd
 from filmscan_studio.core.filmic import FilmicProfile
 from filmscan_studio.developer.project import DevelopProject
@@ -345,8 +347,11 @@ class DensityHistogramWidget(QWidget):
       fotka je"); logaritmická výška, ať i slabá mása není neviditelná,
     * svislé čáry Dmin (šedá) a Dmax (oranžová) -- kde jsem *řekl*, že rozsah
       je; mimosvět mezi nimi je na tisku mrtvá zóna,
-    * bílá křivka -- kam který D dopadá na výstupu (0 = černá, 1 = bílá),
-      včetně expozice: posun křivky doleva = víc světla.
+    * bílá křivka -- diagnostika tónové mapy: kam který D dopadá v lineárním
+      pozitivu (0 = černá, 1 = bílá), včetně expozice a stínového pásu.
+      BEZ zobrazovací gammy (dokument 07): zobrazovací transfer patří do
+      dolního výstupního histogramu a do náhledu, ne do tvaru S-křivky --
+      jinak v ní uživatel vidí hrb monitorové charakteristiky.
 
     ±inf hustoty se kreslí jako plné sloupce na kolejnicích (vlevo −inf =
     přepal, vpravo +inf = neprostupno) a NaN („bez světla") jen jako číslo --
@@ -445,12 +450,14 @@ class DensityHistogramWidget(QWidget):
                 p.setPen(pen)
                 p.drawLine(x, 0, x, h)
                 p.drawText(x + 3, 12, label)
-            # Promítnutá křivka: jaký D -> jaký tisk (vč. expozice, stínového
-            # pásu i zobraz. přenosu -- musí odpovídat tomu, co skutečně vidí
-            # monitor; positive_x je jedný zdroj pravdy pro obě osy).
+            # Promítnutá křivka: jaký D -> jaký tisk (vč. expozice i stínového
+            # pásu; positive_x je jedný zdroj pravdy pro obě osy). Jen DO
+            # lineárního pozitivu -- bez display gammy (dokument 07): bílá
+            # křivka je diagnostika tónové mapy, monitorový transfer patří
+            # do dolního histogramu a náhledu.
             p.setPen(QPen(QColor(255, 255, 255), 2))
             xs = np.linspace(self._xmin, self._xmax, 256)
-            out = rnd.render_for_display(xs, self._params)
+            out = rnd.render_density(xs, self._params)
             p.drawPolyline(QPolygon([
                 QPoint(self._d_to_x(float(dv)),
                        h - int(float(o) * (h - 2)))
@@ -497,13 +504,15 @@ class OutputHistogramWidget(QWidget):
 
     D histogram výše odpovídá „kde film má data"; tenhle „co z toho zbylo po
     křivce a gammě". Počítá se jen z výřezu (ROI) — mimo rámček nic neexportu-
-    jeme. Ořez na koncích stupnice (saturace bílá / podčerně) měříme na ose
-    renderu stejně jako overlay exposure warningu — ne na hodnotě po gammě,
-    kde je 0,98 jen světlý pixel, ne saturace; hlásí ho jen text nahoře.
-    Data končí v otevřených binech, takže signál s maximem 0,98 už u pravé
-    hrany nedělá falešný hřeben. Žádné překryvy — ani kurzor (uživatel
-    2026-09-21: „dej jej pryč, druhý histogram nemusí žádné překryvy“);
-    orientaci v pixelu dává histogram hustoty nad ním a status pod ním.
+    jeme. Ořez na koncích stupnice (saturace bílá / podčerně) měříme výhradně
+    na ose renderu x, tedy ve stejné doméně jako overlay exposure warningu —
+    ne na hodnotě po gammě: páčky jas/kontrast uříznou display na 1,0 i když
+    křivka ani zdaleka nedosáhla bílé, a histogram by křičel „přepálená
+    bílá", kde overlay nemá jedinou červenou. Data končí v otevřených binech,
+    takže signál s maximem 0,98 už u pravé hrany nedělá falešný hřeben.
+    Jediné překryv je oranžová kurzorová čára (uživatel 2026-09-21 večer:
+    „udělej ještě v dolním histogramu podobnou jezdící oranžovou linku co je
+    v horním“ — ruší ranní zákaz překryvů); kolejnice tu pořád nejsou.
     """
 
     BINS = 96
@@ -513,6 +522,7 @@ class OutputHistogramWidget(QWidget):
         self._hist: np.ndarray | None = None
         self._hi_pct = 0.0
         self._lo_pct = 0.0
+        self._cursor_out: float | None = None   # display hodnota pod kurzorem
         self.setMinimumHeight(90)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Fixed)
@@ -530,16 +540,22 @@ class OutputHistogramWidget(QWidget):
             return
         a = np.asarray(out, dtype=np.float64).ravel()
         finite = np.isfinite(a)
-        # Ořez na koncích stupnice: buď ho udělala už křivka (x mimo 0..1),
-        # nebo až kontrast/jas za gammou. Světlý pixel 0,98 do toho nepatří —
-        # saturace je x >= 1, ne „blízko bílé". NaN („bez světla") se v exportu
-        # lijí do černé, proto spadá pod stíny.
-        clip_hi = (a >= 1.0) | np.isposinf(a)
-        clip_lo = ((a <= 0.0) & finite) | np.isneginf(a) | np.isnan(a)
+        # Ořez na koncích stupnice se počítá VÝHRADNĚ na ose x — tj. ve stejné
+        # doméně jako overlay exposure warningu v náhledu. Hodnota po gammě do
+        # toho nepatří: páčky jas/kontrast uříznou display na 1,0 i když se
+        # křivka k bílé ani nepřiblížila (x < 1), a histogram by křičel
+        # „přepálená bílá", kde overlay nemá jedinou červenou. Světlý pixel
+        # 0,98 do saturace taky nepatří — saturace je x >= 1, ne „blízko bílé".
+        # NaN („bez světla") se v exportu lijí do černé, proto spadá pod stíny.
         if x is not None:
             xv = np.asarray(x, dtype=np.float64).ravel()
-            clip_hi |= (xv >= 1.0) | np.isposinf(xv)
-            clip_lo |= ((xv <= 0.0) & ~np.isnan(xv)) | np.isneginf(xv)
+            clip_hi = (xv >= 1.0) | np.isposinf(xv)
+            clip_lo = ((xv <= 0.0) & ~np.isnan(xv)) | np.isneginf(xv)
+        else:
+            # Bez x se ořez změřit nedá (display už je oříznutý) — aspoň
+            # odhad z hodnot po gammě; rerender posílá x vždycky.
+            clip_hi = (a >= 1.0) | np.isposinf(a)
+            clip_lo = ((a <= 0.0) & finite) | np.isneginf(a) | np.isnan(a)
         self._hi_pct = float(clip_hi.mean()) * 100.0 if a.size else 0.0
         self._lo_pct = float(clip_lo.mean()) * 100.0 if a.size else 0.0
         # Saturované pixily (== 1,0) nepatří do posledního datového sloupce,
@@ -553,6 +569,17 @@ class OutputHistogramWidget(QWidget):
             counts, _ = np.histogram(vals, bins=self.BINS, range=(0.0, 1.0))
             peak = float(counts.max())
             self._hist = counts / peak if peak > 0 else np.zeros(self.BINS)
+        self.update()
+
+    def set_cursor_output(self, out_val: float | None) -> None:
+        """Zobrazí/zmaže oranžovou svislou čáru na výstupu pod kurzorem.
+
+        Hodnota je display 0..1 (táž osa jako histogram); mimoscope hodnoty
+        (NaN „bez světla", ±inf) čáru nemažou pozicí — widget nemá co ukázat,
+        jde pryč.
+        """
+        self._cursor_out = (out_val if out_val is not None
+                            and np.isfinite(out_val) else None)
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -579,6 +606,15 @@ class OutputHistogramWidget(QWidget):
         p.drawPolygon(QPolygon(pts))
         p.setPen(QColor(220, 220, 220))
         p.drawPolyline(QPolygon(pts[1:-1]))
+
+        # Kurzor: oranžová svislá čára na display hodnotě pixelu pod myší —
+        # stejná barva a gesto jako v horním histogramu (osa je ale 0..1,
+        # ne hustota). Data mapují na (right-1), takže čára sedí na sloupek.
+        if self._cursor_out is not None:
+            cx = int(self._cursor_out * (right - 1))
+            p.setPen(QPen(QColor(255, 140, 0), 2))
+            p.drawLine(cx, 0, cx, h)
+
         p.setPen(QColor(200, 200, 200))
         p.drawText(6, 12, f"výstup (výřez) · podčerně {self._lo_pct:.1f} %"
                           f" · saturace {self._hi_pct:.1f} %")
@@ -636,9 +672,10 @@ class MainWindow(QMainWindow):
         sv.addWidget(self.lbl_hist_stats)
         self.out_histogram = OutputHistogramWidget()
         sv.addWidget(self.out_histogram)
-        self.lbl_status = QLabel("—")
-        self.lbl_status.setWordWrap(True)
-        sv.addWidget(self.lbl_status)
+        # (status řádek tu byl — uživatel 2026-09-21 večer „celé to dej pryč":
+        # duplikoval stats pod horním histogramem a při hoveru přeskakoval
+        # nastavovátka pod sebou. Zpráwy chodí do spodní lišty okna, ta se
+        # nikdy nepřeskupuje.)
         self.chk_warn = QCheckBox("Exposure warning (světla červeně, stíny modře)")
         self.chk_warn.toggled.connect(self.view.set_warning)
         sv.addWidget(self.chk_warn)
@@ -686,13 +723,26 @@ class MainWindow(QMainWindow):
         Obousměrné spojení v celých číslech: obě páčky mají rozlišení 1/scale,
         takže se navzájem rozkmitat nemohou (setValue bez změny signál pošle
         až na výstřel, ten druhý setValue už změnu nevidí).
+
+        Jezdec má od reorganizace 08 *běžný* rozsah, pole nad ním (kolena
+        do 1,66, gamma do 4,0). Hodnota mimo jezdec se nesmí ztratit: pole si
+        ji drží, jezdec se jen zaparkuje na kraj bez zpětného přepsání — jinak
+        by načtené starší nastavení (toe 1,0) řetězec jezdec→pole ořízl na
+        hranu jezdce (0,8) a tiše přepsal export i uložená nastavení.
         """
 
         def s2p(v: int) -> None:
             spin.setValue(v / scale)
 
         def p2s(v: float) -> None:
-            slider.setValue(int(round(v * scale)))
+            target = int(round(v * scale))
+            if slider.minimum() <= target <= slider.maximum():
+                slider.setValue(target)
+            else:
+                was = slider.blockSignals(True)
+                slider.setValue(max(slider.minimum(),
+                                    min(target, slider.maximum())))
+                slider.blockSignals(was)
 
         slider.valueChanged.connect(s2p)
         spin.valueChanged.connect(p2s)
@@ -703,14 +753,29 @@ class MainWindow(QMainWindow):
         form.addRow(name, row)
 
     def _build_scale_box(self) -> QGroupBox:
-        box = QGroupBox("Stupně (hustoty)")
+        """Meritko filmu (dok 08 §5): Dmin, Dmax, tolerance pod Dmin.
+
+        Dmin/Dmax nejsou kontrastové ovladače — určují, jaká část hustotní
+        osy filmu se mapuje do výstupu (08 §1). Kontrast je až křivka níž.
+        """
+        box = QGroupBox("Meritko filmu")
         form = QFormLayout(box)
         self.spin_dmin = self._spin(0.0, 2.0, 0.2, 0.01, decimals=3)
-        self.chk_dmin_auto = QCheckBox("z měření film base")
+        self.chk_dmin_auto = QCheckBox("auto: z měření film base")
         self.chk_dmin_auto.setChecked(True)
         self.spin_dmax = self._spin(0.2, 5.0, 2.6, 0.05, decimals=3)
-        self.chk_dmax_auto = QCheckBox("auto ze snímku (p99,9 + okraj)")
+        # Stav i přepínač v jedné masce (08 §5): auto je PRACOVNÍ návrh
+        # p99,9 + 0,05 D, ne vlastnost emulze; odškrtnutím ho převezmeš ručně.
+        self.chk_dmax_auto = QCheckBox("auto: návrh p99,9 + 0,05 D")
         self.chk_dmax_auto.setChecked(True)
+        # Tolerance pod Dmin (shadow band) rozšiřuje definiční obor křivky POD
+        # Dmin — co se slilo do černé už nevytáhne, ale gradient mléka mezi
+        # prahem měření a Dmin zůstane. Není to druhé Dmin (08 §3 krok 6).
+        # Jezdec jen běžné ladění 0,00–0,08 D; pole pojme i starší uložené
+        # hodnoty až 0,30 — při načtení se nesmí tiše oříznout (data už
+        # exportovaná s 0,30 musí zůstat reprodukovatelná).
+        self.sl_sb = self._slider(0, 8, 1)            # 0,00 … 0,08 D
+        self.spin_sb = self._spin(0.0, 0.30, 0.01, 0.01, decimals=2)
         # Výstředník: interně 1/100 EV (jemný krok), jezdec ladí po 0,05,
         # textové pole pojme i hodnotu mimo krok (0,15 = 3 ticky).
         self.sl_ev = self._slider(-600, 600, 0)     # ±6 EV
@@ -723,8 +788,21 @@ class MainWindow(QMainWindow):
         form.addRow("", self.chk_dmin_auto)
         form.addRow("Dmax [D]", self.spin_dmax)
         form.addRow("", self.chk_dmax_auto)
+        self._bind_row(form, "Tolerance pod Dmin [D]", self.sl_sb, self.spin_sb)
         self._bind_row(form, "Expozice", self.sl_ev, self.spin_ev)
         form.addRow("", self.btn_defaults)
+
+        self.spin_dmin.setToolTip("Čiré podloží = nejčernější pozitiv. "
+                                  "Bez měření film base je ruční hodnota jen "
+                                  "relativní odhad (08 §3).")
+        self.spin_dmax.setToolTip("Pracovní maximum hustoty: posuň tak, aby "
+                                  "obsáhlo nejhustší užitečné obrazové hodnoty "
+                                  "z horního histogramu, ale zbytečně "
+                                  "nesahalo daleko za ně (08 §3 krok 2).")
+        self.spin_sb.setToolTip("Tolerance měření pod Dmin — mírně podbase "
+                                "hodnoty nesplývají do jedné černě. "
+                                "Nevrací detail fyzicky ořezaný; vyšší hodnota "
+                                "zvedá a vyprává černou (08 §3 krok 6).")
 
         self.spin_dmin.valueChanged.connect(self._setting_changed)
         self.spin_dmax.valueChanged.connect(self._setting_changed)
@@ -734,37 +812,54 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_curve_box(self) -> QGroupBox:
-        box = QGroupBox("Tónová křivka (S, monotónní)")
+        """Fotografická křivka (dok 08 §2): Toe / Kontrast středu / Rameno.
+
+        Rozsahy jezdce jsou *běžné ladění* (08 §2): toe/shoulder 0,00–0,80,
+        gamma 0,80–2,50. Model i textová pole ponechávají nadrazec — kolena
+        až 1,666 (= kotva 0,25 / dráha 0,15: koleno dosáhne konce a daný
+        konec se stlačí na šepot, stále monotónně), gamma 0,10–4,00, aby se
+        hodnota ze starých uložených nastavení nenačetla tiše oříznutá.
+        Nad rozsah jezdce je jen speciální komprese konců, ne fotografie.
+        """
+        box = QGroupBox("Tónová křivka")
         form = QFormLayout(box)
-        # Kolena až 1,66 (= kotva 0,25 / dráha 0,15): tam koleno dosáhne
-        # konců a daný konec se stlačí na šepot — stále monotónní, bez řezu.
-        self.sl_toe = self._slider(0, 166, 35)
-        self.spin_toe = self._spin(0.0, 1.66, 0.35, 0.01)
-        self.sl_gamma = self._slider(10, 400, 110)
-        self.spin_gamma = self._spin(0.10, 4.0, 1.10, 0.01)
-        self.sl_shoulder = self._slider(0, 166, 45)
-        self.spin_shoulder = self._spin(0.0, 1.66, 0.45, 0.01)
+        self.sl_toe = self._slider(0, 80, 20)
+        self.spin_toe = self._spin(0.0, 1.66, 0.20, 0.01)
+        self.sl_gamma = self._slider(80, 250, 135)
+        self.spin_gamma = self._spin(0.10, 4.0, 1.35, 0.01)
+        self.sl_shoulder = self._slider(0, 80, 20)
+        self.spin_shoulder = self._spin(0.0, 1.66, 0.20, 0.01)
         self._bind_row(form, "Patka (toe)", self.sl_toe, self.spin_toe)
-        self._bind_row(form, "Gamma (prostřed)", self.sl_gamma, self.spin_gamma)
+        # „Kontrast středu (gamma)", ne „sklon křivky": kombinovaná křivka má
+        # kvůli spline před gamma krokem vlastní sklon (dok 07 §7); název
+        # podle dok 08 §5 nahrazuje dřívější „Středový kontrast".
+        self._bind_row(form, "Kontrast středu (gamma)", self.sl_gamma,
+                       self.spin_gamma)
         self._bind_row(form, "Rameno (shoulder)", self.sl_shoulder,
                        self.spin_shoulder)
+        self.spin_toe.setToolTip("Komprese spodního konce — vyšší hodnota "
+                                 "stlačí stíny, NENÍ záchrana ztracených "
+                                 "pixelů (08 §3 krok 4).")
+        self.spin_gamma.setToolTip("Hlavní ovladač oddělení stínů a světel: "
+                                   "1,00 téměř lineární, 1,35–1,70 běžný "
+                                   "kontrast, nad 2,20 tvrdý speciál "
+                                   "(08 §2, začni kolem 1,35).")
+        self.spin_shoulder.setToolTip("Komprese horního konce — jemné gradace "
+                                      "před bílým ořezem. Než ji zvedneš, "
+                                      "zkontroluj Dmax (08 §3 krok 5).")
         return box
 
     def _build_display_box(self) -> QGroupBox:
-        """Zobrazovací přenos za křivkou — technický, ne kreativní.
+        """Zobrazovací přenos za křivkou — technický, ne kreativní (08 §5).
 
-        Gamma křivky výše je středový kontrast; tohle je transfer monitoru
-        (darktable: output profile). Stínový pás (shadow band) rozšiřuje
-        definiční obor křivky POD Dmin — co se slilo do černé už nevytáhne
-        (pod prahem měření nic není), ale gradient mléka mezi prahem a Dmin
-        zůstane. Náhled i export použijí totéž — WYSIWYG.
+        Display gamma je pevných 2,2 daných profilem Gray Gamma 2.2 — v UI
+        žádná páčka (uživatel 2026-09-21: „odstranit možnost výstupní gammu
+        upravovat — bude definována profilem") a při tónování se nemá měnit
+        (08 §2). Náhled i export použijí totéž — WYSIWYG, export navíc ponese
+        ICC profil se stejnou TRC.
         """
-        box = QGroupBox("Zobrazení (za křivkou)")
+        box = QGroupBox("Zobrazení")
         form = QFormLayout(box)
-        self.sl_gd = self._slider(100, 300, 220)      # 1,00 … 3,00
-        self.spin_gd = self._spin(1.0, 3.0, 2.2, 0.01)
-        self.sl_sb = self._slider(0, 30, 1)           # 0,00 … 0,30 D
-        self.spin_sb = self._spin(0.0, 0.30, 0.01, 0.01, decimals=2)
         # Jas a kontrast v display prostoru (za gammou) — Photoshop zvyk.
         # kontrast kolem zobrazené střední šedi 0,5; jas posun. Nejsou
         # expozice: ta sahá na hustotní osu (co film viděl).
@@ -772,28 +867,47 @@ class MainWindow(QMainWindow):
         self.spin_br = self._spin(-0.5, 0.5, 0.0, 0.01)
         self.sl_ct = self._slider(10, 400, 100)       # 0,10 … 4,00
         self.spin_ct = self._spin(0.1, 4.0, 1.0, 0.01)
-        self._bind_row(form, "Display gamma", self.sl_gd, self.spin_gd)
-        self._bind_row(form, "Stínový pás [D]", self.sl_sb, self.spin_sb)
+        form.addRow("Display gamma", QLabel("2,2 — dáno profilem"))
         self._bind_row(form, "Jas (display)", self.sl_br, self.spin_br)
         self._bind_row(form, "Kontrast (display)", self.sl_ct, self.spin_ct)
         return box
 
+    #: Formáty exportu: (popisek combo, metoda). Popisky říkají bitovou hloubku
+    #: a barevný prostor — gray cesty nesou Gray Gamma 2.2 (dok 07), RGB cesty
+    #: kompatibilní sRGB (uživatel 2026-09-21: „místo několika čudlíů
+    #: rozbalovací seznam a vedle export" + „přidej jpeg v sRGB a 10bit heic").
+    EXPORT_FORMATS = (
+        ("Pozitiv — TIFF 16b gray (Gray Gamma 2,2)", "save_render"),
+        ("JPEG 8b gray (Gray Gamma 2,2)", "save_jpeg"),
+        ("JPEG 8b sRGB (kompatibilita)", "save_jpeg_srgb"),
+        ("HEIC 10b sRGB (Apple, RGB)", "save_heic"),
+        ("HEIF 10b mono (Gray Gamma 2,2)", "save_heic_mono"),
+        ("Flat pro Capture One — TIFF 16b", "save_flat"),
+        ("Hustotní archiv — TIFF 32b", "save_density"),
+    )
+
     def _build_export_box(self) -> QGroupBox:
         box = QGroupBox("Export")
         h = QVBoxLayout(box)
-        self.btn_save_density = QPushButton("Uložit hustotní archiv (32b)")
-        self.btn_save_density.clicked.connect(self.save_density)
-        self.btn_save_render = QPushButton("Exportovat pozitiv (16b)")
-        self.btn_save_render.clicked.connect(self.save_render)
-        self.btn_save_flat = QPushButton("Exportovat flat pro Capture One")
-        self.btn_save_flat.clicked.connect(self.save_flat)
-        self.btn_save_jpeg = QPushButton("Exportovat JPEG (8b, sRGB)")
-        self.btn_save_jpeg.clicked.connect(self.save_jpeg)
-        for b in (self.btn_save_density, self.btn_save_render,
-                  self.btn_save_flat, self.btn_save_jpeg):
-            b.setEnabled(False)
-            h.addWidget(b)
+        # Jeden seznam + jedno tlačítko místo čtyř čudlíů (uživatel
+        # 2026-09-21). Combo nese i formáty, které nejsou display-referred
+        # (flat, archiv) — pravidla pro ICC/encoding mají vlastní, ta
+        # vyřizuje metoda, ne výběr.
+        self.cmb_export = QComboBox()
+        self.cmb_export.addItems([label for label, _ in self.EXPORT_FORMATS])
+        self.btn_export = QPushButton("Export")
+        self.btn_export.clicked.connect(self.export_current)
+        self.btn_export.setEnabled(False)
+        row = QHBoxLayout()
+        row.addWidget(self.cmb_export, 1)
+        row.addWidget(self.btn_export)
+        h.addLayout(row)
         return box
+
+    def export_current(self) -> None:
+        """Volba ze seznamu → příslušná exportová metoda."""
+        _label, method = self.EXPORT_FORMATS[self.cmb_export.currentIndex()]
+        getattr(self, method)()
 
     # ------------------------------------------------------------- actions
 
@@ -847,10 +961,16 @@ class MainWindow(QMainWindow):
             self.histogram.set_density(None)
             self.view.set_image(None, None)
             self.view.set_placeholder(f"Snímek nelze změřit: {exc}")
-            self.lbl_status.setText(f"Chyba měření {name}: {exc}")
+            self.statusBar().showMessage(f"Chyba měření {name}: {exc}")
             return
         d, prov = self._density
         self._current = name
+        if getattr(prov, "flat_fallback", False):
+            # Varování z bývalého status řádku — spodní lišta se nepřeskupuje
+            # a hover ji nepřepíše (zpráwy pixelu z ní odešly taky).
+            self.statusBar().showMessage(
+                "⚑ bez flat snímku — náhled je relativní (k nejjasnějším "
+                "0,1 %); Dmin zadej ručně")
         self._loading = True
         try:
             # Uložený ROI je v souřadnicích senzoru; náhled je otočený —
@@ -868,12 +988,9 @@ class MainWindow(QMainWindow):
                                   dmin_manual=self._dmin_auto is None)
         finally:
             self._loading = False
-        self._update_status(d, prov)
         self.histogram.set_density(d)
         self.lbl_hist_stats.setText(self.histogram.stats_text())
-        for b in (self.btn_save_density, self.btn_save_render,
-                  self.btn_save_flat, self.btn_save_jpeg):
-            b.setEnabled(True)
+        self.btn_export.setEnabled(True)
         self.rerender()
 
     # ----------------------------------------------------------- parametry
@@ -881,9 +998,11 @@ class MainWindow(QMainWindow):
     def _proposal(self, name: str) -> rnd.RenderParams:
         """První náhled snímku bez historie: auto body + přirozená křivka.
 
-        Defaultní S-ko (toe 0,35 / gamma 1,10 / shoulder 0,45) sedí svahem
-        ~0,6 výstupu na D = strmosti negadoctor BW presetu — „přirozeně
-        vypadající" tisk bez zásahu. Žádné volitelné S-ko navíc."""
+        Výchozí S-ko je pracovní start dok 08 (toe 0,20 / gamma 1,35 /
+        shoulder 0,20): jemný přirozený kontrast, kolena jen lehce zabraná —
+        patka a rameno komprimují konce, nenahrazují špatně nastavené
+        Dmin/Dmax. (Starší negadoctor-svah 0,35/1,10/0,45 nahrazen
+        2026-09-21 reorganizací 08.)"""
         assert self.project is not None
         dmin = self._dmin_auto if self._dmin_auto is not None else 0.2
         # Bez měření base (typicky flatless náhled) může relativní D spodek
@@ -922,8 +1041,7 @@ class MainWindow(QMainWindow):
         self.spin_gamma.setValue(params.profile.gamma)
         self.sl_shoulder.setValue(int(round(params.profile.shoulder * 100)))
         self.spin_shoulder.setValue(params.profile.shoulder)
-        self.sl_gd.setValue(int(round(params.gamma_display * 100)))
-        self.spin_gd.setValue(params.gamma_display)
+        # gamma_display nema ovladac — je dana profilem (icc.GAMMA_DISPLAY)
         self.sl_sb.setValue(int(round(params.shadow_band * 100)))
         self.spin_sb.setValue(params.shadow_band)
         self.sl_br.setValue(int(round(params.brightness * 100)))
@@ -943,7 +1061,10 @@ class MainWindow(QMainWindow):
                                   shoulder=self.spin_shoulder.value()),
             dmax_source="frame" if self.chk_dmax_auto.isChecked()
             else "manual",
-            gamma_display=self.spin_gd.value(),
+            # Gamma display se nenastavuje: drzi se kroky ICC profilu
+            # (Gray Gamma 2,2), ktery exporty nesou. Ulozene hodnoty z drivych
+            # sezeni se pri nacteni prepisou — kontrakt nadejsi.
+            gamma_display=icc.GAMMA_DISPLAY,
             shadow_band=self.spin_sb.value(),
             brightness=self.spin_br.value(),
             contrast=self.spin_ct.value(),
@@ -1043,9 +1164,8 @@ class MainWindow(QMainWindow):
             self._density = self.project.build_density(item.text(),
                                                        crop=False)
         except Exception as exc:  # noqa: BLE001
-            self.lbl_status.setText(f"Chyba měření: {exc}")
+            self.statusBar().showMessage(f"Chyba měření: {exc}")
             return
-        self._update_status(*self._density)
         self.histogram.set_density(self._density[0])
         self.lbl_hist_stats.setText(self.histogram.stats_text())
         self.rerender()
@@ -1053,30 +1173,22 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- status
 
     def _pixel_hovered(self, payload) -> None:
-        """Kurzor v náhledu: oranžová čára v histogramu + čísla do statusu.
+        """Kurzor v náhledu: oranžová čára v obou histogramech.
 
         ``payload`` je (D, out) z :class:`DensityView`, nebo None mimo snímek
-        -- pak se smaže čára a status se vrátí na popis měření.
+        -- pak se čáry smažou. Žádný text: numerický status řádek v pravém
+        panelu byl odstraněn (uživatel 2026-09-21 večer — duplikoval stats
+        a při hoveru přeskakoval nastavovátka pod sebou).
         """
         if payload is None:
             self.histogram.set_cursor_density(None)
-            if self._density is not None:
-                self._update_status(*self._density)
+            self.out_histogram.set_cursor_output(None)
             return
         d_val, out_val = payload
         self.histogram.set_cursor_density(
             None if not np.isfinite(d_val) else d_val)
-        d_txt = ("—          " if not np.isfinite(d_val)
-                 else f"{d_val:+.3f} D")
-        inf_txt = (" (přepal→černá)" if d_val == -np.inf
-                   else " (nad škálu→bílá)" if d_val == np.inf
-                   else " (bez světla)" if np.isnan(d_val) else "")
-        self.lbl_status.setText(
-            f"pixel D {d_txt}{inf_txt} · pozitiv {out_val:.3f}")
-
-    @staticmethod
-    def _fmt(v: float) -> str:
-        return f"{v:.2f}".replace(".", ",")
+        self.out_histogram.set_cursor_output(
+            None if not np.isfinite(out_val) else out_val)
 
     def _dmin_toggled(self) -> None:
         if self._loading:
@@ -1098,31 +1210,6 @@ class MainWindow(QMainWindow):
                                    + self.spin_dmax.singleStep(), 3))
             self.spin_dmax.setValue(dmax)
         self._setting_changed()
-
-    def _update_status(self, d: np.ndarray,
-                       prov: dens.DensityProvenance) -> None:
-        s = dens.density_stats(d)
-        parts = [
-            prov.source,
-            f"{prov.shutter * 1000:.2f} ms",
-            f"platno {s['valid_fraction'] * 100:.1f} %",
-            f"D p50/p99: {self._fmt(s['d_p50'])}/{self._fmt(s['d_p99'])}",
-        ]
-        if prov.flat_fallback:
-            parts.append("⚑ bez flat snímku — náhled je relativní "
-                         "(k nejjasnějším 0,1 %); Dmin zadej ručně")
-        nan_fraction = float(np.isnan(d).mean())
-        if nan_fraction > 0.0:
-            parts.append(f"bez světla {nan_fraction * 100:.1f} %")
-        if s["valid_fraction"] < 0.85:
-            parts.append("⚑ málo platných pixelů — zkontroluj ROI")
-        if (s["valid_fraction"] > 0 and s["d_p50"] < 0.05
-                and not prov.flat_fallback):
-            # u relativního měření bez flatu je nula definiční, ne signál
-            parts.append("⚑ medián D ~ 0 — je ve snímku film?")
-        if self._dmin_auto is not None:
-            parts.append(f"Dmin měřeno {self._dmin_auto:.3f}")
-        self.lbl_status.setText(" · ".join(parts))
 
     # -------------------------------------------------------------- export
 
@@ -1147,7 +1234,7 @@ class MainWindow(QMainWindow):
         stem = Path(prov.source).stem
         path = dens.write_density_tiff(
             self._derived_dir() / f"{stem}.density.tif", d, prov)
-        self.lbl_status.setText(f"Uloženo: {path}")
+        self.statusBar().showMessage(f"Uloženo: {path}", 8000)
 
     def save_render(self) -> None:
         self._export_render(flat=False)
@@ -1155,28 +1242,114 @@ class MainWindow(QMainWindow):
     def save_flat(self) -> None:
         self._export_render(flat=True)
 
-    def save_jpeg(self) -> None:
-        """8b JPEG = totéž co náhled (vč. display gammy)."""
+    def _display_render(self) -> tuple[np.ndarray, rnd.RenderParams, str] \
+            | None:
+        """Společný základ display-referred exportů: ROI → orientace → render.
+
+        Vrací (display 0..1 s NaN, params, stem) nebo None. Uloží nastavení,
+        aby export i metadata sdílely tytéž parametry. NaN nechává na
+        volajícím — každý formát ho lijí do černé jinak (8b rint, 10b posun).
+        """
         cropped = self._cropped_density()
         if cropped is None or self.project is None:
-            return
+            return None
         d, prov = cropped
+        # Uložená orientace: totéž co vidí náhled. Archiv above flipem zůstává.
         d = self.project.orientation_apply(d)
         params = self.current_params()
         self.project.frame_settings[prov.source] = self._settings_payload()
         self.project.save_settings()
         display = rnd.render_for_display(d, params)
+        return display, params, Path(prov.source).stem
+
+    def save_jpeg(self) -> None:
+        """8b gray JPEG = totéž co náhled (vč. gammy 2,2) + ICC profil.
+
+        Profil se jen ZAPÍŠE (APP2), pixely se nepřevádějí — gamma už proběhla
+        právě jednou v apply_display(). Skutečný jednokanálový gray (režim L),
+        ne BGR se třemi identickými kanály jako kdysi přes cv2.
+        """
+        got = self._display_render()
+        if got is None:
+            return
+        display, params, stem = got
         # NaN = „bez světla" -> černá (nan_fill); JPEG nezná NaN.
         data = np.rint(np.where(np.isfinite(display), display, 0.0)
                        * 255.0).astype(np.uint8)
-        stem = Path(prov.source).stem
         out = self._derived_dir() / f"{stem}.jpg"
-        # OpenCV je BGR — i pro 3 identické kanály držíme konvenci pipeline.
-        cv2.imwrite(str(out),
-                    np.ascontiguousarray(np.dstack([data] * 3)[:, :, ::-1]),
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
-        self.lbl_status.setText(
-            f"Exportováno: {out.name} · fingerprint {params.fingerprint()}")
+        profile = icc.profile_for(params.gamma_display)
+        icc.write_gray_jpeg(out, data, profile)
+        self.statusBar().showMessage(
+            f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
+            f" · {icc.PROFILE_NAME}")
+
+    def save_jpeg_srgb(self) -> None:
+        """8b RGB JPEG — gray pixely jako R=G=B, kompatibilní sRGB profil.
+
+        Pro čtečky/prohlížeče, se kterými single-channel gray JPEG dělá potíže.
+        Pixely se NEPŘEVÁDĚJÍ do sRGB gammy: gamma 2,2 z apply_display() už v
+        nich je, R=G=B je achromatické (primáry nejsou co rozmotat), profil je
+        kompatibilní obal. Odliší se od gray cesty jen příponou _srgb.
+        """
+        got = self._display_render()
+        if got is None:
+            return
+        display, params, stem = got
+        g = np.rint(np.where(np.isfinite(display), display, 0.0)
+                    * 255.0).astype(np.uint8)
+        rgb = np.dstack([g, g, g])
+        out = self._derived_dir() / f"{stem}.srgb.jpg"
+        profile = icc.build_srgb_profile()
+        icc.write_srgb_jpeg(out, rgb, profile)
+        self.statusBar().showMessage(
+            f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
+            f" · {icc.SRGB_PROFILE_NAME}")
+
+    def save_heic(self) -> None:
+        """10b RGB HEIC — hlubší bitová hloubka, Apple/ProApps kompatibilní.
+
+        Totéž renderování co JPEG, jen 10 bitů/kanál přes HEVC (pillow-heif),
+        R=G=B + sRGB profil. Apple monochrom HEIC sice zvládá, ale RGB je pro
+        uživatele jistota napříč čtečkami (2026-09-21).
+
+        Pozor na konvenci `pillow_heif.encode("RGB;16", ...)`: 16b vstup se
+        bere jako MAX-ŠKÁLOVANÝ (0..65535 → 0..2^bit_depth); enkoder sám
+        škáluje `>>6` na 10b. Dřívější ruční `>>6` předání hodnot 0..1023
+        enkoder posunul podruhé → HEVC uložil jen ~1 % světla a náhledy
+        byly rozbité (uživatel 2026-09-21: „heic zrovnatak“).
+        """
+        got = self._display_render()
+        if got is None:
+            return
+        display, params, stem = got
+        q16 = rnd.quantise16(display)                 # 0..65535, NaN -> černá
+        rgb = np.dstack([q16, q16, q16]).astype(">u2")  # pillow_heif sám škáluje
+        out = self._derived_dir() / f"{stem}.srgb10.heic"
+        profile = icc.build_srgb_profile()
+        icc.write_srgb_heic(out, rgb, profile)
+        self.statusBar().showMessage(
+            f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
+            f" · {icc.SRGB_PROFILE_NAME} 10b")
+
+    def save_heic_mono(self) -> None:
+        """10b monochromatické HEIF — skutečný single-channel, ne R=G=B.
+
+        Uživatel 2026-09-21: „přidej 10bit heif mono“. Apple to zvládá (ověřeno:
+        pixi 1 kanál @ 10 bpc, ColorSync s Gray Gamma 2.2 profilem kreslí
+        správně). Menší než RGB cesta (třetinová data), plně gray — totéž
+        renderování co JPEG, 16b quantise → enkoder sám škáluje na 10b.
+        """
+        got = self._display_render()
+        if got is None:
+            return
+        display, params, stem = got
+        q16 = rnd.quantise16(display)                 # 0..65535, NaN -> černá
+        out = self._derived_dir() / f"{stem}.mono10.heic"
+        profile = icc.profile_for(params.gamma_display)
+        icc.write_mono_heic(out, q16, profile)
+        self.statusBar().showMessage(
+            f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
+            f" · {icc.PROFILE_NAME} 10b")
 
     def _export_render(self, flat: bool) -> None:
         cropped = self._cropped_density()
@@ -1192,22 +1365,36 @@ class MainWindow(QMainWindow):
         # (WYSIWYG). Flat zůstává bez křivky i bez gammy — grading od nuly.
         full = (rnd.render_flat(d, params) if flat
                 else rnd.render_for_display(d, params))
-        # NaN = „bez světla" -> černá; ±inf hustoty už render ořízl na 0/1.
+        # NaN = „bez světla" -> černá; ±inf hustoty už render ořezal na 0/1.
         data = rnd.quantise16(full)
         stem = Path(prov.source).stem
         kind = "flat" if flat else "positive"
         out = self._derived_dir() / f"{stem}.{kind}.tif"
-        tifffile.imwrite(out, np.ascontiguousarray(data),
-                         photometric="minisblack",
-                         description=json.dumps({
-                             "magic": "filmscan-render",
-                             "kind": kind,
-                             "parameters": params.to_dict(),
-                             "fingerprint": params.fingerprint(),
-                             "density_source": f"{stem}.density.tif",
-                         }, ensure_ascii=False))
-        self.lbl_status.setText(
-            f"Exportováno: {out.name} · fingerprint {params.fingerprint()}")
+        # Kontrakt dokumentu 07: display-referred pozitiv nese ICC profil
+        # Gray Gamma 2.2 (stejná TRC jako apply_display — žádná druhá gamma
+        # do pixelů, profil jen říká čtečkám, jak data interpretovat). Flat
+        # profil NENESÉ — je lineární v hustotě a profil by o datech lhal;
+        # neliší se jen absencí profilu, ale i encoding v metadatech.
+        encoding = (icc.ENCODING_LINEAR_DENSITY if flat
+                    else icc.ENCODING_GRAY_GAMMA_22)
+        profile = None if flat else icc.profile_for(params.gamma_display)
+        meta = {
+            "magic": "filmscan-render",
+            "kind": kind,
+            "encoding": encoding,
+            "parameters": params.to_dict(),
+            "fingerprint": params.fingerprint(),
+            "density_source": f"{stem}.density.tif",
+        }
+        if profile is not None:
+            meta["icc_profile"] = icc.PROFILE_NAME
+            meta["icc_profile_fingerprint"] = icc.profile_fingerprint(profile)
+        icc.write_gray_tiff(out, data, profile,
+                            description=json.dumps(meta, ensure_ascii=False))
+        extra = f" · {icc.PROFILE_NAME}" if profile is not None else ""
+        self.statusBar().showMessage(
+            f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
+            f"{extra}")
 
 
 def _subsample(d: np.ndarray, max_dim: int) -> np.ndarray:

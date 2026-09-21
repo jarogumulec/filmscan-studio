@@ -18,7 +18,12 @@ approaching zero at both ends, steepest through the middle.
   shadow detail is squeezed into a narrow band -- compression, not clipping.
 * ``shoulder`` pushes the highlight anchor up, flattening the curve near white so
   the top of the range compresses into a narrow band before reaching white.
-* ``gamma`` is a contrast control applied around an anchored mid-grey.
+* ``gamma`` is a midtone-contrast control applied around an anchored mid-grey.
+  Its slope at the pivot is exactly ``gamma``, but the spline in front of it
+  already has its own slope, so the slope of the *combined* curve is not
+  ``gamma`` whenever toe/shoulder move the knots (dokument 07 §7). The
+  control is therefore honest as mid-tone shaping, not as an absolute
+  gradient of the whole response.
 
 Both controls therefore *reduce local contrast at their end*, which is what
 "shadow compression" and "highlight compression" mean. An earlier revision moved
@@ -67,18 +72,20 @@ class FilmicProfile:
     validator refuses. ``gamma`` is midtone contrast, where 1.0 is linear --
     NOT the display transfer; that lives in
     :attr:`...render.RenderParams.gamma_display`.
-    The defaults sit at the slope of darktable's negadoctor BW preset
-    (≈0.6 output per D over a 2.4 D span) -- a natural print, toe compressed
-    rather than clipped, shoulder just softer than the spline's mid slope.
+    The defaults are the doc-08 working start (toe 0.20 / gamma 1.35 /
+    shoulder 0.20): a mild natural contrast, knees only lightly engaged --
+    the knees are for *compressing* the ends, not for fixing a bad Dmin/Dmax
+    scale (08 §1). The old negadoctor-BW-slope default (0.35/1.10/0.45) was
+    replaced 2026-09-21 by the user's 08 reorganisation.
     """
 
     #: Knee strength where the anchor lands exactly on the endpoint:
     #: shadow anchor 0.25 / toe travel 0.15 == highlight 0.25-travel mirror.
     KNEE_MAX: float = 1.666
 
-    toe: float = 0.35
-    gamma: float = 1.10
-    shoulder: float = 0.45
+    toe: float = 0.20
+    gamma: float = 1.35
+    shoulder: float = 0.20
     name: str = "generic"
 
     def __post_init__(self) -> None:
@@ -101,9 +108,9 @@ class FilmicProfile:
     @classmethod
     def from_dict(cls, d: dict) -> FilmicProfile:
         return cls(
-            toe=float(d.get("toe", 0.35)),
-            gamma=float(d.get("gamma", 1.10)),
-            shoulder=float(d.get("shoulder", 0.45)),
+            toe=float(d.get("toe", 0.20)),
+            gamma=float(d.get("gamma", 1.35)),
+            shoulder=float(d.get("shoulder", 0.20)),
             name=str(d.get("name", "custom")),
         )
 
@@ -135,11 +142,13 @@ class FilmicProfile:
     def _midtone(self, t: np.ndarray) -> np.ndarray:
         """Midtone contrast: a piecewise power pinned at 0, 0.5 and 1.
 
-        The slope at the pivot is exactly ``gamma``, which is what makes this a
-        contrast control in the photographic sense rather than an exposure
-        shift. Pivoting at a fixed 0.5 (rather than at wherever the knees put
-        mid-grey) keeps the three controls independent: moving the toe does not
-        silently retune the gamma.
+        The slope of *this step* at the pivot is exactly ``gamma``; the
+        combined curve's slope there is spline-slope x gamma, so with knees
+        engaged the whole response is never exactly ``gamma`` steep -- hence
+        the UI label "stredovy kontrast", not "sklon" (dokument 07 §7).
+        Pivoting at a fixed 0.5 (rather than at wherever the knees put
+        mid-grey) keeps the three controls independent: moving the toe does
+        not silently retune the gamma.
         """
         if self.gamma == 1.0:
             return t

@@ -27,7 +27,7 @@ Všechny definované **v hustotní doméně**, ne v display 0..1:
 
 | parametr | význam | doména |
 |---|---|---|
-| `exposure_ev` | posun expozice v stopách: `D_eff = D − 0.301·ev`. Kladný ev zjasňuje pozitiv (vík světl = méní hustoty), konzistentní se současným `exposure_to_linear` | `[D]` |
+| `exposure_ev` | posun expozice v stopách: `D_eff = D − Dmin + 0.301·ev` (oprava dle kódu, dok. 07 §6). Kladný ev zjasňuje pozitiv: v hustotní definici pozitivního renderu roste jas pozitivu **s hustotou** (vyšší D = světlejší scéna na negativu), a `+ev` posune každý pixel o `+log10(2)` D výš po téže ose. Není to totéž znaménko jako „scan exposure bias" v negadoctoru — ten sedí na lineární transmitanční ose před invertou, kde víc světla znamená větší transmisi; zde je inverze už zabudovaná v definici křivky. Uživatelský kontrakt „+EV = světlejší pozitiv" platí v obou modelech. | `[D]` |
 | `black_point` | D, které se mapuje na papírovou černou (0). Default: `Dmin + film_Dmax` z kalibrace | `[D]` |
 | `white_point` | D, které se mapuje na papírovou bílou (Dmin, tj. po Dmin korekci 0). Default: `Dmin` | `[D]` |
 | `contrast` (grade γ) | strmost střední lineární části **v D** — přímočařejší než negadoctor: `slope = d(out)/d(D)` na středové hladině | bezrozměrné |
@@ -41,12 +41,11 @@ všechny páčky mají význam v `[D]`, tedy fyzikálně čitelné („toe zač�
 ## 3. Tónová mapa — struktura
 
 ```
-D_eff   = D − Dmin − 0.301·exposure_ev            # čistá hustota, exponováno
-x       = (D_eff − (white−Δ)) … normalizace do 0..1 mezi black_point a white_point
-y       = spline_toe_shoulder(x; toe, contrast, shoulder)   # monotone Hermite (filmic.py)
-                                            + negadoctorovský soft-clip na rameni
+D_eff   = D − Dmin + 0.301·exposure_ev + shadow_band   # čistá hustota + pás pod base
+x       = D_eff / (span + shadow_band)   # normalizace do 0..1; base na band/(span+band)
+y       = spline_toe_shoulder(x; toe, gamma, shoulder) # monotone Hermite (filmic.py)
 out     = y                                        # lineární pozitiv 0..1
-display = transfer(out, gamma_display)
+display = transfer(out, gamma_display)             # gamma 2,2 dána ICC profilem
 ```
 
 - **Stávající `FilmicProfile` (monotone cubic Hermite, Fritsch–Carlson) zůstává páteří** —

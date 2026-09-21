@@ -10,7 +10,8 @@ development and neither module can corrupt the other's data.
 uv run filmscan-studio          # Capture GUI (PySide6)
 uv run filmscan-studio --mock   #   …with a simulated TS2600MP-G2, no camera needed
 uv run filmscan-develop frameNNN.tif ...  # Developer CLI → 16-bit TIFF + sidecar
-uv run pytest                   # 283 tests
+uv run filmscan-annotate [slozka]  # Anotátor metadat (název, datum, geo, štítky)
+uv run pytest                   # tests
 ```
 
 ## Design rules the code enforces
@@ -105,6 +106,50 @@ per pixel. Mono sensor: no white balance to chase.
 → inversion → exposure → filmic → 16-bit TIFF (+ `.develop.json` provenance
 with a parameter fingerprint, so any export can be re-generated
 bit-identically).
+
+## Developer GUI: jak ladit pozitiv
+
+`uv run filmscan-develop-gui` otevre hustotní archiv a vykreslí pozitiv. Ladění
+dělej v tomto pořadí:
+
+1. **Dmin** nech na `z měření film base`, pokud má projekt měření čiré
+  podložky. Dmin je černý bod pozitivu; není to nejtmavší motiv fotografie.
+2. **Dmax** nejdřív nech na `auto ze snímku (p99,9 + okraj)`. V horním
+  histogramu zkontroluj pravý konec hustot. Pokud je Dmax zbytečně daleko za
+  skutečnými daty, vypni automatiku a opatrně ho sniž. Tím se roztáhnou
+  střední a světlé tóny. Pokud je příliš nízko, světlá místa se oříznou na
+  bílou.
+3. **Kontrast středu (gamma)** dolaď pro celkový kontrast. Začni přibližně na
+  `1,35`; běžný rozsah je `1,35-1,70`. Hodnota `1,00` je neutrální, hodnoty
+  nad `2,2` jsou spíše zvláštní případy.
+4. **Patka (toe)** komprimuje stíny pozitivu. Vyšší hodnota stíny více slepí;
+  pro otevřenější stíny ji sniž.
+5. **Rameno (shoulder)** komprimuje světla pozitivu. Vyšší hodnota chrání
+  nejsvětlejší tóny před tvrdým ořezem, ale může je slít. Pro více roztažená
+  světla ho sniž.
+6. **Tolerance pod Dmin** (`shadow_band`) používej jen jako malou rezervu
+  měření, obvykle `0,00-0,03 D`. Nevrací skutečně oříznutý detail a vysoká
+  hodnota zvedne a vyšedí černou.
+7. **Display gamma** nech na `2,2`. Je to technický převod do koukatelného
+  gray prostoru, ne fotografický kontrast.
+
+Pravidlo pro rychlé rozhodnutí: **Dmin/Dmax nastavují měřítko filmu, gamma
+nastavuje kontrast a toe/shoulder tvarují konce.** Nejprve oprav rozsah dat,
+teprve potom dolaďuj vzhled. Horní bílá křivka slouží k posouzení filmové
+křivky před display transferem; dolní histogram a náhled ukazují výsledek po
+display gamma.
+
+Praktický start pro běžný snímek:
+
+```text
+Dmin: auto z film base
+Dmax: auto, případně ručně podle pravého okraje D histogramu
+toe: 0,10-0,25
+gamma: 1,25-1,60
+shoulder: 0,10-0,25
+shadow_band: 0,01-0,03 D
+gamma_display: 2,2
+```
 
 ## Status
 

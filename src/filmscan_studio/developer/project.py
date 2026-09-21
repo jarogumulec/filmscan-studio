@@ -41,6 +41,7 @@ from filmscan_studio.core.calibration import (
     stack_darks,
 )
 from filmscan_studio.core.filmbase import FILM_BASE_FILENAME, load_samples
+from filmscan_studio.core.orientation import apply_orientation
 from filmscan_studio.core.models import FrameKind
 from filmscan_studio.core.rawio import RAW_SUFFIX, RawFrame, open_frame
 
@@ -195,17 +196,18 @@ class DevelopProject:
                     or self.rotated_180)
 
     def orientation_apply(self, image: np.ndarray) -> np.ndarray:
-        """Flip/rotate a 2-D map (or HxWxN array) into viewer orientation."""
-        a = np.asarray(image)
-        if self.rotated_180:
-            a = np.rot90(a, 2)
-        if self.mirrored_horizontal:
-            a = a[:, ::-1]
-        if self.mirrored_vertical:
-            a = a[::-1, :]
-        return np.ascontiguousarray(a) \
-            if (self.mirrored_horizontal or self.mirrored_vertical
-                or self.rotated_180) else a
+        """Flip/rotate a 2-D map (or HxWxN array) into viewer orientation.
+
+        The transform itself is :func:`filmscan_studio.core.orientation.
+        apply_orientation`, shared with the annotator's previews so the two
+        apps can never drift on what "as recorded" means.
+        """
+        return apply_orientation(
+            image,
+            mirrored_horizontal=self.mirrored_horizontal,
+            mirrored_vertical=self.mirrored_vertical,
+            rotated_180=self.rotated_180,
+        )
 
     def rect_apply(self, rect: tuple[int, int, int, int] | None,
                    frame_wh: tuple[int, int]) -> tuple[int, int, int, int] | None:

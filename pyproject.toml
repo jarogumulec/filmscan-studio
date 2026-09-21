@@ -10,6 +10,8 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.5.3",
     "opencv-python>=5.0.0.93",
+    "pillow>=12.3.0",
+    "pillow-heif>=1.7.0",
     "pydantic>=2.13.5",
     "pyside6>=6.11.2",
     "tifffile>=2025.6.11",
@@ -29,3 +31,4 @@ dev = [
 filmscan-studio = "filmscan_studio.__main__:main"
 filmscan-develop = "filmscan_studio.developer.__main__:main"
 filmscan-develop-gui = "filmscan_studio.developer.gui:main"
+filmscan-annotate = "filmscan_studio.annotator.gui:main"

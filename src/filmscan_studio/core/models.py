@@ -242,6 +242,58 @@ class FilmMetadata(BaseModel):
         return data
 
 
+class FrameAnnotation(BaseModel):
+    """Operator's description of *what the picture is* — added after capture.
+
+    The sidecar's own ``acquisition.capture_date`` is when the rig exposed the
+    negative (2026, in the studio). This block carries the *photographic*
+    facts of the scene: title, note, tags, rating, when and where the film
+    was exposed. A separate block, never folded into ``acquisition``, keeps
+    machine-measured provenance and human annotation from being confused —
+    and lets a re-capture rewrite one without silently destroying the other.
+
+    Written by the annotator GUI (``filmscan-annotate``) directly into the
+    sidecar JSON; read by the developer at export to fill EXIF. Datetime is
+    EXIF-strict ``YYYY:MM:DD HH:MM:SS`` on purpose: a photo manager must be
+    able to sort the picture, and an unparseable "léto 1968" would drop it
+    out of every timeline. Unknown day → ``1968:01:01 00:00:00``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = SCHEMA_VERSION
+    title: str = ""
+    note: str = ""
+    tags: list[str] = Field(default_factory=list)
+    rating: int | None = Field(default=None, ge=0, le=5)
+    #: Exposure moment of the *scene*, EXIF form; "" = unknown.
+    capture_datetime: str = ""
+    #: Raw operator input ("49.1124306N, 9.7371244E") kept for re-parsing.
+    gps_input: str = ""
+    #: Decimal degrees as strings — written by the GPS parser, kept verbatim
+    #: so a round-trip through the GUI never rewrites precision.
+    gps_lat: str = ""
+    gps_lon: str = ""
+    gps_lat_ref: str = ""      # N / S
+    gps_lon_ref: str = ""      # E / W
+    #: EXIF-style DMS helper strings, ready for a later GPS IFD write.
+    gps_lat_exif_dms: str = ""
+    gps_lon_exif_dms: str = ""
+
+    @field_validator("capture_datetime")
+    @classmethod
+    def _exif_datetime(cls, v: str) -> str:
+        if not v:
+            return ""
+        try:
+            datetime.strptime(v, "%Y:%m:%d %H:%M:%S")
+        except ValueError as exc:
+            raise ValueError(
+                "capture_datetime musí být EXIF tvar 'YYYY:MM:DD HH:MM:SS'"
+            ) from exc
+        return v
+
+
 class AcquisitionMetadata(BaseModel):
     """How a single frame was photographed.
 
@@ -333,6 +385,11 @@ class CaptureRecord(BaseModel):
     #: A later developer GUI crops the frame by it. ``None`` = no crop asked
     #: for; the frame stands as captured.
     crop_rect: tuple[int, int, int, int] | None = None
+    #: What the picture *is*: added after capture by the annotator GUI into
+    #: the sidecar's ``annotation`` key. Additive like ``crop_rect`` — the
+    #: capture layer never writes it, and every pre-annotation sidecar stays
+    #: valid (default ``None``), so ``SCHEMA_VERSION`` does not move.
+    annotation: FrameAnnotation | None = None
 
     @property
     def path_like(self) -> Path:
