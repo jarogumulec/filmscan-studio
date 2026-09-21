@@ -59,20 +59,34 @@ _SHOULDER_TRAVEL = 0.15
 class FilmicProfile:
     """Parametric tone curve.
 
-    ``toe`` and ``shoulder`` are strengths in 0..1 where 0 means no adjustment.
-    ``gamma`` is midtone contrast, where 1.0 is linear.
+    ``toe`` and ``shoulder`` are strengths where 0 means no adjustment.
+    The usable ceiling is 1.666 (= anchor 0.25 / travel 0.15): there the knee
+    reaches the endpoint and that end compresses into a whisper -- still
+    monotone, still no clipping, which is the whole point of the spline.
+    Above it a knot would pass an endpoint and the band would *clip*, so the
+    validator refuses. ``gamma`` is midtone contrast, where 1.0 is linear --
+    NOT the display transfer; that lives in
+    :attr:`...render.RenderParams.gamma_display`.
+    The defaults sit at the slope of darktable's negadoctor BW preset
+    (≈0.6 output per D over a 2.4 D span) -- a natural print, toe compressed
+    rather than clipped, shoulder just softer than the spline's mid slope.
     """
+
+    #: Knee strength where the anchor lands exactly on the endpoint:
+    #: shadow anchor 0.25 / toe travel 0.15 == highlight 0.25-travel mirror.
+    KNEE_MAX: float = 1.666
 
     toe: float = 0.35
     gamma: float = 1.10
-    shoulder: float = 0.40
+    shoulder: float = 0.45
     name: str = "generic"
 
     def __post_init__(self) -> None:
         for attr in ("toe", "shoulder"):
             v = getattr(self, attr)
-            if not 0.0 <= v <= 1.0:
-                raise ValueError(f"{attr} must be within 0..1, got {v}")
+            if not 0.0 <= v <= self.KNEE_MAX:
+                raise ValueError(
+                    f"{attr} must be within 0..{self.KNEE_MAX}, got {v}")
         if self.gamma <= 0:
             raise ValueError("gamma must be positive")
 
@@ -89,7 +103,7 @@ class FilmicProfile:
         return cls(
             toe=float(d.get("toe", 0.35)),
             gamma=float(d.get("gamma", 1.10)),
-            shoulder=float(d.get("shoulder", 0.40)),
+            shoulder=float(d.get("shoulder", 0.45)),
             name=str(d.get("name", "custom")),
         )
 

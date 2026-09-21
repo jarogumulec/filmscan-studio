@@ -230,9 +230,26 @@ class TestFilmic:
         assert out[0] == pytest.approx(0.0)
         assert out[-1] == pytest.approx(1.0)
 
+    def test_knees_past_one_stay_valid(self) -> None:
+        """Kapacita nad 1: kotva ujde až ke konci (1,666), konec se šeptá.
+
+        Monotónní, bez ořezu i na plné pojištění obou kolen najednou.
+        """
+        p = filmic.FilmicProfile(toe=1.666, gamma=4.0, shoulder=1.666)
+        out = p.apply(np.linspace(0, 1, 4096))
+        assert np.all(np.diff(out) >= -1e-9)
+        assert out[0] == pytest.approx(0.0)
+        assert out[-1] == pytest.approx(1.0)
+        # Plná patka: pásmo pod kotvou se skoro stlačí...
+        assert out[512] < 0.02
+        # ...a přesto zůstává svah (žádný plakát).
+        assert out[512] > out[0]
+
     def test_validates_range(self) -> None:
         with pytest.raises(ValueError):
-            filmic.FilmicProfile(toe=1.5)
+            filmic.FilmicProfile(toe=1.7)
+        with pytest.raises(ValueError):
+            filmic.FilmicProfile(shoulder=-0.1)
         with pytest.raises(ValueError):
             filmic.FilmicProfile(gamma=0)
 

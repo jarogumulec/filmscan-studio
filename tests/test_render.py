@@ -11,8 +11,11 @@ from filmscan_studio.core.filmic import FilmicProfile
 
 @pytest.fixture
 def params() -> render.RenderParams:
+    # shadow_band=0: these are axis tests (base -> black, dmax -> white);
+    # the default band shifts base off zero on purpose -- see TestShadowBand.
     return render.RenderParams(dmin=0.2, dmax=2.6, exposure_ev=0.0,
-                               profile=FilmicProfile.neutral())
+                               profile=FilmicProfile.neutral(),
+                               shadow_band=0.0)
 
 
 class TestRenderParams:
@@ -87,7 +90,8 @@ class TestRenderDensity:
         d = np.full((1, 1), 1.0, dtype=np.float32)
         shifted = render.RenderParams(dmin=0.2 - render.D_PER_STOP,
                                       dmax=2.6 - render.D_PER_STOP,
-                                      profile=FilmicProfile.neutral())
+                                      profile=FilmicProfile.neutral(),
+                                      shadow_band=0.0)
         assert render.render_density(d, params.with_exposure(1.0))[0, 0] == \
             pytest.approx(render.render_density(d, shifted)[0, 0], abs=1e-12)
 
@@ -124,3 +128,131 @@ class TestFlatRenderAndQuantise:
         out = render.render_for_display(d, params)
         assert 0.0 < out[0, 0] < 1.0
         assert np.isnan(out[0, 1])
+
+
+class TestDisplayTransfer:
+    """The last step: gamma_display, shared by preview/export."""
+
+    def test_gamma_display_default_is_2_2(self) -> None:
+        assert render.RenderParams().gamma_display == pytest.approx(2.2)
+
+    def test_transfer_formula(self) -> None:
+        p = render.RenderParams(gamma_display=2.0, shadow_band=0.0)
+        out = render.apply_display(np.array([0.0, 0.25, 1.0]), p)
+        assert out[0] == pytest.approx(0.0)
+        assert out[1] == pytest.approx(0.5)                        # sqrt
+        assert out[2] == pytest.approx(1.0)                        # white pinned
+
+    def test_gamma_one_is_identity(self) -> None:
+        p = render.RenderParams(gamma_display=1.0)
+        x = np.linspace(0.0, 1.0, 257)
+        assert np.allclose(render.apply_display(x, p), x)
+
+    def test_display_transfer_is_monotone(self, params) -> None:
+        d = np.linspace(params.dmin, params.dmax, 512, dtype=np.float32)
+        out = render.render_for_display(d, params)
+        assert np.all(np.diff(out) >= -1e-12)
+
+    def test_fingerprint_covers_display_fields(self) -> None:
+        base = render.RenderParams()
+        assert (render.RenderParams(gamma_display=2.0).fingerprint()
+                != base.fingerprint())
+        assert (render.RenderParams(shadow_band=0.0).fingerprint()
+                != base.fingerprint())
+
+    def test_legacy_dict_without_display_fields(self) -> None:
+        """Settings saved before the display knobs existed must load."""
+        legacy = {"dmin": 0.2, "dmax": 2.6, "exposure_ev": 0.0,
+                  "name": "neutral", "toe": 0.0, "gamma": 1.0,
+                  "shoulder": 0.0}
+        p = render.RenderParams.from_dict(legacy)
+        assert p.gamma_display == pytest.approx(2.2)
+        assert p.shadow_band == pytest.approx(0.01)
+
+
+class TestBrightnessContrast:
+    """Viewer-side knobs in DISPLAY space, deliberately after the gamma.
+
+    Pre-gamma brightness would ramp through the density domain -- that is
+    exposure_ev's job. These are Photoshop-curve knobs on displayed pixels.
+    """
+
+    def test_defaults_neutral(self) -> None:
+        p = render.RenderParams()
+        assert p.brightness == 0.0 and p.contrast == 1.0
+
+    def test_identity_when_neutral(self) -> None:
+        p = render.RenderParams(gamma_display=1.0)
+        x = np.linspace(0.0, 1.0, 257)
+        assert np.allclose(render.apply_display(x, p), x)
+
+    def test_brightness_shifts_display_not_density(self) -> None:
+        p = render.RenderParams(gamma_display=1.0, brightness=0.1)
+        out = render.apply_display(np.array([0.0, 0.5, 0.89]), p)
+        assert np.allclose(out, [0.1, 0.6, 0.99])
+        # clipped at the top -- brightness must not exceed white
+        assert render.apply_display(np.array([1.0]), p)[0] == 1.0
+
+    def test_contrast_pivots_at_display_midgrey(self) -> None:
+        p = render.RenderParams(gamma_display=1.0, contrast=2.0)
+        out = render.apply_display(np.array([0.25, 0.5, 0.75]), p)
+        assert np.allclose(out, [0.0, 0.5, 1.0])
+        # pivot stays put: more contrast must not move middle grey
+        assert out[1] == pytest.approx(0.5)
+
+    def test_nan_survives_knobs(self) -> None:
+        p = render.RenderParams(brightness=0.2, contrast=1.5)
+        out = render.apply_display(np.array([0.4, np.nan]), p)
+        assert np.isfinite(out[0]) and np.isnan(out[1])
+
+    def test_fingerprint_and_roundtrip_cover_them(self) -> None:
+        base = render.RenderParams()
+        assert (render.RenderParams(brightness=0.1).fingerprint()
+                != base.fingerprint())
+        assert (render.RenderParams(contrast=1.5).fingerprint()
+                != base.fingerprint())
+        p = render.RenderParams(brightness=-0.2, contrast=1.35)
+        assert render.RenderParams.from_dict(p.to_dict()) == p
+
+    def test_validates_range(self) -> None:
+        with pytest.raises(ValueError):
+            render.RenderParams(brightness=0.6)
+        with pytest.raises(ValueError):
+            render.RenderParams(contrast=0.0)
+
+
+class TestShadowBand:
+    """Shadow separation BEFORE the curve: widening the domain under base.
+
+    The rejected alternative -- a paper-black lift AFTER the curve -- could
+    not unfuse clipped shadows: every clipped pixel maps to the same value.
+    Widening the domain keeps the gradient that physically exists between
+    the sensor floor and the measured base.
+    """
+
+    def test_default_is_small(self) -> None:
+        # The display gamma lifts small values hard; keep the band a
+        # darkroom floor, not a milky black.
+        assert render.RenderParams().shadow_band == pytest.approx(0.01)
+
+    def test_base_lifts_off_zero(self) -> None:
+        p = render.RenderParams(dmin=0.2, dmax=2.6, shadow_band=0.1)
+        d = np.array([[0.2]], dtype=np.float64)
+        out = render.render_density(d, p)
+        assert 0.0 < out[0, 0] < 0.1
+
+    def test_sub_base_gradient_survives(self) -> None:
+        # Densities below base (fog, lamp drift): with a band they render as
+        # distinct dark tones; with band 0 all of them fuse to one 0.
+        d = np.array([[0.0, 0.1, 0.2]], dtype=np.float64)
+        fused = render.render_density(d, render.RenderParams(
+            dmin=0.2, dmax=2.6, shadow_band=0.0))
+        kept = render.render_density(d, render.RenderParams(
+            dmin=0.2, dmax=2.6, shadow_band=0.2))
+        assert fused[0, 0] == fused[0, 1] == fused[0, 2] == 0.0
+        assert kept[0, 0] < kept[0, 1] < kept[0, 2]
+
+    def test_band_preserves_dmax_white(self) -> None:
+        p = render.RenderParams(dmin=0.2, dmax=2.6, shadow_band=0.1)
+        out = render.render_density(np.array([[2.6]], dtype=np.float64), p)
+        assert out[0, 0] == pytest.approx(1.0)

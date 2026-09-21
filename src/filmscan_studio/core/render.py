@@ -9,9 +9,10 @@ hence the fingerprint.
 The tonal scale works entirely in [D] (density units), which makes every
 control physically readable ("the toe starts 0.3 D above base"):
 
-    D_eff = D - dmin + 0.301 * exposure_ev     # net density, exposed (+ev brightens)
-    x     = D_eff / span                       # span = dmax - dmin, 0..1
+    D_eff = D - dmin + shadow_band + 0.301 * exposure_ev  # exposed net density
+    x     = D_eff / (span + shadow_band)       # base sits at band/(span+band)
     out   = FilmicProfile.apply(x)             # monotone spline toe/gamma/shoulder
+    disp  = out ^ (1/gamma_display)            # apply_display: monitor transfer
 
 Inverting is *not* a step here, but it does set the sign: a negative's density
 grows where the scene was bright (bright scene -> more exposure -> more
@@ -71,6 +72,27 @@ class RenderParams:
     curve_model: str = "spline"
     #: Provenance of dmax ("frame" | "film" | "manual"), informational only.
     dmax_source: str = "frame"
+    #: Display transfer applied AFTER the tone curve (03 §2 ``gamma_display``).
+    #: The profile's own ``gamma`` is midtone contrast -- a creative slope at
+    #: the pivot, near 1 for a natural look; this is the technical monitor
+    #: transform (darktable's output profile, which negadoctor does not even
+    #: carry). Preview and export must apply it identically or WYSIWYG dies.
+    gamma_display: float = 2.2
+    #: How far below dmin [D] still maps into the toe instead of clipping to
+    #: black. A floor applied *after* the curve cannot unfuse detail already
+    #: clipped at base -- every clipped pixel becomes the same value. This
+    #: widens the curve's *domain* below base, so the fog/shadow gradient
+    #: under the measured base renders as dark tones instead of one flat 0.
+    #: 0 = hard clip at base (the old behaviour). Keep it small: the display
+    #: gamma lifts small values hard, so 0.01 D already puts base at ~7 % of
+    #: the print -- enough gradient for fog, not a milky black.
+    shadow_band: float = 0.01
+    #: Display-space brightness, added AFTER gamma in display units (−0.5..0.5).
+    #: Deliberately *not* exposure: exposure_ev shifts the density axis (what
+    #: the film saw); this is the Photoshop-curve feel knob on already
+    #: displayed pixels. Contrast pivots at display mid-grey 0.5.
+    brightness: float = 0.0
+    contrast: float = 1.0
 
     def __post_init__(self) -> None:
         if self.dmax <= self.dmin:
@@ -78,6 +100,14 @@ class RenderParams:
                 f"dmax ({self.dmax}) must exceed dmin ({self.dmin})")
         if self.curve_model not in ("spline", "print"):
             raise ValueError(f"unknown curve_model {self.curve_model!r}")
+        if self.gamma_display <= 0:
+            raise ValueError(f"gamma_display must be positive, got {self.gamma_display}")
+        if self.shadow_band < 0.0:
+            raise ValueError(f"shadow_band must be >= 0, got {self.shadow_band}")
+        if not -0.5 <= self.brightness <= 0.5:
+            raise ValueError(f"brightness must be within -0.5..0.5, got {self.brightness}")
+        if not 0.1 <= self.contrast <= 4.0:
+            raise ValueError(f"contrast must be within 0.1..4.0, got {self.contrast}")
 
     @property
     def span(self) -> float:
@@ -90,6 +120,10 @@ class RenderParams:
             "exposure_ev": self.exposure_ev,
             "curve_model": self.curve_model,
             "dmax_source": self.dmax_source,
+            "gamma_display": self.gamma_display,
+            "shadow_band": self.shadow_band,
+            "brightness": self.brightness,
+            "contrast": self.contrast,
             **self.profile.to_dict(),
         }
 
@@ -112,16 +146,25 @@ class RenderParams:
             profile=FilmicProfile.from_dict(d),
             curve_model=str(d.get("curve_model", "spline")),
             dmax_source=str(d.get("dmax_source", "frame")),
+            # Fallbacky se rovnají výchozím polí -- archivy z dob před těmito
+            # páčkami se nahrají se současnými defaulty, ne s nulami.
+            gamma_display=float(d.get("gamma_display", 2.2)),
+            shadow_band=float(d.get("shadow_band", 0.01)),
+            brightness=float(d.get("brightness", 0.0)),
+            contrast=float(d.get("contrast", 1.0)),
         )
 
 
-def _positive_x(d: np.ndarray, params: RenderParams) -> np.ndarray:
+def positive_x(d: np.ndarray, params: RenderParams) -> np.ndarray:
     """Net-density axis of the positive: 0 = base (black print), 1 = dmax
-    (white print). +/-inf densities (unmeasurably dense / clipped) survive as
-    inf and clip to the ends below; NaN stays NaN."""
+    (white print). ``shadow_band`` stretches the negative axis: base sits at
+    ``band / total`` above 0, so densities below the measured base keep a
+    gradient through the toe instead of clipping to one flat black value.
+    +/-inf densities (unmeasurably dense / clipped) survive as inf and clip
+    to the ends below; NaN stays NaN."""
     d_eff = (np.asarray(d, dtype=np.float64) - params.dmin
-             + D_PER_STOP * params.exposure_ev)
-    return d_eff / params.span
+             + D_PER_STOP * params.exposure_ev + params.shadow_band)
+    return d_eff / (params.span + params.shadow_band)
 
 
 def render_density(d: np.ndarray, params: RenderParams) -> np.ndarray:
@@ -133,10 +176,42 @@ def render_density(d: np.ndarray, params: RenderParams) -> np.ndarray:
     visible mask; exports NaN-fill to black at quantisation time
     (:func:`quantise16`) — a silent black is the least inventive lie.
     """
-    x = _positive_x(d, params)
+    x = positive_x(d, params)
     out = params.profile.apply(np.clip(x, 0.0, 1.0))
     out[np.isnan(np.asarray(d, dtype=np.float64))] = np.nan
     return out
+
+
+def apply_display(out: np.ndarray, params: RenderParams) -> np.ndarray:
+    """Display transfer, the last steps after the tone curve.
+
+    ``display = clamp((out^(1/g) - 0.5)·contrast + 0.5 + brightness)`` —
+    the gamma maps to the monitor's native response (darktable's output
+    profile; negadoctor stops before this and leaves it to the pipeline),
+    and brightness/contrast then work in *display* space like every
+    viewer-side tool: contrast pivots at displayed mid-grey, brightness
+    shifts it. (This is why they sit after the gamma, not before — a
+    pre-gamma brightness lift would ramp through the density domain, which
+    is exposure's job.) NaN passes through: a pixel with no light must not
+    acquire a tone.
+
+    There is deliberately *no* paper-black lift here: a floor added after
+    the curve cannot unfuse detail already clipped at base — every clipped
+    pixel would become the same value, just a brighter one. Shadow
+    separation is what :attr:`RenderParams.shadow_band` does, before the
+    curve, where the gradient still exists.
+    """
+    with np.errstate(invalid="ignore"):
+        g = np.where(np.isfinite(out),
+                     np.power(np.maximum(out, 0.0), 1.0 / params.gamma_display),
+                     np.nan)
+    if params.contrast != 1.0:
+        g = (g - 0.5) * params.contrast + 0.5
+    if params.brightness != 0.0:
+        g = g + params.brightness
+    if params.contrast != 1.0 or params.brightness != 0.0:
+        g = np.where(np.isfinite(g), np.clip(g, 0.0, 1.0), np.nan)
+    return g
 
 
 def render_flat(d: np.ndarray, params: RenderParams) -> np.ndarray:
@@ -145,7 +220,7 @@ def render_flat(d: np.ndarray, params: RenderParams) -> np.ndarray:
     Same exposure and points, linear in net density -- the user's grading
     starts from an untouched response, not one with our S-curve baked in.
     """
-    x = _positive_x(d, params)
+    x = positive_x(d, params)
     out = np.clip(x, 0.0, 1.0)
     out[np.isnan(np.asarray(d, dtype=np.float64))] = np.nan
     return out
@@ -157,11 +232,11 @@ def quantise16(image: np.ndarray, nan_fill: float = 0.0) -> np.ndarray:
     return np.clip(filled * 65535.0 + 0.5, 0, 65535).astype(np.uint16)
 
 
-def render_for_display(d: np.ndarray, params: RenderParams,
-                       gamma: float = 2.2) -> np.ndarray:
-    """sRGB-ish preview of a render (display gamma on top; NaN preserved)."""
-    out = render_density(d, params)
-    with np.errstate(invalid="ignore"):
-        display = np.where(np.isfinite(out), np.power(np.maximum(out, 0.0),
-                                                      1.0 / gamma), np.nan)
-    return display
+def render_for_display(d: np.ndarray, params: RenderParams) -> np.ndarray:
+    """Full on-screen render: density -> curve -> display transfer (NaN kept).
+
+    This is what the preview shows and what export must match byte-for-byte:
+    ``render_density`` followed by :func:`apply_display` with the params' own
+    ``gamma_display``.
+    """
+    return apply_display(render_density(d, params), params)

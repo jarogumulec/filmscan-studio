@@ -166,16 +166,33 @@ class DevelopProject:
         the developer shows the *viewer* orientation, so these drive flips in
         preview and exports only — never the density archive, which stays in
         raw sensor orientation.
+
+        Older sessions predate ``project.json`` on disk (the capture app wrote
+        it only to the catalog) — the same ``film`` block travels in every
+        frame sidecar, so fall back to the first sidecar that carries it.
+        Without the fallback the flag was silently ignored and the picture
+        never flipped (K16_O02, 2026-09-21).
         """
+        film: dict = {}
         try:
             data = json.loads((root / "project.json").read_text(
                 encoding="utf-8"))
+            film = data.get("film") or {}
         except (OSError, json.JSONDecodeError):
-            return          # no capture project metadata: unoriented
-        film = data.get("film") or {}
+            pass            # no capture project.json: try the sidecars
+        if not film:
+            for entry in self.frames:
+                film = entry.record.get("film") or {}
+                if film:
+                    break
         self.mirrored_horizontal = bool(film.get("mirrored_horizontal"))
         self.mirrored_vertical = bool(film.get("mirrored_vertical"))
         self.rotated_180 = bool(film.get("rotated_180"))
+
+    @property
+    def oriented(self) -> bool:
+        return bool(self.mirrored_horizontal or self.mirrored_vertical
+                    or self.rotated_180)
 
     def orientation_apply(self, image: np.ndarray) -> np.ndarray:
         """Flip/rotate a 2-D map (or HxWxN array) into viewer orientation."""
@@ -189,6 +206,29 @@ class DevelopProject:
         return np.ascontiguousarray(a) \
             if (self.mirrored_horizontal or self.mirrored_vertical
                 or self.rotated_180) else a
+
+    def rect_apply(self, rect: tuple[int, int, int, int] | None,
+                   frame_wh: tuple[int, int]) -> tuple[int, int, int, int] | None:
+        """Transform a whole-frame rect [D] (x0, y0, x1, y1) into viewer orientation.
+
+        ``orientation_apply`` flips pixel maps; a rectangle needs the corners
+        mapped by the same transforms, so a rect drawn in the displayed image
+        lands on the right sensor pixels. ``frame_wh`` is the whole-frame
+        (W, H) the rect lives in; 180° rotation keeps the shape, mirrors swap
+        the relevant axis around the frame extent.
+        """
+        if rect is None or not self.oriented:
+            return rect
+        x0, y0, x1, y1 = rect
+        w, h = frame_wh
+        if self.rotated_180:
+            x0, x1 = w - x1, w - x0
+            y0, y1 = h - y1, h - y0
+        if self.mirrored_horizontal:
+            x0, x1 = w - x1, w - x0
+        if self.mirrored_vertical:
+            y0, y1 = h - y1, h - y0
+        return (int(x0), int(y0), int(x1), int(y1))
 
     # ------------------------------------------------------------ settings
 

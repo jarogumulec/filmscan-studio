@@ -183,6 +183,65 @@ class TestCaptureWorkflow:
         assert len(sidecars) == 3
         assert "3) Snímání" in window.stage_label.text()
 
+    def test_project_json_autosaves_after_scan(self, window, tmp_path, qtbot):
+        """Povel 2026-09-21: metadata musejí přežít i pád aplikace.
+
+        Do this order the manual-only export meant three real sessions lost
+        their orientation flags (the operator forgot „Exportovat projekt");
+        every capture must refresh project.json on disk by itself, silently.
+        """
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="HP5_AUTO", operator="JG",
+                            mirrored_horizontal=True)
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film,
+                                        paths=paths)
+        assert not (paths.root / "project.json").exists()
+        window._capture(scan=True)
+        qtbot.waitUntil(lambda: window.session.state.scan_count == 1,
+                        timeout=10000)
+        data = json.loads((paths.root / "project.json").read_text(
+            encoding="utf-8"))
+        assert data["film"]["mirrored_horizontal"] is True
+        assert data["counts"]["scans"] == 1
+
+    def test_autosave_never_warns_by_dialog(self, window, tmp_path,
+                                            monkeypatch) -> None:
+        """Tichá sestra exportu: žádný modal při každém skenu; selhání jde
+        jen do logu a sken v tom musí pokračovat."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="HP5_QUIET")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film,
+                                        paths=paths)
+
+        def boom() -> None:
+            raise OSError("disk plný")
+
+        window.session.export_project = boom
+        asked: list = []
+        monkeypatch.setattr(
+            "filmscan_studio.gui.capture_window.QMessageBox.warning",
+            staticmethod(lambda *a, **k: asked.append(a)))
+        assert window._autosave_project() == []
+        assert not asked
+        assert "selhal" in window.log_view.text()
+
+    def test_close_finalizes_project_json(self, window, tmp_path) -> None:
+        """Při zavření se projekt zfinalizuje (počty skenů na disku)."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="HP5_CLOSE")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film,
+                                        paths=paths)
+        window.close()
+        data = json.loads((paths.root / "project.json").read_text(
+            encoding="utf-8"))
+        assert data["counts"] == {"scans": 0, "dark": 0, "flat": 0, "base": 0}
+
     def test_average_spin_defaults_to_one(self, qtbot, camera):
         # Hermetic: a leaked setting from another test (or a real app run on
         # this machine) must not decide what "default" means here — hence a

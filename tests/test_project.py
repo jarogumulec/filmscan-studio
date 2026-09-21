@@ -247,6 +247,24 @@ class TestOrientation:
         d = np.arange(12, dtype=np.float32).reshape(3, 4)
         assert np.array_equal(proj.orientation_apply(d), d)
 
+    def test_orientation_falls_back_to_sidecar(self, session) -> None:
+        """Starší sezení bez project.json (K16_O02): flag žije v bočním souboru.
+
+        Dřív se fallback nečetl a zrcadlení se tiše ignorovalo — fotka se
+        nezrcadlila, i když `film.mirrored_horizontal: true` byla v každém
+        sidecaru i v catalogu.
+        """
+        sc = session / "frames" / "frame001.tif.json"
+        record = json.loads(sc.read_text(encoding="utf-8"))
+        record["film"] = {"film_id": "x", "mirrored_horizontal": True,
+                          "mirrored_vertical": False, "rotated_180": False}
+        sc.write_text(json.dumps(record), encoding="utf-8")
+        assert not (session / "project.json").exists()
+        proj = DevelopProject.open(session)
+        assert proj.mirrored_horizontal and not proj.mirrored_vertical
+        d = np.arange(6, dtype=np.float32).reshape(2, 3)
+        assert np.array_equal(proj.orientation_apply(d), d[:, ::-1])
+
     def test_horizontal_mirror_flips_columns(self, session) -> None:
         payload = {"film": {"film_id": "x", "mirrored_horizontal": True}}
         (session / "project.json").write_text(json.dumps(payload))
@@ -271,6 +289,39 @@ class TestOrientation:
         # The ramp rises with x in raw sensor orientation; a flipped map would
         # fall. The archive must keep rising.
         assert d[24, 60] > d[24, 4]
+
+    @pytest.mark.parametrize("flags", [
+        {"mirrored_horizontal": True},
+        {"mirrored_vertical": True},
+        {"rotated_180": True},
+        {"mirrored_horizontal": True, "mirrored_vertical": True},
+    ])
+    def test_rect_apply_matches_map_flip(self, session, flags) -> None:
+        """Crop-of-flipped at the mapped rect == flip-of-crop at the sensor rect.
+
+        The GUI draws the ROI in displayed (oriented) pixels but the export
+        crops the raw map and flips the crop; rect_apply must translate the
+        rectangle so both paths select the same content. (The bug this pins:
+        the rect used to be stored in displayed pixels and cropped raw — with
+        V-mirror or 180° it landed elsewhere.)
+        """
+        payload = {"film": {"film_id": "x", **flags}}
+        (session / "project.json").write_text(json.dumps(payload))
+        proj = DevelopProject.open(session)
+        d = np.arange(48 * 64, dtype=np.float32).reshape(48, 64)
+        disp = proj.orientation_apply(d)
+        sensor = (10, 5, 26, 19)
+        shown = proj.rect_apply(sensor, (64, 48))
+        assert np.array_equal(disp[shown[1]:shown[3], shown[0]:shown[2]],
+                              proj.orientation_apply(
+                                  d[sensor[1]:sensor[3], sensor[0]:sensor[2]]))
+        # Involuce: DRAWNY rect -> ulozeny -> zpet = ten druhy.
+        assert proj.rect_apply(shown, (64, 48)) == sensor
+
+    def test_rect_apply_identity_when_unoriented(self, session) -> None:
+        proj = DevelopProject.open(session)
+        assert proj.rect_apply((1, 2, 3, 4), (64, 48)) == (1, 2, 3, 4)
+        assert proj.rect_apply(None, (64, 48)) is None
 
 
 class TestSettingsPersistence:

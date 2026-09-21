@@ -7,6 +7,7 @@ re-measures; exports write the right files with the right headers.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import numpy as np
@@ -35,11 +36,21 @@ def window(qtbot, session) -> MainWindow:
 
 
 class TestDensityImage:
-    def test_nan_pixels_get_the_mask_color(self) -> None:
+    def test_nan_pixels_are_black_not_magenta(self) -> None:
+        """Magenta mask is gone; NaN renders as black (exports fill black too)."""
         img = np.array([[0.5, np.nan]])
         q = density_to_qimage(img)
-        assert q.pixelColor(1, 0).name() == "#ff00ff"
+        assert q.pixelColor(1, 0).name() == "#000000"
         assert q.pixelColor(0, 0).name() in ("#808080", "#7f7f7f")
+
+    def test_warning_masks_colorize(self) -> None:
+        img = np.array([[0.5, 0.5, 0.5]])
+        hi = np.array([[False, True, False]])
+        lo = np.array([[True, False, False]])
+        q = density_to_qimage(img, hi, lo)
+        assert q.pixelColor(1, 0).name() == "#ff2828"   # světla červeně
+        assert q.pixelColor(0, 0).name() == "#285aff"   # stíny modře
+        assert q.pixelColor(2, 0).name() in ("#808080", "#7f7f7f")
 
     def test_rejects_3d(self) -> None:
         with pytest.raises(ValueError):
@@ -139,7 +150,11 @@ class TestWindow:
         assert len(meta["fingerprint"]) == 16
 
     def test_positive_pixels_match_params(self, window, tmp_path) -> None:
-        """The exported file is the render of the current params, byte-exact."""
+        """The exported file is the render of the current params, byte-exact.
+
+        Including the display transfer: the exported TIFF must be exactly
+        what the preview showed (WYSIWYG), gamma and paper black included.
+        """
         from filmscan_studio.core import density as dens
         from filmscan_studio.core import render as rnd
 
@@ -148,9 +163,114 @@ class TestWindow:
         out = tmp_path / "derived" / "frame001.positive.tif"
         exported = tifffile.imread(out)
         d, _prov = window.project.build_density("frame001.tif", crop=True)
-        expected = rnd.quantise16(rnd.render_density(d,
-                                                     window.current_params()))
+        expected = rnd.quantise16(rnd.render_for_display(d,
+                                                         window.current_params()))
         assert np.array_equal(exported, expected)
+
+    def test_jpeg_export_matches_display(self, window, tmp_path) -> None:
+        """The JPEG is the display render quantised to 8 bit."""
+        import cv2
+
+        from filmscan_studio.core import render as rnd
+
+        window.project.root = tmp_path
+        window.save_jpeg()
+        out = tmp_path / "derived" / "frame001.jpg"
+        assert out.exists()
+        loaded = cv2.imread(str(out), cv2.IMREAD_GRAYSCALE)
+        d, _ = window.project.build_density("frame001.tif", crop=True)
+        display = rnd.render_for_display(d, window.current_params())
+        expected = np.rint(np.where(np.isfinite(display), display, 0.0)
+                           * 255.0).astype(np.uint8)
+        # JPEG is lossy: allow codec slack, demand agreement in tone.
+        assert loaded.shape == expected.shape
+        assert np.abs(loaded.astype(int)
+                      - expected.astype(int)).mean() < 3
+
+    def test_display_sliders_feed_params_and_remember(self, window, tmp_path,
+                                                      qtbot) -> None:
+        window.project.root = tmp_path
+        window.sl_gd.setValue(180)
+        window.sl_sb.setValue(5)
+        qtbot.wait(20)
+        p = window.current_params()
+        assert p.gamma_display == pytest.approx(1.8)
+        assert p.shadow_band == pytest.approx(0.05)
+        stored = window.project.frame_settings["frame001.tif"]
+        assert stored["gamma_display"] == pytest.approx(1.8)
+        assert stored["shadow_band"] == pytest.approx(0.05)
+
+    def test_spin_edits_drive_sliders(self, window) -> None:
+        """Textove pole (vpravo od jezdce) jsou plnohodnotny vstup."""
+        window.spin_toe.setValue(0.62)
+        window.spin_gamma.setValue(1.35)
+        window.spin_shoulder.setValue(0.28)
+        window.spin_gd.setValue(2.8)
+        window.spin_sb.setValue(0.08)
+        p = window.current_params()
+        assert p.profile.toe == pytest.approx(0.62)
+        assert p.profile.gamma == pytest.approx(1.35)
+        assert p.profile.shoulder == pytest.approx(0.28)
+        assert p.gamma_display == pytest.approx(2.8)
+        assert p.shadow_band == pytest.approx(0.08)
+        # a jezdec sedí na stejné hodnote (obousmerne spojeni)
+        assert window.sl_toe.value() == 62
+        assert window.sl_gd.value() == 280
+
+    def test_shadow_band_widens_floor(self, window, tmp_path) -> None:
+        """Větší stínový pás zvedne nejtmavší pixel — pod-base graduje."""
+        window.project.root = tmp_path
+        window.sl_sb.setValue(0)
+        window.save_render()
+        fused = tifffile.imread(tmp_path / "derived" / "frame001.positive.tif")
+        window.sl_sb.setValue(20)
+        window.save_render()
+        graded = tifffile.imread(tmp_path / "derived" / "frame001.positive.tif")
+        assert int(graded.min()) > int(fused.min())
+
+    def test_exposure_warning_toggles_overlay(self, window) -> None:
+        """Přepínač překreslí náhled bez nového renderu."""
+        window.spin_ev.setValue(3.0)   # +3 EV: pravá část přepálí škálu
+        before = np.array(window.view._image.constBits(), copy=True)
+        window.chk_warn.setChecked(True)
+        after = np.array(window.view._image.constBits(), copy=True)
+        assert not np.array_equal(before, after)   # červené světla přibydou
+        window.chk_warn.setChecked(False)
+        back = np.array(window.view._image.constBits(), copy=True)
+        assert np.array_equal(before, back)        # vypnuto = původní obraz
+
+    def test_output_histogram_fills(self, window) -> None:
+        assert window.out_histogram._hist is not None
+
+    def test_output_histogram_no_false_saturation(self, window) -> None:
+        """Signál s maximem 0,98 není saturace — kolejnice musí mlčet.
+
+        Dřív padla hodnota 1,0 (aniž by ji křivka ořízla) do posledního binu
+        s uzavřenou prava hranou a histogram namaloval hřeben u zdi + text
+        „světla" hlásil procenta, která v obraze nejsou.
+        """
+        near_white = np.linspace(0.02, 0.98, 64 * 64).reshape(64, 64)
+        x = near_white * 0.9           # nikde >= 1.0 -> žádný ořez křivkou
+        window.out_histogram.set_output(near_white, x=x)
+        assert window.out_histogram._hi_pct == pytest.approx(0.0)
+        assert window.out_histogram._lo_pct == pytest.approx(0.0)
+
+    def test_output_histogram_reports_true_clip(self, window) -> None:
+        """Skutečný ořez (x >= 1) se hlásí v procentech, ne v posledním binu."""
+        out = np.full((8, 8), 1.0)
+        x = np.full((8, 8), 1.2)       # křivka přestřelila škálu
+        window.out_histogram.set_output(out, x=x)
+        assert window.out_histogram._hi_pct == pytest.approx(100.0)
+        # žádná data v binech — nasycené pixily patří jen do textu
+        assert not window.out_histogram._hist.any()
+
+    def test_output_histogram_has_no_overlays(self, window) -> None:
+        """Druhý histogram nesmí žádné překryvy (povel 2026-09-21): ani
+        kurzorovou čáru, ani kolejnice — hover jen preskočí status."""
+        window._pixel_hovered((1.2, 0.75))
+        assert window.histogram._cursor_d == pytest.approx(1.2)  # ten první ANO
+        assert not hasattr(window.out_histogram, "_cursor_out")
+        assert not hasattr(window.out_histogram, "_clip_hi")
 
 
 class TestExposureSpin:
@@ -321,10 +441,10 @@ class TestPositiveRender:
             tmp_path / "derived" / "frame001.positive.tif")
         d, _ = window.project.build_density("frame001.tif", crop=True)
         from filmscan_studio.core import render as rnd
-        unflipped = rnd.quantise16(rnd.render_density(
+        unflipped = rnd.quantise16(rnd.render_for_display(
             d, window.current_params()))
         assert not np.array_equal(exported, unflipped)
-        flipped = rnd.quantise16(rnd.render_density(
+        flipped = rnd.quantise16(rnd.render_for_display(
             d[:, ::-1], window.current_params()))
         assert np.array_equal(exported, flipped)
 
@@ -361,3 +481,20 @@ class TestHistogram:
         window.histogram.render(img)
         window.histogram.set_density(None)
         window.histogram.render(img)
+
+    def test_shadow_band_moves_input_curve(self, window) -> None:
+        """Stínový pás musí být vidět i v křivce vstupního histogramu.
+
+        Křivka se počítá z render_for_display (positive_x vč. pásu), ne ze
+        zjednodušeného vzorce bez pásu -- jinak šoupátko hýbe výstupem, ale
+        v ladícím histogramu se nic neděje a operátor nevidí, co dělá.
+        """
+        from filmscan_studio.core import render as rnd
+        params = window.current_params()
+        xs = np.array([params.dmin])          # film base: bez pásu bod 0
+        no_band = rnd.render_for_display(
+            xs, dataclasses.replace(params, shadow_band=0.0))
+        with_band = rnd.render_for_display(
+            xs, dataclasses.replace(params, shadow_band=0.10))
+        assert float(no_band[0]) == pytest.approx(0.0, abs=1e-6)
+        assert float(with_band[0]) > float(no_band[0])

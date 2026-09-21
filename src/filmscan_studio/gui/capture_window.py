@@ -1471,6 +1471,7 @@ class CaptureWindow(QMainWindow):
         self._refresh_stage()
         self._poll_temperature()
         self.act_export.setEnabled(True)
+        self._autosave_project()   # metadata přežijí i pád aplikace
         if label == "Snímek" and first.path.suffix.lower() == ".tif":
             self._post_capture_check(first)
 
@@ -1586,6 +1587,7 @@ class CaptureWindow(QMainWindow):
         self.act_export.setEnabled(True)
         self.statusBar().showMessage(f"Film {film.film_id}: {paths.root}")
         self._log(f"nový film {film.label()} ({film.film_type_class.value})")
+        self._autosave_project()   # ať má i prázdné sezení projekt.json hned
         self._refresh_stage()
         self._refresh_buttons()
 
@@ -1603,19 +1605,45 @@ class CaptureWindow(QMainWindow):
         path, unmatched = self.session.export_project()
         self.statusBar().showMessage(f"Projekt exportován: {path}")
         self._log(f"export {path.name}")
-        if unmatched:
-            # The cooling rule (INSTRUCTIONS §7): a scan whose darks sit a
-            # different temperature away cannot be dark-subtracted honestly.
-            # The export still happened — this is the loud, listed warning.
-            QMessageBox.warning(
-                self, "Chybí teplotně sedící dark",
-                "Tyto skeny nemají dark pořízený ve stejné teplotě senzoru "
-                f"(±0,5 °C):\n  snímky {', '.join(str(n) for n in unmatched)}\n\n"
-                "Dark subtraction na chlazeném senzoru platí jen v úzkém "
-                "teplotním okně — změřené darky k nim nepatří. Pořiď dark "
-                "při stejné teplotě a export opakuj, nebo počítej s "
-                "šumovým/zbytkovým gradientem.",
-            )
+        self._warn_unmatched_darks(unmatched)
+
+    @staticmethod
+    def _warn_unmatched_darks(unmatched: list[int]) -> None:
+        """The cooling rule warning (INSTRUCTIONS §7) — manual export only.
+
+        The export still happened; this is the loud, listed warning that
+        those scans have no temperature-matched dark.
+        """
+        if not unmatched:
+            return
+        QMessageBox.warning(
+            None, "Chybí teplotně sedící dark",
+            "Tyto skeny nemají dark pořízený ve stejné teplotě senzoru "
+            f"(±0,5 °C):\n  snímky {', '.join(str(n) for n in unmatched)}\n\n"
+            "Dark subtraction na chlazeném senzoru platí jen v úzkém "
+            "teplotním okně — změřené darky k nim nepatří. Pořiď dark "
+            "při stejné teplotě a export opakuj, nebo počítej s "
+            "šumovým/zbytkovým gradientem.",
+        )
+
+    def _autosave_project(self) -> list[int]:
+        """Průběžný export projektu po každém skenu / novém filmu.
+
+        Metadata (včetně orientace pásu!) musejí přežít i pád aplikace —
+        do 2026-09-21 existoval projekt.json jen když operátor ručně
+        zmáčkl „Exportovat projekt“, a na třech sezeních to zapomněl,
+        takže developer ztratil zrcadlení. Tichá sestra ručního exportu:
+        žádný dialog, žádný status — varování na darky hlásí jen ruční
+        export a finalizace při zavření.
+        """
+        if self.session is None:
+            return []
+        try:
+            _path, unmatched = self.session.export_project()
+        except Exception as exc:  # noqa: BLE001 - sken je uložen, export ne
+            self._log(f"varování: automatický export projektu selhal: {exc}")
+            return []
+        return unmatched
 
     # ------------------------------------------------------------- one-shot IO
 
@@ -1708,6 +1736,10 @@ class CaptureWindow(QMainWindow):
     # ------------------------------------------------------------------ teardown
 
     def closeEvent(self, event) -> None:  # noqa: N102 - Qt naming
+        # Finalizace: poslední stav sezení (počet skenů, dark-šikmé) na disk
+        # ještě před odpojením kamery. Varovat tu ale umíme jen na ruční
+        # export — při zavírání už operátor nikam nejde, jen tichý zápis.
+        self._autosave_project()
         self._temp_timer.stop()
         if self._worker is not None:
             self._worker.stop()
