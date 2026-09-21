@@ -39,11 +39,12 @@ from pathlib import Path
 import numpy as np
 import tifffile
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QSlider, QSplitter, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSlider, QSizePolicy, QSplitter,
+    QVBoxLayout, QWidget,
 )
 
 from filmscan_studio.core import density as dens
@@ -85,6 +86,9 @@ class DensityView(QWidget):
     """Náhled renderu s zoom/pan a Shift+tažením rámčku (ROI)."""
 
     rect_chosen = Signal(object)      # (x0, y0, x1, y1) v whole-frame pixelech
+    #: Kurzor nad pixel: (D, out) -- hustota a render 0..1 (už po úpravách);
+    #: None když je kurzor mimo snímek.
+    hovered = Signal(object)
 
     MIN_ZOOM, MAX_ZOOM = 0.05, 16.0
 
@@ -100,14 +104,29 @@ class DensityView(QWidget):
         self._pan_origin = QPoint(0, 0)
         self._rect_px: QRect | None = None    # v pixelech náhledové mapy
         self._rect_src: tuple[int, int, int, int] | None = None
+        self._placeholder = "Otevři složku projektu (s frames/*.tif)"
         self.setMinimumSize(320, 240)
+        self.setMouseTracking(True)     # hover i bez tažení
+
+    def set_placeholder(self, text: str) -> None:
+        """Co kreslit, když není co; ať text nelže otevřené složce."""
+        self._placeholder = text
+        self.update()
 
     # ---------------------------------------------------------------- model
 
     def set_image(self, image: np.ndarray | None,
-                  map_wh: tuple[int, int] | None) -> None:
-        """Podvzorek náhledu 0..1 (s NaN) + rozměry mapy, ze které vzešel."""
+                  map_wh: tuple[int, int] | None,
+                  densities: np.ndarray | None = None) -> None:
+        """Podvzorek náhledu 0..1 (s NaN) + rozměry mapy, ze které vzešel.
+
+        ``densities`` je týž podvzorek v hustotě D (před renderem) -- aby
+        hover mohl hlásit obě čísla; má stejný tvar jako ``image``.
+        """
         self._map_wh = map_wh
+        self._out = None if image is None else np.asarray(image, np.float64)
+        self._dens = (None if densities is None
+                      else np.asarray(densities, np.float64))
         self._image = None if image is None else density_to_qimage(image)
         self._recompute_rect_px()
         self._fit()
@@ -189,6 +208,24 @@ class DensityView(QWidget):
         elif self._drag_pan_from is not None:
             self._origin = self._pan_origin + (pos - self._drag_pan_from)
             self.update()
+        self._emit_hover(pos)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.hovered.emit(None)
+
+    def _emit_hover(self, pos: QPoint) -> None:
+        """Přepočítá kurzor na pixel mapy a pošle (D, out) nebo None."""
+        if self._image is None or self._out is None:
+            self.hovered.emit(None)
+            return
+        mx = int((pos.x() - self._origin.x()) / max(self._zoom, 1e-6))
+        my = int((pos.y() - self._origin.y()) / max(self._zoom, 1e-6))
+        if not (0 <= mx < self._out.shape[1] and 0 <= my < self._out.shape[0]):
+            self.hovered.emit(None)
+            return
+        d = (float(self._dens[my, mx]) if self._dens is not None
+             else float("nan"))
+        self.hovered.emit((d, float(self._out[my, mx])))
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if self._drag_from is not None:
@@ -215,7 +252,7 @@ class DensityView(QWidget):
         if self._image is None:
             p.setPen(QColor(160, 160, 160))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                       "Otevři složku projektu (s frames/*.tif)")
+                       self._placeholder)
             return
         p.translate(self._origin)
         p.scale(self._zoom, self._zoom)
@@ -226,6 +263,186 @@ class DensityView(QWidget):
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(self._rect_px)
+
+
+#: Počet-binový histogram hustoty; při rozsahu 0..3.2 D je bin 0.0125 D --
+#: hrubší než šum měření, jemnější než rozlišení oka na křivce.
+HIST_BINS = 256
+#: Spodní zárukář osy: ani prázdný/rozmělněný snímek nesmí histogram roztáhnout
+#: na mikro-rozsah, osový popisek by poskakoval pod každým snímkem.
+D_HIST_MIN_SPAN = 0.5
+
+
+def density_histogram(d: np.ndarray, xmax: float = 3.2,
+                      xmin: float = 0.0,
+                      bins: int = HIST_BINS) -> np.ndarray:
+    """Histogram platných (konečných) hustot v D na [xmin, xmax].
+
+    ±inf (saturace / neprostupná hustota) do histogramu nepatří -- nemají
+    hodnotu, jen směr; počet na kolejnicích hlásí widget zvlášť. NaN taky ne.
+    """
+    fin = d[np.isfinite(d)]
+    if fin.size == 0:
+        return np.zeros(bins)
+    counts, _ = np.histogram(fin, bins=bins, range=(xmin, xmax))
+    peak = float(counts.max())
+    return counts / peak if peak > 0 else np.zeros(bins)
+
+
+class DensityHistogramWidget(QWidget):
+    """Histogram hustoty v [D] + body stupnice + promítnutá S-křivka.
+
+    Osa x je hustota, ne jas výstupu: to je doména měření, ve které se
+    rozhoduje (Dmin ze měření film base, Dmax z rozložení snímku). Tři vrstvy
+    nad jedinou osou:
+
+    * histogram -- kde v obraze *jsou* data (odpověď na „v jakém rozsahu
+      fotka je"); logaritmická výška, ať i slabá mása není neviditelná,
+    * svislé čáry Dmin (šedá) a Dmax (oranžová) -- kde jsem *řekl*, že rozsah
+      je; mimosvět mezi nimi je na tisku mrtvá zóna,
+    * bílá křivka -- kam který D dopadá na výstupu (0 = černá, 1 = bílá),
+      včetně expozice: posun křivky doleva = víc světla.
+
+    ±inf hustoty se kreslí jako plné sloupce na kolejnicích (vlevo −inf =
+    přepal, vpravo +inf = neprostupno) a NaN („bez světla") jen jako číslo --
+    ani jedno nemá vlastní hustotu, ale operátor o něm musí vědět.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._hist: np.ndarray | None = None
+        self._xmin = 0.0
+        self._xmax = 3.2
+        self._params: rnd.RenderParams | None = None
+        self._neg_inf_fraction = 0.0
+        self._pos_inf_fraction = 0.0
+        self._nan_fraction = 0.0
+        self._stats: dict[str, float] = {}
+        self._cursor_d: float | None = None   # hustota pod kurzorem
+        self.setMinimumHeight(120)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding,
+                           QSizePolicy.Policy.Fixed)
+
+    def set_density(self, d: np.ndarray | None) -> None:
+        if d is None:
+            self._hist = None
+            self.update()
+            return
+        # Osa se oběma směry přizpůsobí datům (i záporná D pod film base --
+        # dřív se ořezala na nulu a data vlevo se "řízla"), ale nikdy se
+        # ztenčí pod D_HIST_MIN_SPAN, aby škála neukazovala data jako proužek.
+        fin = d[np.isfinite(d)]
+        if fin.size:
+            self._xmin = min(0.0, float(fin.min()) - 0.02)
+            self._xmax = max(self._xmin + D_HIST_MIN_SPAN,
+                             float(np.percentile(fin, 99.9)) * 1.05)
+        else:
+            self._xmin, self._xmax = 0.0, D_HIST_MIN_SPAN
+        self._hist = density_histogram(d, self._xmax, self._xmin)
+        self._neg_inf_fraction = float(np.isneginf(d).mean())
+        self._pos_inf_fraction = float(np.isposinf(d).mean())
+        self._nan_fraction = float(np.isnan(d).mean())
+        self._stats = dens.density_stats(d)
+        self.update()
+
+    def set_cursor_density(self, d_val: float | None) -> None:
+        """Zobrazí/zmaže svislou čáru na hustotě hodnoty pod kurzorem."""
+        self._cursor_d = d_val
+        self.update()
+
+    def set_params(self, params: rnd.RenderParams | None) -> None:
+        self._params = params
+        self.update()
+
+    def _d_to_x(self, d_val: float) -> int:
+        w = self.width()
+        span = max(self._xmax - self._xmin, 1e-9)
+        return int(np.clip((d_val - self._xmin) / span, 0.0, 1.0) * (w - 1))
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), QColor(30, 30, 30))
+        if self._hist is None:
+            p.setPen(QColor(160, 160, 160))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "histogram D")
+            return
+
+        # Mrtvá zóna tisku: mimo [dmin, dmax] nic není.
+        if self._params is not None:
+            x0, x1 = self._d_to_x(self._params.dmin), \
+                self._d_to_x(self._params.dmax)
+            p.fillRect(0, 0, x0, h, QColor(80, 40, 40, 90))
+            p.fillRect(x1, 0, max(0, w - x1), h, QColor(40, 40, 80, 90))
+
+        # Histogram: log škála výšky (lineární by maisu pod tlakem bitu
+        # zakryla), kresleno jako plň pod křivkou.
+        poly = [(0, h)]
+        for i, v in enumerate(self._hist):
+            x = int(i / max(len(self._hist) - 1, 1) * (w - 1))
+            y = h - int(np.log1p(9.0 * float(v)) / np.log1p(9.0) * (h - 2))
+            poly.append((x, y))
+        poly.append((w - 1, h))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(220, 220, 220, 70))
+        pts = [QPoint(*pt) for pt in poly]
+        p.drawPolygon(QPolygon(pts))
+        p.setPen(QColor(220, 220, 220))
+        p.drawPolyline(QPolygon(pts[1:-1]))
+
+        if self._params is not None:
+            # Body stupně.
+            for d_val, color, label in (
+                    (self._params.dmin, QColor(0, 220, 255), "Dmin"),
+                    (self._params.dmax, QColor(255, 170, 0), "Dmax")):
+                x = self._d_to_x(d_val)
+                pen = QPen(color, 1, Qt.PenStyle.DashLine)
+                p.setPen(pen)
+                p.drawLine(x, 0, x, h)
+                p.drawText(x + 3, 12, label)
+            # Promítnutá křivka: jaký D -> jaký tisk (vč. expozice).
+            p.setPen(QPen(QColor(255, 255, 255), 2))
+            xs = np.linspace(self._xmin, self._xmax, 256)
+            net = (xs - self._params.dmin
+                   + rnd.D_PER_STOP * self._params.exposure_ev
+                   ) / self._params.span
+            out = self._params.profile.apply(np.clip(net, 0.0, 1.0))
+            p.drawPolyline(QPolygon([
+                QPoint(self._d_to_x(float(dv)),
+                       h - int(float(o) * (h - 2)))
+                for dv, o in zip(xs, out)]))
+
+        # Kurzor: oranžová svislá čára na D pixelu pod myší (z náhledu).
+        if self._cursor_d is not None and np.isfinite(self._cursor_d):
+            cx = self._d_to_x(self._cursor_d)
+            p.setPen(QPen(QColor(255, 140, 0), 2))
+            p.drawLine(cx, 0, cx, h)
+
+        # Kolejnice: ±inf mají směr, ne hodnotu -- ať jsou vidět.
+        if self._neg_inf_fraction > 0:
+            bw = max(3, int(np.sqrt(self._neg_inf_fraction) * w * 0.5))
+            p.fillRect(0, 0, bw, h, QColor(255, 255, 255, 150))
+        if self._pos_inf_fraction > 0:
+            bw = max(3, int(np.sqrt(self._pos_inf_fraction) * w * 0.5))
+            p.fillRect(w - bw, 0, bw, h, QColor(0, 120, 255, 150))
+
+        # Číselné konto: percentily + koš na kolejnicích a mimo světlo.
+        # "přepal" = D -inf (senz. na maximu) -> v pozitivu černá;
+        # "hustší než škála" = D +inf -> v pozitivu bílá. Černý pod je
+        # opak: ten má nízké, konečné D a je vidět v histogramu.
+        s = self._stats
+        if s and np.isfinite(s.get("d_p50", float("nan"))):
+            txt = (f"D min/p50/p99 {self._fmt1(s['d_min'])}/"
+                   f"{self._fmt1(s['d_p50'])}/{self._fmt1(s['d_p99'])}"
+                   f" · přepal(→černá) {self._neg_inf_fraction * 100:.2f} %"
+                   f" · nad škálu(→bílá) {self._pos_inf_fraction * 100:.2f} %"
+                   f" · bez světla {self._nan_fraction * 100:.1f} %")
+            p.setPen(QColor(200, 200, 200))
+            p.drawText(6, h - 6, txt)
+
+    @staticmethod
+    def _fmt1(v: float) -> str:
+        return f"{v:.2f}".replace(".", ",")
 
 
 class MainWindow(QMainWindow):
@@ -259,10 +476,17 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.lbl_orient)
         splitter.addWidget(left)
 
-        # -- střed: náhled ---------------------------------------------------
+        # -- střed: náhled + histogram ------------------------------------
+        centre = QWidget()
+        cv = QVBoxLayout(centre)
+        cv.setContentsMargins(0, 0, 0, 0)
         self.view = DensityView()
         self.view.rect_chosen.connect(self.rect_selected)
-        splitter.addWidget(self.view)
+        self.view.hovered.connect(self._pixel_hovered)
+        cv.addWidget(self.view, 1)
+        self.histogram = DensityHistogramWidget()
+        cv.addWidget(self.histogram)
+        splitter.addWidget(centre)
 
         # -- pravý sloupec: parametry + export -------------------------------
         right = QWidget()
@@ -306,8 +530,16 @@ class MainWindow(QMainWindow):
         self.spin_dmax.setValue(2.6)
         self.chk_dmax_auto = QCheckBox("auto ze snímku (p99,9 + okraj)")
         self.chk_dmax_auto.setChecked(True)
-        self.lbl_ev = QLabel("0,0 EV")
-        self.sl_ev = self._slider(-60, 60, 0)      # EV po třetinách
+        # Výstředník: interně 1/100 EV (jemný krok), jezdec ladí po 0,05,
+        # textové pole pojme i hodnotu mimo krok (0,15 = 3 ticky).
+        self.sl_ev = self._slider(-600, 600, 0)     # ±6 EV
+        self.sl_ev.setSingleStep(5)                 # 0,05 EV
+        self.sl_ev.setPageStep(20)                  # 0,2 EV (kolečko/klik do dráhy)
+        self.spin_ev = QDoubleSpinBox()
+        self.spin_ev.setRange(-6.0, 6.0)
+        self.spin_ev.setSingleStep(0.05)
+        self.spin_ev.setDecimals(2)
+        self.spin_ev.setSuffix(" EV")
         self.btn_defaults = QPushButton("Proposal (auto body, linear)")
         self.btn_defaults.clicked.connect(self.apply_defaults)
         form.addRow("Dmin [D]", self.spin_dmin)
@@ -315,12 +547,18 @@ class MainWindow(QMainWindow):
         form.addRow("Dmax [D]", self.spin_dmax)
         form.addRow("", self.chk_dmax_auto)
         form.addRow("Expozice", self.sl_ev)
-        form.addRow("", self.lbl_ev)
+        form.addRow("", self.spin_ev)
         form.addRow("", self.btn_defaults)
 
         self.spin_dmin.valueChanged.connect(self._setting_changed)
         self.spin_dmax.valueChanged.connect(self._setting_changed)
-        self.sl_ev.valueChanged.connect(self._ev_moved)
+        # obousmerne spojeni jezdec <-> spin; oba maji rozliseni 0,01,
+        # takze se signal nemohou rozkmitat (setValue bez zmeny signál pošle)
+        self.sl_ev.valueChanged.connect(
+            lambda v: self.spin_ev.setValue(v / 100.0))
+        self.spin_ev.valueChanged.connect(
+            lambda v: self.sl_ev.setValue(int(round(v * 100.0))))
+        self.spin_ev.valueChanged.connect(self._setting_changed)
         self.chk_dmin_auto.toggled.connect(self._dmin_toggled)
         self.chk_dmax_auto.toggled.connect(self._scale_toggled)
         self.spin_dmin.setEnabled(False)   # auto zapnuto
@@ -409,6 +647,9 @@ class MainWindow(QMainWindow):
             self._density = self.project.build_density(name, crop=False)
         except Exception as exc:  # noqa: BLE001
             self._density = None
+            self.histogram.set_density(None)
+            self.view.set_image(None, None)
+            self.view.set_placeholder(f"Snímek nelze změřit: {exc}")
             self.lbl_status.setText(f"Chyba měření {name}: {exc}")
             return
         d, prov = self._density
@@ -427,6 +668,7 @@ class MainWindow(QMainWindow):
         finally:
             self._loading = False
         self._update_status(d, prov)
+        self.histogram.set_density(d)
         for b in (self.btn_save_density, self.btn_save_render,
                   self.btn_save_flat):
             b.setEnabled(True)
@@ -441,9 +683,15 @@ class MainWindow(QMainWindow):
         """
         assert self.project is not None
         dmin = self._dmin_auto if self._dmin_auto is not None else 0.2
+        # Bez měření base (typicky flatless náhled) může relativní D spodek
+        # ležet pod výchozích 0,2 -- dmax musí_scale přesahovat, ať
+        # RenderParams nespadou a náhled vyjde.
+        suggested = self.project.suggested_dmax(name)
+        if suggested <= dmin:
+            dmin = max(0.0, suggested - 0.2)
         return rnd.RenderParams(
             dmin=dmin,
-            dmax=self.project.suggested_dmax(name),
+            dmax=suggested,
             exposure_ev=0.0,
             profile=FilmicProfile.neutral(),
             dmax_source="frame",
@@ -463,8 +711,8 @@ class MainWindow(QMainWindow):
         self.chk_dmax_auto.setChecked(params.dmax_source == "frame")
         self.spin_dmin.setValue(round(params.dmin, 3))
         self.spin_dmax.setValue(round(params.dmax, 3))
-        self.sl_ev.setValue(int(round(params.exposure_ev * 3.0)))
-        self.lbl_ev.setText(f"{params.exposure_ev:+.1f} EV")
+        self.sl_ev.setValue(int(round(params.exposure_ev * 100.0)))
+        self.spin_ev.setValue(round(params.exposure_ev, 2))
         self.sl_toe.setValue(int(round(params.profile.toe * 100)))
         self.lbl_toe.setText(self._fmt(params.profile.toe))
         self.sl_gamma.setValue(int(round(params.profile.gamma * 100)))
@@ -478,7 +726,7 @@ class MainWindow(QMainWindow):
         return rnd.RenderParams(
             dmin=self.spin_dmin.value(),
             dmax=self.spin_dmax.value(),
-            exposure_ev=self.sl_ev.value() / 3.0,
+            exposure_ev=self.spin_ev.value(),
             profile=FilmicProfile(toe=self.sl_toe.value() / 100.0,
                                   gamma=self.sl_gamma.value() / 100.0,
                                   shoulder=self.sl_shoulder.value() / 100.0),
@@ -522,10 +770,12 @@ class MainWindow(QMainWindow):
         d, _prov = self._density
         params = self.current_params()
         # Náhled vidí orientaci diváka; archiv zůstává surový.
-        display = rnd.render_for_display(
-            _subsample(self.project.orientation_apply(d), PREVIEW_MAX_DIM),
-            params)
-        self.view.set_image(display, (d.shape[1], d.shape[0]))
+        sub = _subsample(self.project.orientation_apply(d), PREVIEW_MAX_DIM)
+        display = rnd.render_for_display(sub, params)
+        # _subsample je stride-sám o sobě deterministický: display[i,j]
+        # pochází z sub[i,j], takže kurzor vidí týž pixel v D i v renderu.
+        self.view.set_image(display, (d.shape[1], d.shape[0]), densities=sub)
+        self.histogram.set_params(params)
 
     def rect_selected(self, rect: tuple[int, int, int, int]) -> None:
         """ROI z Shift+kreslení: přepočítá měření (archiv se krájí) i status."""
@@ -541,13 +791,32 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(f"Chyba měření: {exc}")
             return
         self._update_status(*self._density)
+        self.histogram.set_density(self._density[0])
         self.rerender()
 
     # -------------------------------------------------------------- status
 
-    def _ev_moved(self, value: int) -> None:
-        self.lbl_ev.setText(f"{value / 3.0:+.1f} EV")
-        self._setting_changed()
+    def _pixel_hovered(self, payload) -> None:
+        """Kurzor v náhledu: oranžová čára v histogramu + čísla do statusu.
+
+        ``payload`` je (D, out) z :class:`DensityView`, nebo None mimo snímek
+        -- pak se smaže čára a status se vrátí na popis měření.
+        """
+        if payload is None:
+            self.histogram.set_cursor_density(None)
+            if self._density is not None:
+                self._update_status(*self._density)
+            return
+        d_val, out_val = payload
+        self.histogram.set_cursor_density(
+            None if not np.isfinite(d_val) else d_val)
+        d_txt = ("—          " if not np.isfinite(d_val)
+                 else f"{d_val:+.3f} D")
+        inf_txt = (" (přepal→černá)" if d_val == -np.inf
+                   else " (nad škálu→bílá)" if d_val == np.inf
+                   else " (bez světla)" if np.isnan(d_val) else "")
+        self.lbl_status.setText(
+            f"pixel D {d_txt}{inf_txt} · pozitiv {out_val:.3f}")
 
     @staticmethod
     def _fmt(v: float) -> str:
@@ -570,8 +839,12 @@ class MainWindow(QMainWindow):
         self.spin_dmax.setEnabled(not self.chk_dmax_auto.isChecked())
         if (self.chk_dmax_auto.isChecked() and self._density is not None
                 and self.project is not None and self._current is not None):
-            self.spin_dmax.setValue(
-                round(self.project.suggested_dmax(self._current), 3))
+            dmax = round(self.project.suggested_dmax(self._current), 3)
+            # Relativní škála bez flatu může sahát pod aktuální Dmin --
+            # dmax ji musí přesáhnout, ať render nespadne.
+            dmax = max(dmax, round(self.spin_dmin.value()
+                                   + self.spin_dmax.singleStep(), 3))
+            self.spin_dmax.setValue(dmax)
         self._setting_changed()
 
     def _update_status(self, d: np.ndarray,
@@ -583,12 +856,17 @@ class MainWindow(QMainWindow):
             f"platno {s['valid_fraction'] * 100:.1f} %",
             f"D p50/p99: {self._fmt(s['d_p50'])}/{self._fmt(s['d_p99'])}",
         ]
+        if prov.flat_fallback:
+            parts.append("⚑ bez flat snímku — náhled je relativní "
+                         "(k nejjasnějším 0,1 %); Dmin zadej ručně")
         nan_fraction = float(np.isnan(d).mean())
         if nan_fraction > 0.0:
             parts.append(f"purpur (bez světla) {nan_fraction * 100:.1f} %")
         if s["valid_fraction"] < 0.85:
             parts.append("⚑ málo platných pixelů — zkontroluj ROI")
-        if s["valid_fraction"] > 0 and s["d_p50"] < 0.05:
+        if (s["valid_fraction"] > 0 and s["d_p50"] < 0.05
+                and not prov.flat_fallback):
+            # u relativního měření bez flatu je nula definiční, ne signál
             parts.append("⚑ medián D ~ 0 — je ve snímku film?")
         if self._dmin_auto is not None:
             parts.append(f"Dmin měřeno {self._dmin_auto:.3f}")

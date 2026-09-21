@@ -29,8 +29,10 @@ from filmscan_studio.capture.camera import (
     CaptureResult,
     LiveFrame,
     NotConnectedError,
+    SensorModes,
 )
 from filmscan_studio.core.exposure import ARCHIVE_GAIN, ExposureSettings
+from filmscan_studio.core.models import AcquisitionMetadata
 from filmscan_studio.core.rawio import write_frame
 from filmscan_studio.core.zoom import (
     MIN_ROI_PX,
@@ -45,11 +47,12 @@ from filmscan_studio.core.zoom import (
 MOCK_SENSOR = SensorSize(6224, 4168)
 MOCK_BLACK = 0.0
 MOCK_WHITE = 65535.0
-#: The SDK's analog gain range, in linear multipliers (permille 1000..8000).
-# Measured on the real ATR2600M (get_ExpoAGainRange): 0.1x..10x. The floor
-# is below unity — the sensor can attenuate, which is honest AE room but
-# never an archival setting (ARCHIVE_GAIN is pinned at 1.00x).
-MOCK_GAIN_RANGE = (0.1, 10.0)
+#: The SDK's analog gain range in linear multipliers. The real ATR2600M
+#: reports get_ExpoAGainRange() = (100, 10000, 100) *percent* Gain Values =
+#: 1x..100x (hardware-checked 2026-09-20; the old (0.1, 10.0) came from
+#: reading those percent values as permille). Unity is the floor and the
+# archival setting (ARCHIVE_GAIN = 1.00x).
+MOCK_GAIN_RANGE = (1.0, 100.0)
 #: Simulated dark-current DN per second of exposure at the archive gain.
 MOCK_DARK_DN_PER_S = 6.0
 #: Sensor temperature physics: ambient the sensor drifts toward, °C per minute
@@ -104,8 +107,17 @@ class MockCamera(CameraBackend):
                         else temperature_c)
         self._temp_clock = time.monotonic()
         self.target_history: list[float] = []
+        # ----------------------------------------------------------- readout modes
+        # Scanner default = the ATR2600M optimum the app applies at connect:
+        # LCG + low noise. HCG multiplies DN ~2.8x (measured); the mock keeps
+        # LCG+LN as its reference DN scale so scene maths stays in plain DN.
+        self._hcg = False
+        self._low_noise = True
+        self.mode_history: list[SensorModes] = []
         #: What the last capture() was asked about Live View (GUI contract).
         self.last_keep_live_view: bool | None = None
+        #: How many exposures the last capture() averaged (GUI contract).
+        self.last_capture_frames: int | None = None
 
     # ------------------------------------------------------------------ identity
 
@@ -131,7 +143,37 @@ class MockCamera(CameraBackend):
     def capabilities(self) -> CameraCapabilities:
         return CameraCapabilities(
             shutter=True, gain=True, live_view_zoom=True, cooling=self._cooling,
+            conversion_gain=True, low_noise=True,
         )
+
+    # ------------------------------------------------------------- readout modes
+
+    def get_modes(self) -> SensorModes:
+        return SensorModes(hcg=self._hcg, low_noise=self._low_noise)
+
+    def set_conversion_gain(self, hcg: bool) -> SensorModes:
+        self._require()
+        self._hcg = bool(hcg)
+        modes = self.get_modes()
+        self.mode_history.append(modes)
+        return modes
+
+    def set_low_noise(self, enabled: bool) -> SensorModes:
+        self._require()
+        self._low_noise = bool(enabled)
+        modes = self.get_modes()
+        self.mode_history.append(modes)
+        return modes
+
+    def _mode_dn_factor(self) -> float:
+        """DN scale vs. the LCG reference (hardware ratios, camera_tests).
+
+        HCG reads ~2.8× the DN of the same exposure (measured). Low-noise
+        readout is DN-neutral in *stills* (measured 0.996×); its ~0.83×
+        shift was a live-stream-only effect, so the mock — which exists for
+        exposure-maths tests — keeps it out.
+        """
+        return 2.81 if self._hcg else 1.0
 
     # ----------------------------------------------------------------- exposure
 
@@ -150,8 +192,8 @@ class MockCamera(CameraBackend):
     def set_gain(self, gain: float) -> float:
         self._require()
         low, high = MOCK_GAIN_RANGE
-        # The SDK takes integer permille; snap like the real thing does.
-        applied = round(max(low, min(high, gain)) * 1000) / 1000
+        # The SDK takes an integer percent Gain Value; snap like the real thing.
+        applied = round(max(low, min(high, gain)) * 100) / 100
         self._settings = self._settings.with_gain(applied)
         self.gain_history.append(applied)
         return applied
@@ -200,21 +242,42 @@ class MockCamera(CameraBackend):
     # ------------------------------------------------------------------ capture
 
     def capture(self, destination: Path, filename_stem: str,
-                keep_live_view: bool = True) -> CaptureResult:
+                keep_live_view: bool = True, frames: int = 1,
+                progress=None) -> CaptureResult:
         self._require()
         started = time.monotonic()
+        frames = max(1, int(frames))
         self.last_keep_live_view = keep_live_view
-        if self._capture_seconds:
-            time.sleep(self._capture_seconds)
-        self._advance_temperature()
+        self.last_capture_frames = frames
+        notes: list[str] = []
+        accumulated: np.ndarray | None = None
+        for taken in range(frames):
+            if self._capture_seconds:
+                time.sleep(self._capture_seconds)
+            self._advance_temperature()
+            frame = self.synth_frame(height=MOCK_SENSOR.height,
+                                     width=MOCK_SENSOR.width, binned=False)
+            accumulated = (frame.astype(np.float32) if accumulated is None
+                           else accumulated + frame)
+            if progress is not None:
+                progress(taken + 1, frames)
+        average = np.rint(accumulated / frames).astype(np.uint16)
         destination.mkdir(parents=True, exist_ok=True)
         # The same full-res mono TIFF the Touptek backend writes — the session
         # and developer read it through the production rawio path unchanged.
         target = destination / f"{filename_stem}.tif"
-        full = self.synth_frame(height=MOCK_SENSOR.height,
-                                width=MOCK_SENSOR.width, binned=False)
-        write_frame(target, full, black_level=MOCK_BLACK,
-                    white_level=MOCK_WHITE)
+        modes = self.get_modes()
+        write_frame(target, average,
+                    acquisition=AcquisitionMetadata(
+                        camera="Mock TS2600MP-G2", camera_serial="MOCK",
+                        iso=None, gain=self._settings.gain,
+                        exposure_time=self._settings.shutter,
+                        frames_averaged=frames,
+                        conversion_gain="HCG" if modes.hcg else "LCG",
+                        low_noise=modes.low_noise),
+                    black_level=MOCK_BLACK, white_level=MOCK_WHITE)
+        if frames > 1:
+            notes.append(f"average: uložen průměr z {frames} expozic")
         result = CaptureResult(
             path=target,
             size_bytes=target.stat().st_size,
@@ -224,6 +287,9 @@ class MockCamera(CameraBackend):
             # export validation must see, not a made-up number.
             sensor_temperature_c=(self._temp_c if self._cooling else None),
             bit_depth=16,
+            conversion_gain="HCG" if modes.hcg else "LCG",
+            low_noise=modes.low_noise,
+            notes=tuple(notes),
         )
         self._captures.append(result)
         return result
@@ -290,7 +356,8 @@ class MockCamera(CameraBackend):
         reference = 1.0 * ARCHIVE_GAIN
         signal = base * (s * g / reference)
         dark = MOCK_DARK_DN_PER_S * s
-        return float(np.clip(signal + dark + MOCK_BLACK, 0, MOCK_WHITE))
+        return float(np.clip((signal + dark + MOCK_BLACK) * self._mode_dn_factor(),
+                             0, MOCK_WHITE))
 
     def synth_frame(self, height: int, width: int, *, binned: bool = False,
                     offset: Roi | None = None) -> np.ndarray:

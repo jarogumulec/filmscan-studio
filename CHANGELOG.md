@@ -3,6 +3,190 @@
 Vše, co se od posledního stavu změnilo, a hlavně: **co nešlo bez fotoaparátu
 ověřit** a jak to poznat při prvním zapnutí s tělem.
 
+## 2026-09-20 — developer GUI: osa histogramu, kurzor pixelu, jemná expozice
+
+**Řezání histogramu vlevo — příčina:** osa byla pevně od **nuly**
+(`density_histogram(range=(0.0, xmax))`, `D_HIST_MAX` záruka doleva). Vše
+pod nulou — D pod film base (fog, lamp drift, u flatless relativní měření
+mínusové od podsvitu) — do histogramu nevlezo a jevilo se to jako uříznutý
+levý okraj dat i křivky. **Oprava:** osa `_xmin.._xmax` se nyní počítá
+z dat: `xmin = min(0, min(D) - 0.02)`, `xmax = max(xmin + 0.5, p99,9·1,05)`
+(sestupná záruka 0,5 D, ať se škála nesrazí na proužek). Křivka i mrtvá
+zóna se kreslí přes `_d_to_x` se stejným `_xmin`, takže sedí na data.
+
+**Histogram NENÍ z výřezu** — je z celého snímku (`build_density(crop=False)`),
+stejně jako náhled i status; ROI se uplatní až při exportu archivu
+(původní záměr, ROI rámeček se kreslí do whole-frame souřadnic).
+
+**Kurzor pixelu (nové):** `DensityView.hovered` signal — jakmile myš pojede
+nad náhledem, vyšle `(D, out)` pixelu pod ní (D z on-the-fly Hustotního
+podvzorku, `out` z renderu už **po** expozici i křivce; `_subsample` je
+stride, takže `display[i,j]` ≡ `sub[i,j]`). V histogramu běhá **oranžová
+svislá čára** na D, do status řádku se píše
+`pixel D +1,415 · pozitiv 0.441`. Mimo snímek / `leaveEvent` se maže
+a status vrací popis měření.
+
+**Jemná expozice:** jezdec míval krok ⅓ EV (test4: skokem ~0,33 EV —
+uživatel vnímal ~0,7). Nově `QSlider` ±6 EV v tickách po **0,01 EV**
+(singleStep 0,05, pageStep 0,2) + **`QDoubleSpinBox`** s libovolnou hodnotou
+(zadáš 0,15 → jezdec jede na 15). Obousměrné propojení, rozlišení shodné
+→ žádná oscilace. `lbl_ev` nahrazen spinboxem; `current_params()` čte spin.
+
+**"neprostup" přeclarováno:** byl to +inf D = *hustší než škála* (film
+nestihl prosvitovat) → v pozitivu **bílá**, ne černý pod. Popisek ahora
+`nad škálu(→bílá)`; přepal (−inf D) ponese `→černá`. Komentář vysvětluje,
+že černý pod je opak — nízké konečné D viditelné v histogramu.
+
+Testy: `TestExposureSpin`, `TestPixelProbe`, `TestHistogramAxis`
+(+ úprava EV hodnot v existujících GUI testech na nové rozlišení).
+Ověřeno headless na `test4`: osa −0,026..2,598, hover píše `pixel D +0,033
+· pozitiv 0,441`, `spin 0,15 → slider 15`. 431 testů zelených.
+
+## 2026-09-20 — developer: náhled i bez flat snímku
+
+Složka bez `flat_*.tif` dříve v vyvíječi **nevykreslila nic**:
+`build_density` hodil „project has no flat frames", GUI ho chytil jako
+„Chyba měření" a náhled zůstal prázdný s textem „Otevři složku projektu" —
+i když otevřená byla. Nyní:
+
+* **Fallback reference** (`project.py`): bez flatu nastupuje reference z
+  vlastních highlightů snímku (percentil 99,9 above-black signálu, konstantní
+  plocha) — design 04 připouští percentilovou base jen jako preview fallback,
+  ne jako měření. Hustoty jsou pak **relativní** (nula = nejjasnější místa),
+  Dmin z film base bez flatu stejně změřit nejde → zůstává ruční.
+* **Poctivý záznam**: `DensityProvenance.flat_fallback` (i v JSON hlavičce
+  archivu) — archiv z relativního měření se navenek nevydává za absolutní.
+  Přidané additivní pole, schéma beze změny, staré archivy čitelné.
+* **GUI**: status lišta nese „⚑ bez flat snímku — náhled je relativní
+  (k nejjasnějším 0,1 %); Dmin zadej ručně"; prázdný placeholder náhledu
+  už nikdy nelže otevřené složce (při reálné chybě měření píše co selhalo);
+  Proposal bez měření base nespadne, když relativní dmax ≤ výchozí dmin
+  (dmax i tak musí škálu přesáhnout).
+* **Ověřeno** na reálné složce `~/scans/test4` (flat chybí,
+  4 snímky): náhled 1245×834 vyjde, status radí, exporty se odblokují.
+  Syntetické testy: `TestFlatFallback` (project) +
+  `TestFlatlessProject` (GUI). 424 testů zelených.
+
+## 2026-09-20 — GUI: návrat tlačítka Flat Field
+
+Refactor „Kalibrace & číslo snímku" (collapsible box, ~2026-09-15) tichounce
+ztratil `btn_flat` — tlačítko se sice vytvořilo a napojilo, ale nikdy se
+nepřidalo do layoutu (`addWidget` chybělo v `calib_row`). Tmáře ani film base
+se nic nestalo; jen Flat zmizel z UI. Opraveno doplněním `addWidget` +
+regresivní test `test_calibration_buttons_are_parented_into_the_box`
+(parenting všech kalibračních tlačítek). Logika dark/film base nedotčena.
+
+## 2026-09-20 — capture: LCG + Low noise režimy, oprava jednotek gainu (přímý povel)
+
+418 testů zelených; ověřeno na reálné kameře (end-to-end still s metadaty).
+Zásah do capture vrstvy **na výslovný povel uživatele** (checklist 2026-09-20).
+
+**OPRAVA JEDNOTEK GAINU — `GAIN_UNIT` 1000 → 100.** SDK `ExpoAGain` jsou
+**procenta** (Gain Value; `toupcam.h` „percent, such as 300",
+`TOUPCAM_EXPOGAIN_MIN=100`, hardware readback `(100, 10000, 100)` = 1–100×
+dle manuálu). Dřívější permilový dělič znamenal: to, co aplikace i metadata
+jmenovaly „archivní gain 1,00×", bylo fyzikálně **GV 1000 = 10×** (+20 dB).
+Dopad na staré archivy: DN hodnoty platné, popisek `gain: 1.0` lhal (bylo
+10×); UI gain spin teď ukazuje skutečných 1–100× s výchozí 1,00×.
+
+**Konverzní gain + Low noise jako režimy** (`camera.py` `SensorModes`,
+`touptek.py` `apply_default_modes`/`set_conversion_gain`/`set_low_noise`):
+kamera přetrvává v **HCG** (hw: CG=1 při connectu) — aplikace nyní při
+connectu nastaví **LCG + low noise** (optimum skeneru: max full well 51 ke−
+a DR ~14,4 stopu; low noise na stillu prokazatelně neškodí — jen poloviční
+kadence náhledu). V GUI
+zaškrtávátka „LCG" a „Low noise" (implicitně zapnuto, per QSettings,
+přepínatelná za chodu — hw to bere na běžícím proudu; CG mění DN stupnici
+~2,8×, LN jen živý náhled ~0,83× (still 0,996× — měřeno), status bar
+připomíná přeřešit expozici). Obojí se píše do
+`AcquisitionMetadata` (`conversion_gain`, `low_noise`) → TIFF JSON i sidecar.
+Schéma beze změny (additivní pola, staré sidecary čitelné).
+
+**Hardware-probe (camera_tests (e), `probe_modes.py`):** FLAG_CG i
+FLAG_LOW_NOISE přítomny; HDR odmítnuto; fps 6,99→3,57 (LN); LN funguje i s
+3×3 overview binningem (3,65 fps — manuálové „jen All Pixel" na tomto kuse
+neplatí tvrdě); funkční poměr HCG/LCG DN = 2,81 (manuál 3,01); LN posouvá DN
+na ~0,83× **jen v live proudu** — still DN 0,996× a σ beze změny.
+Světelná fáze měření šumu (`lcg_hcg_snr.py`): při stejném DN má LCG
+σ 1,76× nižší a 3,06× expoziční headroom, oba módy shot-noise-limitované;
+tma čeká
+provoz.
+
+## 2026-09-19 (2) — capture: konec zámku gainu + kalibraverage 10× (přímé povely)
+
+409 testů zelených.
+
+**Zámek gainu pryč.** Capture nezahlaví snímek při gainu ≠ 1,00× —
+`_capture_block_reason` zůstalo jen „není připojen fotoaparát", výhrůžný
+tooltip tlačítka je pryč. Důvod: měření (d) ukázalo, že nízký gain s kompenzovanou
+expozicí je legitimní (0,1× = +1,44 dB); operátor si vybírá sám.
+`ARCHIVE_GAIN` zůstává jako výchozí hodnota (konekt, mock), ne jako pravidlo.
+
+**Kalibrace averageuje implicitně ×10** (`CALIBRATION_AVERAGE`): Dark, Flat
+i Film base fotí průměr z 10 expozic do JEDNOHO TIFF (stejná cesta jako
+spinbox u skenu, ale nezávisle na jeho hodnotě). Flat byl dřív 3 samostatné
+soubory pro median na disku; teď 1 averaging soubor (√10 > √3, median proti
+kosmickému záření na tomle senzoru nemá co řešit). Vývojářská vrstva čte
+soubory z disku a medianuje je — jedno averageované pole projde beze změny.
+Status bar hlásí „Dark: average 3/10…" i u kalibrace. Počet `count` sad
+zůstává jako parametr (implicitně 1).
+
+**Doba:** flat/dark/base trvají ~10× déle (u mocky ~8 s; na kameře
+10×(expozice + ~1 s readout)). Dark averageuje taky — tlumí readout šum i
+kolísání teploty, tmavý reference chce √K stejně jako flat.
+
+## 2026-09-19 — capture: SW clamp na hw dno + averaging snímků (přímé povely)
+
+406 testů zelených. Zásah do capture vrstvy **na výslovný povel uživatele**
+(ruší dočasně zákaz sahání do `capture/` ze checklistu).
+
+**Clamp expozice 300 → 100 µs** (`EXPO_TIME_RANGE_US`): SW dno bylo
+neprozkoumaný odhad, hw dno změřeno (camera_tests (a)): pod 100 µs firmware
+`E_INVALIDARG`. Kotvící test `test_shutter_floor_is_the_hardware_floor`
+brání návratu. Pod ~400 µs zůstává kvantování po ~75 µs — readback v
+`set_shutter` to operátorovi ukáže.
+
+**Averaging:** vedle tlačítka Capture je spinbox „Average" ×1…×16.
+`capture(frames=K)` proběhne K expozic v JEDNÉ still session (K× Snap,
+jedna rekonfigurace), uloží se **jediný TIFF = průměr** (float32 akumulace,
+žádné whole-DN biasy; dílčí snímky se neukládají — rozhodnutí operátora).
+`AcquisitionMetadata.frames_averaged` (default 1 = i staré sidecary, bez
+bumpu schématu), do logu poznámka „average: uložen průměr z N expozic",
+status bar „average k/n…" přes relay. Dary/flaty zůstávají více-souborové
+záměrně — jejich averaging je median stack v kalibraci. Hodnota spinboxu
+se persistuje přes QSettings.
+
+**Ověřeno na kameře 2026-09-19 (ATR2600M na rigu):** 10× Snap v jedné still
+session proběhne bez zádrhele — flat i dark ×10 trvají 9,5 s (≈ expozice +
+~0,9 s readout/download na snímek). Fyzika averageu sedí: σ single 5,7 DN →
+σ average(10) 2,0 DN, podíl 2,86 (√10=3,16; zbytek spolkne nestabilita
+světla). Sidecary nesou `frames_averaged`, sken při gainu 0,5× proběhl bez
+výhrady (zámek pryč). `DevelopProject.open` + calibration + hustota +
+developerské GUI (náhled, histogram, slider, export pozitiv/flat/hustota,
+reopen `develop_settings.json`) nad hw averageovaným projektem prošly bez
+kolize. Poznatek: kamera si po odpojení napájení drží vlastní poslední
+nastavení (připojila se na 0,1×/10 ms) — aplikace je poctivě čte a ukáže je;
+bez zámku gainu je na operátorovi, aby se podíval na stavový řádek.
+
+## 2026-09-18 večer (2) — vyvolávač: histogram D + vizualizace křivky
+
+397 testů zelených. Čistě `developer/gui.py` + testy; vrstvy neměny.
+
+**`DensityHistogramWidget`** pod náhledem: osa x je **hustota v [D]** (doména,
+ve které se rozhoduje), ne jas výstupu. Odpověď na „v jakém rozsahu fotka je"
+je histogram nad hustotou — data (konečné D) se počítají na plném rozlišení
+při výběru/ROI snímku, ±inf (směr, ne hodnota) do nich nepatří a kreslí se
+jako sloupce na kolejnicích: bílá vlevo = přepal (−inf), modrá vpravo =
+neprostupno (+inf); NaN („bez světla") jen číselně do stavového textu.
+
+Tři vrstvy nad jednou osou: **histogram** (log. výška, ať mása není nevidit;
+plň i linka), **body stupnice** Dmin (cyan) / Dmax (oranžová) tečkovaně —
+a pole mimo ně se stmívá (červeně pod Dmin = mrtvá zóna pod tiskovou černí,
+modře nad Dmax), takže posun slideru je sofort vidět jako „kolik obrazu
+zahazuji", a **bílá křivka** = promítnutí `RenderParams` (toe/gamma/shoulder
++ expozice): kde který D dopadne na tisku. Osa se automaticky roztáhne, aby
+Dmax i pravé konto vešly. Reaguje na každý slider přes `rerender()`.
+
 ## 2026-09-18 večer — vyvolávač: pozitiv, per-snímkové nastavení, orientace
 
 393 testů zelených. Zásah jen do developerské vrstvy (`core/render.py`,

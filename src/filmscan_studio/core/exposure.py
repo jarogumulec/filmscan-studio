@@ -31,7 +31,9 @@ DEFAULT_HEADROOM_EV = 0.4
 #: The archival scan's fixed sensitivity (2026-09 brief): the camera's noise
 #: floor. Scanning is a transmission measurement — exposure lives in the
 #: shutter, gain stays pinned so every frame of a film is the same measurement.
-#: On the IMX571 at HCG this is gain = 1.0 (the SDK's 1000 permille).
+#: On the IMX571 this is gain = 1.0 — the SDK's Gain Value 100 (percent),
+#: the floor of its reported range and max full well. (Fixed 2026-09-20:
+#: until the GAIN_UNIT=1000 bug was found, "1.00x" here was physically 10x.)
 ARCHIVE_GAIN = 1.0
 
 #: Percentile of the linear signal used as the "brightest real value".

@@ -25,6 +25,7 @@ from filmscan_studio.capture.camera import (
 )
 from filmscan_studio.capture.mock import MOCK_GAIN_RANGE, MOCK_SENSOR, MockCamera
 from filmscan_studio.capture.session import (
+    CALIBRATION_AVERAGE,
     DARK_TEMPERATURE_TOLERANCE_C,
     CaptureSession,
     SessionPaths,
@@ -105,15 +106,16 @@ class TestCameraContract:
             assert applied == pytest.approx(1 / 61)
             assert camera.info.shutter_choices == ()
 
-    def test_gain_snaps_to_permille(self) -> None:
+    def test_gain_snaps_to_percent_value(self) -> None:
+        """The SDK ladder is the integer percent Gain Value (100 = 1.00x)."""
         with MockCamera() as camera:
             applied = camera.set_gain(1.2345)
-            assert applied == pytest.approx(1.234, abs=1e-9)
-            assert camera.get_settings().gain == pytest.approx(1.234)
+            assert applied == pytest.approx(1.23, abs=1e-9)
+            assert camera.get_settings().gain == pytest.approx(1.23)
 
     def test_gain_clamped_to_range(self) -> None:
         with MockCamera() as camera:
-            assert camera.set_gain(50.0) == MOCK_GAIN_RANGE[1]
+            assert camera.set_gain(999.0) == MOCK_GAIN_RANGE[1]
             assert camera.set_gain(0.1) == MOCK_GAIN_RANGE[0]
 
     def test_iso_is_not_offered(self) -> None:
@@ -122,6 +124,18 @@ class TestCameraContract:
                 camera.set_iso(100)
             assert camera.capabilities().iso is False
             assert camera.capabilities().gain is True
+
+    def test_readout_modes_switchable(self) -> None:
+        """The mock mirrors the ATR2600M's LCG/HCG + low-noise switches,
+        defaulting to the scanner optimum (LCG + low noise)."""
+        with MockCamera() as camera:
+            modes = camera.get_modes()
+            assert modes.hcg is False and modes.low_noise is True
+            assert camera.capabilities().conversion_gain is True
+            assert camera.capabilities().low_noise is True
+            modes = camera.set_conversion_gain(hcg=True)
+            assert modes == camera.get_modes()
+            assert camera.mode_history[-1].hcg is True
 
     def test_live_frames_only_while_running(self) -> None:
         with MockCamera(live_fps=200) as camera:
@@ -209,18 +223,18 @@ class TestCoolingContract:
 class TestSessionWorkflow:
     def test_dark_then_flat_then_frames(self, session: CaptureSession) -> None:
         assert session.state.stage == "dark"
-        session.capture_dark(1)
+        session.capture_dark(1, average=1)
         assert session.state.stage == "flat"
-        session.capture_flat(3)
+        session.capture_flat(1, average=1)
         assert session.state.stage == "frames"
         assert session.state.has_calibration
         session.capture_scan()
         session.capture_scan()
         state = session.state
-        assert (state.dark_count, state.flat_count, state.scan_count) == (1, 3, 2)
+        assert (state.dark_count, state.flat_count, state.scan_count) == (1, 1, 2)
 
     def test_tiff_files_are_written(self, session: CaptureSession) -> None:
-        session.capture_dark(1)
+        session.capture_dark(1, average=1)
         files = list(session.paths.frames.glob("*.tif"))
         assert len(files) == 1
 
@@ -241,7 +255,7 @@ class TestSessionWorkflow:
         assert session.camera.last_keep_live_view is False
 
     def test_sidecar_written_beside_raw(self, session: CaptureSession) -> None:
-        result = session.capture_dark(1)[0]
+        result = session.capture_dark(1, average=1)[0]
         sidecar = session.paths.sidecar(result.path)
         assert sidecar.exists()
         payload = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -258,17 +272,82 @@ class TestSessionWorkflow:
     def test_sidecar_records_calibration_settings(self, session: CaptureSession) -> None:
         session.camera.set_shutter(8.0)
         session.camera.set_gain(1.5)
-        result = session.capture_dark(1)[0]
+        result = session.capture_dark(1, average=1)[0]
         payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
         assert payload["acquisition"]["exposure_time"] == pytest.approx(result.settings.shutter)
         assert payload["acquisition"]["gain"] == pytest.approx(1.5)
 
+    def test_sidecar_records_readout_modes(self, session: CaptureSession) -> None:
+        """LCG/HCG and low-noise change the DN scale — the sidecar must say
+        which modes the frame was exposed in (user order 2026-09-20)."""
+        session.camera.set_conversion_gain(hcg=True)
+        session.camera.set_low_noise(False)
+        result = session.capture_scan()
+        payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["acquisition"]["conversion_gain"] == "HCG"
+        assert payload["acquisition"]["low_noise"] is False
+
     def test_sidecar_records_sensor_temperature(self, session: CaptureSession) -> None:
-        result = session.capture_dark(1)[0]
+        result = session.capture_dark(1, average=1)[0]
         payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
         assert payload["sensor_temperature_c"] == pytest.approx(
             result.sensor_temperature_c
         )
+
+    def test_scan_average_stores_one_file_with_count(self, session) -> None:
+        """Averaging is the operator's 2026-09-19 ruling: K exposures go in,
+        ONE TIFF comes out, and the sidecar tells how many were averaged."""
+        result = session.capture_scan(average=4)
+        assert session.camera.last_capture_frames == 4
+        assert len(list(session.paths.frames.glob("frame*.tif"))) == 1
+        payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["acquisition"]["frames_averaged"] == 4
+
+    def test_scan_average_default_is_single_exposure(self, session) -> None:
+        result = session.capture_scan()
+        assert session.camera.last_capture_frames == 1
+        payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["acquisition"]["frames_averaged"] == 1
+
+    def test_scan_average_progress_reports(self, session) -> None:
+        seen: list[tuple[int, int]] = []
+        session.capture_scan(average=3,
+                             progress=lambda k, n: seen.append((k, n)))
+        assert seen == [(1, 3), (2, 3), (3, 3)]
+
+    def test_calibration_averages_ten_by_default(self, session) -> None:
+        """Operator order 2026-09-19: dark/flat/base average CALIBRATION_AVERAGE
+        exposures implicitly — one averaged TIFF per set, counted like the old
+        single file, sidecar carrying the count."""
+        dark = session.capture_dark()[0]
+        flat = session.capture_flat()[0]
+        assert session.camera.last_capture_frames == CALIBRATION_AVERAGE
+        assert len(list(session.paths.frames.glob("dark_*.tif"))) == 1
+        assert len(list(session.paths.frames.glob("flat_*.tif"))) == 1
+        for result in (dark, flat):
+            payload = json.loads(
+                session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+            assert payload["acquisition"]["frames_averaged"] == CALIBRATION_AVERAGE
+
+    def test_base_averages_by_default(self, session) -> None:
+        result, _sample = session.capture_base()
+        payload = json.loads(
+            session.paths.sidecar(result.path).read_text(encoding="utf-8"))
+        assert payload["acquisition"]["frames_averaged"] == CALIBRATION_AVERAGE
+
+    def test_scan_average_value_does_not_touch_calibration(self, session) -> None:
+        """The spinbox value is a scan setting passed explicitly per call;
+        calibration keeps its own implicit average regardless."""
+        scan = session.capture_scan(average=3)
+        assert session.camera.last_capture_frames == 3
+        dark = session.capture_dark()[0]
+        assert session.camera.last_capture_frames == CALIBRATION_AVERAGE
+        scan_payload = json.loads(
+            session.paths.sidecar(scan.path).read_text(encoding="utf-8"))
+        dark_payload = json.loads(
+            session.paths.sidecar(dark.path).read_text(encoding="utf-8"))
+        assert scan_payload["acquisition"]["frames_averaged"] == 3
+        assert dark_payload["acquisition"]["frames_averaged"] == CALIBRATION_AVERAGE
 
     def test_frame_numbers_follow_film(self, session: CaptureSession) -> None:
         session.capture_scan(12)
@@ -294,7 +373,7 @@ class TestSessionWorkflow:
         """
         session.camera.set_shutter(4.0)
         rect = (100, 100, 600, 500)
-        result, sample = session.capture_base(rect)
+        result, sample = session.capture_base(rect, average=1)
         payload = json.loads(session.paths.sidecar(result.path).read_text(encoding="utf-8"))
         assert payload["kind"] == "base"
         assert payload["acquisition"]["exposure_time"] == pytest.approx(4.0)
@@ -343,8 +422,8 @@ class TestSessionWorkflow:
         assert [s.mean_dn for s in stored] == [4000.0, 8000.0]
 
     def test_export_project_writes_json(self, session: CaptureSession) -> None:
-        session.capture_dark(1)
-        session.capture_flat(2)
+        session.capture_dark(1, average=1)
+        session.capture_flat(2, average=1)
         session.capture_scan()
         path, unmatched = session.export_project()
         assert unmatched == []   # mock temperature is stable: darks match
@@ -366,7 +445,7 @@ class TestSessionWorkflow:
         camera = MockCamera()
         camera.connect()
         s = CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id))
-        s.capture_dark(1)                                   # dark at the setpoint
+        s.capture_dark(1, average=1)                        # dark at the setpoint
         camera.set_tec_enabled(False)                       # sensor drifts warm
         import time
         time.sleep(0.4)
@@ -383,7 +462,7 @@ class TestSessionWorkflow:
         camera = MockCamera(cooling=False)
         camera.connect()
         s = CaptureSession(camera, film, SessionPaths.create(tmp_path, film.film_id))
-        s.capture_dark(1)
+        s.capture_dark(1, average=1)
         s.capture_scan()
         assert s.unmatched_scan_frame_numbers() == [1]
 
@@ -412,7 +491,8 @@ class TestSessionWorkflow:
     ) -> None:
         class Failing(MockCamera):
             def capture(self, destination: Path, filename_stem: str,
-                        keep_live_view: bool = True):
+                        keep_live_view: bool = True, frames: int = 1,
+                        progress=None):
                 raise RuntimeError("Čtení proudu selhalo")
 
         camera = Failing()
@@ -776,6 +856,9 @@ class TestFilmMetadataV2:
                    "exposure_time": 4.0}
         acq = AcquisitionMetadata.model_validate(old_acq)
         assert acq.exposure_time == 4.0
+        # Sidecars written before averaging (2026-09-19) carry no
+        # frames_averaged key — the default is the truth for them.
+        assert acq.frames_averaged == 1
         for gone in ("lens", "lens_serial", "f_number", "focus_distance_m",
                      "white_balance", "raw_developer"):
             assert not hasattr(acq, gone)

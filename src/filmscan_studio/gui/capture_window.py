@@ -53,11 +53,12 @@ import logging
 import threading
 from collections import deque
 from dataclasses import replace
+from functools import partial
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QTimer, QThread, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -87,7 +88,6 @@ from filmscan_studio.capture.quality import audit_frame, render_preview_jpeg
 from filmscan_studio.capture.session import CaptureSession, SessionPaths
 from filmscan_studio.capture.touptek import TouptekCamera
 from filmscan_studio.core.exposure import (
-    ARCHIVE_GAIN,
     ExposureSettings,
     MeterReading,
     parse_shutter,
@@ -266,6 +266,13 @@ class CaptureWindow(QMainWindow):
         self._temp_timer = QTimer(self)
         self._temp_timer.setInterval(2000)
         self._temp_timer.timeout.connect(self._poll_temperature)
+        #: Readout modes the operator wants (QSettings-persistent; the
+        #: scanner optimum LCG + low noise is the default — see camera_tests
+        #: lcg_hcg_snr). Applied at connect and switchable live.
+        mode_settings = QSettings("filmscan-studio", "Capture")
+        self._want_lcg = mode_settings.value("capture/mode_lcg", True, type=bool)
+        self._want_low_noise = mode_settings.value(
+            "capture/mode_low_noise", True, type=bool)
 
         self._build_ui()
         self._set_mode(raw_view=True)
@@ -341,8 +348,10 @@ class CaptureWindow(QMainWindow):
         self.gain_spin.setDecimals(2)
         self.gain_spin.setSuffix("×")
         self.gain_spin.setToolTip(
-            "Analogový gain (násobič signálu, ne ISO). 1.00× = nejnižší šum — "
-            "pro archiv platí: expozice patří do času, gain je identita měření."
+            "Analogový gain (násobič signálu, ne ISO). 1.00× = plný full well "
+            "a max. DR — pro archiv platí: expozice patří do času, gain je "
+            "identita měření. (Pozor: camera_tests Gain Value je totéž; "
+            "kamera ho hlásí v procentech, 100 = 1,00×.)"
         )
         self.gain_spin.editingFinished.connect(self._apply_gain_spin)
         row = QHBoxLayout()
@@ -352,12 +361,40 @@ class CaptureWindow(QMainWindow):
         # the two widgets it names, and both say what they are once touched.
         exposure_form.addRow(row)
 
+        # ------------------------------------------------- readout mode switches
+        # LCG (max full well/DR — the scanner domain) and low-noise readout
+        # are the operator's live switches (user order 2026-09-20: „udělej
+        # možnost ty režimy zaškrtnout do sw, implicitně ať jsou on ty
+        # optimální"). Both are recorded into every frame's metadata.
+        mode_row = QHBoxLayout()
+        self.mode_lcg = QCheckBox("LCG")
+        self.mode_lcg.setToolTip(
+            "Low Conversion Gain: max. full well (51 ke−) a dynamic range "
+            "(~14,4 stopu) — pro filmový skener se silným světlem. Vypnuto = "
+            "HCG: třetinový full well, minimální read noise (na astro).\n"
+            "Přepnutí mění DN stupnici (~2,8×) — po přepnutí přeřeš expozici."
+        )
+        self.mode_lcg.setChecked(self._want_lcg)
+        self.mode_lcg.toggled.connect(self._apply_mode_lcg)
+        mode_row.addWidget(self.mode_lcg)
+        self.mode_low_noise = QCheckBox("Low noise")
+        self.mode_low_noise.setToolTip(
+            "Low-noise readout: nižší čtecí šum, ale poloviční kadence proudu "
+            "(6,8→3,4 fps). Still snímek se nemění (měřeno 0,996×); jen živý "
+            "náhled čte nižší DN (~0,83×). Přepínat lze i za běhu; po "
+            "přepnutí přeřeš expozici (histogram náhledu sedí jinak)."
+        )
+        self.mode_low_noise.setChecked(self._want_low_noise)
+        self.mode_low_noise.toggled.connect(self._apply_mode_low_noise)
+        mode_row.addWidget(self.mode_low_noise)
+        mode_row.addStretch()
+        exposure_box.body_layout().addLayout(mode_row)
+
         # The „Gain 1.00× (archiv)" button and the „Auto Exposure" button are
-        # gone (2026-09): the rig runs manual-only now — the archival gain rule
-        # still guards Capture (via _capture_block_reason, which reads the
-        # camera directly), and exposure is solved by the operator from the
-        # honest linear histogram, not by a closed loop. The gain spin stays:
-        # it is how a non-1.00× gain gets *back* to the archival 1.00×.
+        # gone (2026-09): the rig runs manual-only now — exposure is solved by
+        # the operator from the honest linear histogram, not by a closed loop.
+        # The archival gain RULE guarding Capture was removed too (operator
+        # order 2026-09-19): the gain spin is a free exposure control now.
         self.ae_hint = QLabel(
             "Měřicí rámeček: drž SHIFT a přetáhni myší — histogram i audit "
             "pak měří jen uvnitř (mimo něj nic nevidí). Při snímku se uloží "
@@ -460,10 +497,32 @@ class CaptureWindow(QMainWindow):
         right_layout.addWidget(self.zoom_note)
 
         # ------------------------------------------------------------- actions
+        # Capture + its averaging count share one row (2026-09-19: the
+        # operator asked for "vedle capture box, z kolika se averageuje").
+        capture_row = QHBoxLayout()
         self.btn_capture = QPushButton("Capture")
         self.btn_capture.setMinimumHeight(48)
         self.btn_capture.clicked.connect(lambda: self._capture(scan=True))
-        right_layout.addWidget(self.btn_capture)
+        capture_row.addWidget(self.btn_capture, stretch=1)
+        self.average_spin = QSpinBox()
+        self.average_spin.setRange(1, 16)
+        self.average_spin.setValue(1)
+        self.average_spin.setPrefix("×")
+        self.average_spin.setToolTip(
+            "Průměr z N po sobě jdoucích expozic — šum klesá ~√N, "
+            "při K≈8 už ale dotírá na kolísání světla (měřeno, camera_tests). "
+            "Ukládá se jediný TIFF = průměr; dílčí snímky se neukládají."
+        )
+        # Load first, connect second: otherwise constructing the window
+        # re-writes the setting on every launch.
+        self.average_spin.setValue(QSettings("filmscan-studio", "Capture").value(
+            "capture/average_frames", 1, type=int))
+        self.average_spin.valueChanged.connect(self._store_average_frames)
+        average_col = QVBoxLayout()
+        average_col.addWidget(QLabel("Average"))
+        average_col.addWidget(self.average_spin)
+        capture_row.addLayout(average_col)
+        right_layout.addLayout(capture_row)
 
         # Calibration and numbering happen once per session each, yet used to
         # claim three permanent rows (2026-09: "nevleze se tam vše").
@@ -471,9 +530,17 @@ class CaptureWindow(QMainWindow):
         calib_row = QHBoxLayout()
         self.btn_dark = QPushButton("Dark Frame")
         self.btn_dark.clicked.connect(lambda: self._capture(kind="dark"))
+        self.btn_dark.setToolTip(
+            "Tma: průměr z 10 expozic za tmy, uložen jako jeden TIFF. "
+            "Spinbox Average se ho nedotýká — kalibrace averageuje vždy."
+        )
         calib_row.addWidget(self.btn_dark)
         self.btn_flat = QPushButton("Flat Field")
         self.btn_flat.clicked.connect(lambda: self._capture(kind="flat"))
+        self.btn_flat.setToolTip(
+            "Vyrovnané pole: průměr z 10 expozic, uložen jako jeden TIFF. "
+            "Spinbox Average se ho nedotýká — kalibrace averageuje vždy."
+        )
         calib_row.addWidget(self.btn_flat)
         calib_box.body_layout().addLayout(calib_row)
         # Film base / min point — not a flat: a flat is shot WITHOUT film and
@@ -574,8 +641,11 @@ class CaptureWindow(QMainWindow):
             self._connecting = True
             self.act_connect.setEnabled(False)
             self.statusBar().showMessage("Hledám Touptek…")
-            self._start_worker(_connect_touptek, self._on_connected,
-                               on_failed=self._on_connect_failed)
+            lcg, ln = self._want_lcg, self._want_low_noise
+            self._start_worker(
+                lambda: _connect_touptek(default_lcg=lcg,
+                                         default_low_noise=ln),
+                self._on_connected, on_failed=self._on_connect_failed)
         elif chosen is mock:
             camera = MockCamera()
             camera.connect()
@@ -624,6 +694,7 @@ class CaptureWindow(QMainWindow):
             self._poll_temperature()
         self.view.sensor = self._sensor_size()
         self._populate_exposure_editors()
+        self._sync_mode_checkboxes()
         self.start_live_view()
         self._refresh_settings()
         self._refresh_buttons()
@@ -691,23 +762,71 @@ class CaptureWindow(QMainWindow):
         self._refresh_settings()
         self._refresh_buttons()
 
+    # ------------------------------------------------------------ readout modes
+
+    def _sync_mode_checkboxes(self) -> None:
+        """Mirror what the camera *reports* (not what we asked) into the UI."""
+        if self.camera is None:
+            return
+        caps = self.camera.capabilities()
+        modes = self.camera.get_modes()
+        self._echo = True
+        try:
+            self.mode_lcg.setEnabled(caps.conversion_gain)
+            self.mode_low_noise.setEnabled(caps.low_noise)
+            if modes.hcg is not None:
+                self.mode_lcg.setChecked(not modes.hcg)
+            if modes.low_noise is not None:
+                self.mode_low_noise.setChecked(modes.low_noise)
+        finally:
+            self._echo = False
+
+    def _store_mode(self, key: str, value: bool) -> None:
+        QSettings("filmscan-studio", "Capture").setValue(key, value)
+
+    def _apply_mode_lcg(self, lcg: bool) -> None:
+        self._want_lcg = lcg
+        self._store_mode("capture/mode_lcg", lcg)
+        if self.camera is None or self._echo:
+            return
+        try:
+            modes = self.camera.set_conversion_gain(hcg=not lcg)
+        except CameraError as exc:
+            QMessageBox.warning(self, "Konverzní gain", str(exc))
+            self._sync_mode_checkboxes()
+            return
+        self.statusBar().showMessage(
+            f"{'LCG' if lcg else 'HCG'} — pozor, DN stupnice se mění "
+            "(~2,8×), přeřeš expozici", 6000)
+        self._sync_mode_checkboxes()
+
+    def _apply_mode_low_noise(self, low_noise: bool) -> None:
+        self._want_low_noise = low_noise
+        self._store_mode("capture/mode_low_noise", low_noise)
+        if self.camera is None or self._echo:
+            return
+        try:
+            self.camera.set_low_noise(low_noise)
+        except CameraError as exc:
+            QMessageBox.warning(self, "Low noise", str(exc))
+            self._sync_mode_checkboxes()
+            return
+        self.statusBar().showMessage(
+            f"Low noise {'zapnuto' if low_noise else 'vypnuto'} — "
+            "kadence proudu a DN stupnice se mění, přeřeš expozici", 6000)
+        self._sync_mode_checkboxes()
+
     def _capture_block_reason(self) -> str | None:
         """Why Capture must refuse right now, or None when it may run.
 
-        The archival rule (2026-09 brief, carried to the Touptek): scan at
-        gain 1.00 and vary only the shutter. A frame exposed at any other
-        gain is a different measurement with more noise, so the button
-        refuses rather than let it slip through.
+        The archival gain rule (scan only at 1.00×) was **removed on the
+        operator's explicit order 2026-09-19** — gain is an ordinary exposure
+        control now (the gain×SNR measurement showed lower gain with a
+        longer, exposure-compensated shot is legitimate and quieter). What
+        remains is only the physical precondition: a connected camera.
         """
         if self.camera is None:
             return "Fotoaparát není připojen."
-        try:
-            gain = self.camera.get_settings().gain
-        except Exception:  # noqa: BLE001 - settings read flaky over USB
-            return None       # never block a shot on a settings read that hiccuped
-        if gain is not None and abs(gain - ARCHIVE_GAIN) > 1e-3:
-            return (f"Archivní sken vyžaduje gain {ARCHIVE_GAIN:.2f}× (teď "
-                    f"{gain:.2f}×) — vrať gain na 1.00× a exponuj jen časem.")
         return None
 
     # ------------------------------------------------------------- cooling UI
@@ -1139,7 +1258,8 @@ class CaptureWindow(QMainWindow):
                     old.disconnect()
                 except Exception:  # noqa: BLE001 - best effort on a wedged handle
                     log.exception("disconnect při obnově selhal")
-            camera = TouptekCamera()
+            camera = TouptekCamera(default_lcg=self._want_lcg,
+                                   default_low_noise=self._want_low_noise)
             camera.connect()
             return camera
 
@@ -1277,18 +1397,26 @@ class CaptureWindow(QMainWindow):
             # the full-size frame's own grid, never the 3×3-binned stream —
             # so the developer GUI can crop by it directly. No rect, no crop.
             crop = self._ae_rect_in_sensor_px()
-            fn, args = self.session.capture_scan, (number, crop)
+            average = self.average_spin.value()
             label = "Snímek"
+            fn, args = self.session.capture_scan, (
+                number, crop, average, self._capture_progress_cb(label)
+            )
         elif kind == "base":
             # The frame is full-size, so the rect must arrive in sensor px —
-            # the same conversion the audit uses.
-            fn = self.session.capture_base
-            args = (self._base_rect_in_sensor_px(),)
+            # the same conversion the audit uses. Calibration averaging is
+            # implicit (session default CALIBRATION_AVERAGE); the operator's
+            # spinbox governs scans only.
             label = "Film base"
+            fn = partial(self.session.capture_base,
+                         progress=self._capture_progress_cb(label))
+            args = (self._base_rect_in_sensor_px(),)
         else:
-            fn = self.session.capture_dark if kind == "dark" else self.session.capture_flat
-            args = ()
             label = "Dark" if kind == "dark" else "Flat"
+            fn = partial((self.session.capture_dark if kind == "dark"
+                          else self.session.capture_flat),
+                         progress=self._capture_progress_cb(label))
+            args = ()
         self._set_actions_busy(True)
         # The capture reconfigures the stream to full sensor internally; the
         # poller must not be pulling frames while it does (and on a long
@@ -1296,6 +1424,27 @@ class CaptureWindow(QMainWindow):
         self._pause_live_view()
         self.statusBar().showMessage(f"{label}: expozice…")
         self._start_worker(fn, lambda res: self._on_captured(label, res), *args)
+
+    def _capture_progress_cb(self, label: str):
+        """Backend progress -> status bar, via the relay (worker thread!).
+
+        The averaging loop calls this from the camera thread after every
+        pulled exposure; touching the status bar there directly is exactly
+        what the ResultRelay exists to prevent (macOS aborts, see its
+        docstring), so every tick rides the relay home to the UI thread.
+        """
+        def progress(k: int, n: int) -> None:
+            if n > 1:
+                self._relay.send(
+                    lambda _unused: self.statusBar().showMessage(
+                        f"{label}: average {k}/{n}…"), None)
+        return progress
+
+    def _store_average_frames(self, value: int) -> None:
+        """Persist the averaging count; it is an operator habit, not a film
+        property, so it lives in QSettings rather than the project."""
+        QSettings("filmscan-studio", "Capture").setValue(
+            "capture/average_frames", value)
 
     def _on_captured(self, label: str, results) -> None:
         self._set_actions_busy(False)
@@ -1547,17 +1696,10 @@ class CaptureWindow(QMainWindow):
         self.btn_base_frame.setEnabled(has_camera and has_session)
         self.btn_base_stream.setEnabled(has_camera and has_session)
         self.btn_base_mode.setEnabled(has_camera)
-        # The archival gain rule (2026-09, carried over): no scan at any
-        # sensitivity but the floor one. The tooltip states why, so the
-        # greyed button is an explanation and not a mystery.
-        scans_allowed = has_camera and has_session and (
-            self.camera is None or self._capture_block_reason() is None)
-        self.btn_capture.setEnabled(scans_allowed)
-        self.btn_capture.setToolTip(
-            "" if scans_allowed else
-            "Archivní sken se exponuje při gain 1.00× — vrať gain na 1.00× "
-            "a nastavuj jen čas."
-        )
+        # The archival gain rule is GONE (operator order 2026-09-19): gain is
+        # a free exposure control, Capture no longer interrogates it.
+        self.btn_capture.setEnabled(has_camera and has_session)
+        self.btn_capture.setToolTip("")
 
     def _log(self, line: str) -> None:
         current = self.log_view.text()
@@ -1578,8 +1720,15 @@ class CaptureWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def _connect_touptek() -> TouptekCamera:
-    """Enumerate and open on a worker thread; USB discovery can take seconds."""
-    camera = TouptekCamera()
+def _connect_touptek(default_lcg: bool = True,
+                     default_low_noise: bool = True) -> TouptekCamera:
+    """Enumerate and open on a worker thread; USB discovery can take seconds.
+
+    The mode defaults ride in as plain bools (read from QSettings on the UI
+    thread) — apply_default_modes puts the sensor into LCG + low noise at
+    connect unless the operator unchecked them.
+    """
+    camera = TouptekCamera(default_lcg=default_lcg,
+                           default_low_noise=default_low_noise)
     camera.connect()
     return camera

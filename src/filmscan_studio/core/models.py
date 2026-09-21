@@ -265,6 +265,29 @@ class AcquisitionMetadata(BaseModel):
     exposure_time: float | None = Field(default=None, description="Seconds.")
     capture_date: datetime | None = None
     copy_number: int = 1
+    #: How many consecutive exposures the stored frame is the mean of (2026-09-19
+    #: averaging; the user's ruling — only the averaged TIFF is archived). 1 = a
+    #: single exposure, which is also the value of every sidecar written before
+    #: averaging existed, so no schema bump or migration is needed.
+    frames_averaged: int = 1
+    #: Conversion gain the frame was exposed at: "LCG" (max full well — the
+    #: scanner mode) or "HCG" (min read noise — astro). None on bodies without
+    #: the switch, and in every sidecar written before 2026-09-20. The
+    #: DN↔electron mapping is mode-dependent (~2.8× measured on the ATR2600M),
+    #: so this is reproducibility provenance, not decoration.
+    conversion_gain: str | None = None
+    #: Low-noise readout on/off at exposure. Stills are DN-neutral across it
+    #: (measured 0.996×); it halves the frame rate and shifts only the live
+    #: preview's DN scale (~0.83×). None = unsupported or unrecorded (every
+    #: pre-2026-09-20 sidecar).
+    low_noise: bool | None = None
+
+    @field_validator("conversion_gain")
+    @classmethod
+    def _cg_known(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("LCG", "HCG"):
+            raise ValueError("conversion_gain is 'LCG', 'HCG' or None")
+        return v
 
     @model_validator(mode="before")
     @classmethod

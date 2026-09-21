@@ -290,6 +290,10 @@ class DensityProvenance:
     #: Fraction of valid pixels after masking -- low values flag a suspect
     #: frame ("no film?" / wrong calibration) right in the header.
     valid_fraction: float = 1.0
+    #: True when the frame was measured against a fallback reference (its own
+    #: highlight percentile) because the project has no flat frames. Densities
+    #: are then relative, not absolute -- preview only, never an archive.
+    flat_fallback: bool = False
     pipeline_version: int = DENSITY_SCHEMA_VERSION
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -310,6 +314,7 @@ class DensityProvenance:
             "dmin_source": self.dmin_source,
             "crop_rect": list(self.crop_rect) if self.crop_rect else None,
             "valid_fraction": self.valid_fraction,
+            "flat_fallback": self.flat_fallback,
         }
 
 

@@ -260,7 +260,9 @@ Mirror současného přístupu (`tests/test_nikon_sdk.py`) →
 > `PullStillImageV2` berou `c_char_p` buffer (přes `create_string_buffer`,
 > ndarray i POINTER odmítnou), a `WaitImageV4` na Snap'd still vrací
 > `E_UNEXPECTED` — still chodí přes `TOUPCAM_EVENT_STILLIMAGE` +
-> `PullStillImageV2`. Gain range `get_ExpoAGainRange` = 0,1–10×.
+> `PullStillImageV2`. Gain range `get_ExpoAGainRange` = (100, 10000, 100)
+> — **procenta** (Gain Value 100 = 1,00×; rozsah 1–100× dle manuálu).
+> (Původní zápis „0,1–10×" byl následek chybného děliče permile — viz §11.3.)
 
 1. Skutečný max fps při `BINNING=0x83` overview (16bit, USB3) —
    dokumentace dává vzorec jen orientačně
@@ -281,9 +283,33 @@ Mirror současného přístupu (`tests/test_nikon_sdk.py`) →
    trval 2,6 s (1s expozice), TIFF round-trip ok.
 3. Skutečné jednotky `ExpoAGain` (dB vs. permile) pro tento konkrétní model
    — SDK je obecné napříč desítkami produktů
-   → **✅ permile** (`put_ExpoAGain(1000)` = 1,00×; range 0,1–10×).
-   Pro archiv se doporučuje pevně 1,00×: IMX571 má 16bit ADC a plná
-   nádrž se vejde do 65535, <1× signál jen tłumí, >1× přidává šum.
+   → **✅ PROCENTA (Gain Value), ne permile** — opraveno 2026-09-20.
+   Původní závěr „permile (1000 = 1×)" byl OMYL z pohledu aplikace, která
+   dělila 1000: `toupcam.h` říká `/* percent, such as 300 */`,
+   `TOUPCAM_EXPOGAIN_MIN = 100`, hardware readback range = (100, 10000, 100)
+   a manuál ATR2600M uvádí Gain 1×–100× se stejnou tabulkou Gain Value
+   100…10000. Důsledek bugu: to, čemu aplikace říkala „archivní 1,00×",
+   bylo fyzikálně **Gain Value 1000 = 10×** (+20 dB, ~1/10 full wellu LCG).
+   `GAIN_UNIT` srovnán na 100; od nynějška „1,00×" znamená 1,00× a range
+   je 1–100×. Měření (d) 2026-09-19 interpretováno v novém světle: jeho
+   „gain 0,1×" byl fyzikálně 1× — závěr „nejnižší gain + delší čas = víc
+   fotonů" tím stojí O to víc. **Zámek gainu v Capture odstraněn 2026-09-19
+   na přímý povel operátora** — 1,00× je doporučená výchozí hodnota,
+   ne podmínka snímání.
+
+   **Metoda výpočtu jednotek gainu (GUI × ↔ Gain Value ↔ dB).** Rozsah
+   „1–100×" v GUI a „100–10000" v manuálu/SDK jsou TENTÝŽ rozsah v různých
+   jednotkách — trojmapa je lineární v první dvojici, logaritmická ve druhé:
+   - `Gain Value (SDK, %) = × × 100` ⇒ GUI 1,00× = GV 100; GUI 100× = GV 10000
+     (v kódu `GAIN_UNIT = 100.0`, `gain_to_value()`/`parse_gain_range()`)
+   - `Rel Gain (dB) = 20 · log10(Gain Value / 100)` (vzorec manuálu §2.9);
+     obráceně `Gain Value = 100 · 10^(dB/20)`. Tedy × = 10^(dB/20).
+   - Kontrola proti tabulce manuálu: GV 1000 → 20·log10(10) = +20,0 dB ✓
+     (manuál uvádí 19,90–20,08 dB, zaokrouhlení měření); GV 10000 → +40 dB ✓.
+   - Pozor na záměnu s `e-/ADU` (tomu se taky říká „gain" v astro smyslu):
+     to je převodní konstanta pixelu, klesá s rostoucím GV (LCG@GV100 =
+     0,77 e/ADU); násobek × / GV je analogový zesilovač za ní. Vyšší × ⇒
+     méně e na DN ⇒ menší full well i menší náboj na stejném DN.
 4. Zda externí 11–14V napájení je potřeba mít připojené i pro pouhé USB
    enumeraci/streamování bez chlazení (varovná hláška v GUI, pokud
    `EnumV2` selže a napájení není indikováno)
@@ -295,6 +321,30 @@ Mirror současného přístupu (`tests/test_nikon_sdk.py`) →
    `scripts/cooling_probe.py`: 32,1 → −3,1 °C za 180 s, dosáhne cíle
    ±0,2 °C). Semafor ±2 °C je tedy po nastavení cíle „closed“ zhruba
    po 3 minutách; při vypnutém chlazení teplota vyleze ke ~25–32 °C.
+
+## 12. Naměřené charakteristiky (2026-09-19, box `camera_tests/`)
+
+Samostatné skripty + grafy + CSV v `camera_tests/` (README tamtéž):
+
+- **Nejkratší expozice:** hw dno je **100 µs** (pod ním firmware
+  `E_INVALIDARG`). Původní SW clamp aplikace na 300 µs **srovnán s hw na
+  100 µs** (2026-09-19, přímý povel). Pod ~400 µs je expozice **kvantovaná
+  po ~75 µs** (skoky po ~12,3 k DN na bílém poli), plynulé krokování tam
+  nejde — readback v `set_shutter` to operátorovi ukáže.
+- **Averaging (gain 1×, +10 °C, bílé pozadí, 30 snímků):** SNR roste jen
+  do K≈4–8 (+2,6…3,2 dB) a saturuje na ~31 — tvoří ji fixní nerovnoměrnost
+  pozadí (3,2 %) a kolísání světla (3,8 %), ne šum senzoru. Víc snímků má
+  smysl jen se stabilizovaným světlem.
+- **Teplota × SNR (115 µs, pokoj → −5 °C):** rozdíl 0,09 dB, tj. žádný —
+  při krátkém osvitu dark current nic neznamená. TEC má smysl až pro
+  sekundové archivy; follow-up = dark-field charakteristika.
+- **Gain × SNR (expoziční kompenzace na ~26 k DN):** gain je **analogový
+  (před ADC)** — při 0,1× signál doroste na plných 65 535 DN, digitální
+  škálování by ořízlo na ~6,5 k. Zisk je na SNR vidět: 0,1× → 29,8 vs.
+  1,0× → 20,2 (+1,44 dB), ale je to zisk fotonů delší expozicí, ne
+  elektroniky; σ·gain ≈ konst (32 k DN·×) = elektronový šum nezávislý na
+  gainu, relativně 3,8 % = shoda s nestabilitou světla z (b). Gain ≥ 3
+  neudrží cíl pod saturací (hw dno 100 µs). Pro provoz: 1× je v pořádku.
 
 ## Doporučené pořadí implementace
 

@@ -183,6 +183,53 @@ class TestDensity:
         assert np.isfinite(d[:, 16:]).all()
 
 
+class TestFlatFallback:
+    """Without flat frames the frame must still preview -- relative D only."""
+
+    @staticmethod
+    def _strip_flats(session: Path) -> None:
+        for p in (session / "frames").glob("flat_*.tif*"):
+            p.unlink()
+
+    def test_build_density_previews_without_flat(self, session) -> None:
+        self._strip_flats(session)
+        proj = DevelopProject.open(session)
+        assert proj.flat_signal is None
+        d, prov = proj.build_density("frame001.tif")
+        assert prov.flat_fallback and prov.flat_shutter == SHUTTER_SCAN
+        # The ramp survives: relative densities still rise across x
+        # (true rise over cols 8..56 is 2.0 * 48/63).
+        col = np.nanmedian(d, axis=0)
+        assert col[56] - col[8] == pytest.approx(2.0 * 48 / 63, abs=0.1)
+
+    def test_export_flagged_in_provenance_json(self, session) -> None:
+        from filmscan_studio.core.density import write_density_tiff
+        self._strip_flats(session)
+        proj = DevelopProject.open(session)
+        d, prov = proj.build_density("frame001.tif")
+        out = write_density_tiff(session / "derived" / "x.density.tif",
+                                 d, prov)
+        import tifffile
+        with tifffile.TiffFile(out) as tf:
+            meta = json.loads(tf.pages[0].description)
+        assert meta["flat_fallback"] is True
+
+    def test_black_frame_without_flat_still_raises(self, session) -> None:
+        self._strip_flats(session)
+        p = session / "frames" / "frame001.tif"
+        from filmscan_studio.core.rawio import open_frame, write_frame
+        fr = open_frame(p)
+        write_frame(p, np.zeros_like(fr.data), acquisition=fr.acquisition)
+        proj = DevelopProject.open(session)
+        with pytest.raises(ValueError, match="no signal"):
+            proj.build_density("frame001.tif")
+
+    def test_flat_project_is_not_flagged(self, session) -> None:
+        proj = DevelopProject.open(session)
+        _d, prov = proj.build_density("frame001.tif")
+        assert not prov.flat_fallback
+
+
 class TestOrientation:
     def test_flags_loaded_from_project_json(self, session) -> None:
         payload = {"schema_version": 1, "film": {

@@ -29,7 +29,7 @@ from filmscan_studio.capture.touptek import (
     apply_raw_contract,
     disable_camera_autoexposure,
     even_roi,
-    gain_to_permille,
+    gain_to_value,
     options_for_flags,
     parse_gain_range,
     sensor_from_device,
@@ -53,13 +53,20 @@ def _const(name: str) -> int:
 class FakeHcam:
     """Records every call; answers plausibly; enforces stream-state rules."""
 
+    #: Options the REAL ATR2600M accepts on a running stream (hardware-checked
+    #: 2026-09-20: CG and LOW_NOISE writes land during a live stream; only
+    #: geometry (BINNING/ROI) is E_WRONG_THREAD there).
+    STREAM_SAFE_OPTIONS = frozenset({_const("CG"), _const("LOW_NOISE")})
+
     def __init__(self, *, options: dict[int, int] | None = None,
                  size: tuple[int, int] = (6224, 4168),
-                 gain_range=(1000, 8000, 1000), refuse_options=(),
+                 gain_range=(100, 10000, 100), refuse_options=(),
                  autoexpo: int = 0) -> None:
         # size is what get_Size answers — hardware: always the sensor
         # resolution, binning/ROI notwithstanding. Delivered frames come
         # from delivered_size().
+        # gain_range mirrors the real ATR2600M: percent Gain Values,
+        # (100, 10000, 100) = 1x..100x (hardware-checked get_ExpoAGainRange).
         self.calls: list[tuple] = []
         self.options = dict(options or {})
         self.refused = set(refuse_options)
@@ -71,7 +78,7 @@ class FakeHcam:
         #: stamps its exposure. The fake defaults to that; a test that wants
         #: the SDK-documented stamping opts in explicitly.
         self._stamp_expotime = False
-        self._gain_permille = 1000
+        self._gain_value = 100         # percent: 100 = 1.00x
         self._temperature = -52      # -5.2 °C in 0.1 units
         self._autoexpo = autoexpo    # camera-side AE state, persists in flash
         # A mono camera has no colour pipeline: reads of colour options fail
@@ -82,6 +89,9 @@ class FakeHcam:
         self.roi: tuple[int, int, int, int] | None = None
         self.pulls: list[tuple] = []
         self.waited: list[tuple] = []
+        #: Per-pull still fills (averaging tests); empty = constant 999.
+        self.still_fills: list[int] = []
+        self.still_pulls = 0
 
     # -- options ----------------------------------------------------------
     def put_Option(self, opt: int, value: int) -> None:
@@ -89,7 +99,8 @@ class FakeHcam:
             raise sdk.HRESULTException(0x80004005)
         self.calls.append(("put_Option", opt, value))
         self.options[opt] = value
-        self._check_not_running(opt)
+        if opt not in self.STREAM_SAFE_OPTIONS:
+            self._check_not_running(opt)
 
     def get_Option(self, opt: int) -> int:
         if opt in self.unreadable_options or opt not in self.options:
@@ -112,12 +123,12 @@ class FakeHcam:
     def get_ExpoTime(self) -> int:
         return self._expo_us
 
-    def put_ExpoAGain(self, permille: int) -> None:
-        self.calls.append(("put_ExpoAGain", permille))
-        self._gain_permille = permille
+    def put_ExpoAGain(self, value: int) -> None:
+        self.calls.append(("put_ExpoAGain", value))
+        self._gain_value = value
 
     def get_ExpoAGain(self) -> int:
-        return self._gain_permille
+        return self._gain_value
 
     def get_ExpoAGainRange(self):
         return self._gain_range
@@ -170,7 +181,13 @@ class FakeHcam:
     def PullStillImageV2(self, buf, bits, info) -> None:
         w, h = self._size
         self.pulls.append(((h, w), bits))
-        np.frombuffer(buf, dtype=np.uint16, count=w * h).reshape(h, w)[:] = 999
+        # Averaging tests need per-exposure values: a test sets still_fills
+        # to a list of constants and every pull delivers the next one.
+        fill = 999
+        if self.still_fills:
+            fill = self.still_fills[min(self.still_pulls, len(self.still_fills) - 1)]
+            self.still_pulls += 1
+        np.frombuffer(buf, dtype=np.uint16, count=w * h).reshape(h, w)[:] = fill
 
     def delivered_size(self) -> tuple[int, int]:
         """What the stream actually sends: get_Size is *not* this."""
@@ -222,7 +239,9 @@ class FakeDevice:
             self.still, self.preview, self.flag = still, preview, flag
 
     def __init__(self, dev_id="usb:1", name=b"ATR2600M",
-                 flag=sdk.TOUPCAM_FLAG_TEC | sdk.TOUPCAM_FLAG_MONO):
+                 flag=(sdk.TOUPCAM_FLAG_TEC | sdk.TOUPCAM_FLAG_MONO
+                       | sdk.TOUPCAM_FLAG_CG
+                       | sdk.TOUPCAM_FLAG_LOW_NOISE)):
         self.id = dev_id
         self.displayname = name
         self.model = FakeDevice._Model(
@@ -306,7 +325,7 @@ class TestConnect:
         info = camera.info
         assert info.manufacturer == "Touptek"
         assert info.shutter_choices == ()             # continuous
-        assert info.gain_range == (1.0, 8.0)          # permille / 1000
+        assert info.gain_range == (1.0, 100.0)        # percent GV / 100
         assert (info.sensor_width, info.sensor_height) == (6224, 4168)
 
     def test_no_camera_raises_with_power_hint(self, monkeypatch) -> None:
@@ -343,6 +362,12 @@ class TestExposureUnits:
         assert camera.set_shutter(1e-9) == EXPO_TIME_RANGE_US[0] / 1e6
         assert camera.set_shutter(1e9) == EXPO_TIME_RANGE_US[1] / 1e6
 
+    def test_shutter_floor_is_the_hardware_floor(self) -> None:
+        """Anchor: 300 µs was only an unprobed guess; the hardware floor is
+        100 µs (camera_tests/probe_min_exposure.py, 2026-09-19 — below it
+        put_ExpoTime raises E_INVALIDARG). Do not raise this again."""
+        assert EXPO_TIME_RANGE_US[0] == 100
+
     def test_shutter_reports_what_firmware_accepted(self, fake, camera) -> None:
         """First light 2026-09: the firmware has its own exposure ceiling —
         the GUI must show the accepted time, not the requested one (the
@@ -358,21 +383,25 @@ class TestExposureUnits:
         assert applied == pytest.approx(50.0)
         assert camera.get_settings().shutter == pytest.approx(50.0)
 
-    def test_gain_exchanged_in_permille(self, fake, camera) -> None:
+    def test_gain_exchanged_in_percent_value(self, fake, camera) -> None:
+        """The SDK's ExpoAGain is a percent Gain Value (100 = 1.00x), not
+        permille — the historical /1000 divisor made the app call GV 1000
+        "1.00x" when it is physically 10x (toupcam.h "percent", hardware
+        readback range (100, 10000, 100), both checked 2026-09-20)."""
         applied = camera.set_gain(2.5)
-        assert ("put_ExpoAGain", 2500) in fake.calls
+        assert ("put_ExpoAGain", 250) in fake.calls
         assert applied == pytest.approx(2.5)
 
     def test_gain_clamped_to_reported_range(self, fake, camera) -> None:
         assert camera.set_gain(0.5) == pytest.approx(1.0)
-        assert camera.set_gain(99.0) == pytest.approx(8.0)
+        assert camera.set_gain(999.0) == pytest.approx(100.0)
 
     def test_gain_helpers(self) -> None:
-        assert gain_to_permille(1.0) == 1000
-        assert gain_to_permille(1.2345) == 1234        # SDK ladder is integer
+        assert gain_to_value(1.0) == 100
+        assert gain_to_value(1.234) == 123            # SDK ladder is integer
         with pytest.raises(ValueError):
-            gain_to_permille(0.0)
-        assert parse_gain_range((1000, 8000, 1000)) == (1.0, 8.0)
+            gain_to_value(0.0)
+        assert parse_gain_range((100, 10000, 100)) == (1.0, 100.0)
         assert parse_gain_range((0, 0, 0)) == (1.0, 1.0)   # broken read
         assert shutter_to_us(0.5) == 500_000
 
@@ -549,6 +578,45 @@ class TestCapture:
         assert fake.waited == []
         assert fake.pulls and fake.pulls[-1][1] == 16   # 16-bit pull
 
+    def test_capture_frames_averages_into_one_tiff(self, fake, camera, tmp_path) -> None:
+        """frames=4: four Snaps in ONE still session, the archived TIFF is
+        their mean, the sidecar metadata says how many (operator ruling
+        2026-09-19 — the individual exposures are not kept)."""
+        fake._size = (6224, 4168)
+        fake.still_fills = [100, 200, 300, 400]
+        seen: list[tuple[int, int]] = []
+        result = camera.capture(tmp_path, "avg", frames=4,
+                                progress=lambda k, n: seen.append((k, n)))
+        snaps = [c for c in fake.calls if c[0] == "Snap"]
+        assert fake.pulls and len(snaps) == 4
+        frame = open_frame(result.path)
+        assert int(frame.data[0, 0]) == 250        # (100+200+300+400)/4
+        assert frame.acquisition.frames_averaged == 4
+        assert any("average" in n for n in result.notes)
+        assert seen == [(1, 4), (2, 4), (3, 4), (4, 4)]
+        # One reconfiguration only: a single Stop->Start still session.
+        assert len([c for c in fake.calls if c[0] == "Start"]) == 1
+
+    def test_capture_frames_default_unchanged(self, fake, camera, tmp_path) -> None:
+        """frames=1 keeps the old record: no average note, frames_averaged 1,
+        exactly one Snap."""
+        fake._size = (6224, 4168)
+        result = camera.capture(tmp_path, "single")
+        assert not any("average" in n for n in result.notes)
+        frame = open_frame(result.path)
+        assert frame.acquisition.frames_averaged == 1
+        assert len([c for c in fake.calls if c[0] == "Snap"]) == 1
+
+    def test_capture_average_keeps_sub_dn_precision(self, fake, camera, tmp_path) -> None:
+        """The mean runs in float: (100+102+103)/3 = 101.67 rounds to 102.
+        An integer mean that truncated between steps would land on 101 —
+        a systematic half-DN bias the noise maths must not inherit."""
+        fake._size = (6224, 4168)
+        fake.still_fills = [100, 102, 103]
+        result = camera.capture(tmp_path, "frac", frames=3)
+        frame = open_frame(result.path)
+        assert int(frame.data[0, 0]) == 102
+
     def test_capture_restores_live_view_mode(self, fake, camera, tmp_path) -> None:
         camera.start_live_view()
         camera.set_live_view_roi((2000, 1500, 1200, 1200))
@@ -687,3 +755,79 @@ class TestHelpers:
 
         notes = apply_raw_contract(LyingHcam(), RAW_OPTIONS)
         assert any("lineární" in n and "hlásí" in n for n in notes)
+
+
+class TestReadoutModes:
+    """LCG/HCG + low-noise switches (user order 2026-09-20)."""
+
+    def test_connect_applies_scanner_defaults(self, fake, camera) -> None:
+        """The ATR2600M persists in HCG (hardware: CG reads 1 at connect) —
+        the raw contract must put it into LCG + low noise unless told
+        otherwise, and the modes must be readable back."""
+        assert ("put_Option", _const("CG"), 0) in fake.calls       # LCG
+        assert ("put_Option", _const("LOW_NOISE"), 1) in fake.calls
+        modes = camera.get_modes()
+        assert modes.hcg is False and modes.low_noise is True
+
+    def test_connect_honours_operator_defaults_off(self, monkeypatch) -> None:
+        hcam = FakeHcam()
+        monkeypatch.setattr(sdk.Toupcam, "EnumV2",
+                            staticmethod(lambda: [FakeDevice()]))
+        monkeypatch.setattr(sdk.Toupcam, "Open", staticmethod(lambda _id: hcam))
+        cam = TouptekCamera(default_lcg=False, default_low_noise=False)
+        cam.connect()
+        assert ("put_Option", _const("CG"), 1) in hcam.calls        # HCG
+        assert ("put_Option", _const("LOW_NOISE"), 0) in hcam.calls
+        modes = cam.get_modes()
+        assert modes.hcg is True and modes.low_noise is False
+
+    def test_switch_conversion_gain_live(self, camera) -> None:
+        modes = camera.set_conversion_gain(hcg=True)
+        assert modes.hcg is True and modes.low_noise is True   # LN untouched
+        assert camera.set_conversion_gain(hcg=False).hcg is False
+
+    def test_switch_low_noise_live(self, camera) -> None:
+        modes = camera.set_low_noise(False)
+        assert modes.low_noise is False and modes.hcg is False  # LCG kept
+        assert camera.set_low_noise(True).low_noise is True
+
+    def test_mode_switch_while_streaming_is_allowed(self, camera) -> None:
+        """Hardware-checked 2026-09-20: the real camera takes CG/LOW_NOISE
+        writes on a running stream (unlike BINNING/ROI)."""
+        camera.start_live_view()
+        assert camera.set_conversion_gain(hcg=True).hcg is True
+        assert camera.set_low_noise(False).low_noise is False
+        camera.stop_live_view()
+
+    def test_camera_without_flags_refuses_and_is_not_asked(self,
+                                                           monkeypatch) -> None:
+        hcam = FakeHcam()
+        plain = FakeDevice(flag=sdk.TOUPCAM_FLAG_TEC | sdk.TOUPCAM_FLAG_MONO)
+        monkeypatch.setattr(sdk.Toupcam, "EnumV2",
+                            staticmethod(lambda: [plain]))
+        monkeypatch.setattr(sdk.Toupcam, "Open", staticmethod(lambda _id: hcam))
+        cam = TouptekCamera()
+        cam.connect()
+        written = {c[1] for c in hcam.calls if c[0] == "put_Option"}
+        assert _const("CG") not in written       # never asked what it lacks
+        assert _const("LOW_NOISE") not in written
+        caps = cam.capabilities()
+        assert caps.conversion_gain is False and caps.low_noise is False
+        modes = cam.get_modes()
+        assert modes.hcg is None and modes.low_noise is None
+        with pytest.raises(CameraError):
+            cam.set_conversion_gain(True)
+        with pytest.raises(CameraError):
+            cam.set_low_noise(True)
+
+    def test_capture_records_modes_in_metadata(self, fake, camera,
+                                               tmp_path) -> None:
+        fake._size = (6224, 4168)
+        camera.set_conversion_gain(hcg=False)
+        camera.set_low_noise(True)
+        result = camera.capture(tmp_path, "mode_frame")
+        assert result.conversion_gain == "LCG"
+        assert result.low_noise is True
+        from filmscan_studio.core.rawio import open_frame
+        acq = open_frame(result.path).acquisition
+        assert acq.conversion_gain == "LCG" and acq.low_noise is True

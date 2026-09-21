@@ -99,7 +99,30 @@ class CaptureResult:
     sensor_temperature_c: float | None = None
     #: Bits actually delivered, so the developer knows the scale to expect.
     bit_depth: int = 16
+    #: Sensor readout modes the frame was exposed in (metadata provenance —
+    #: LCG vs HCG and low-noise change the DN↔electron mapping, so a frame
+    #: is not reproducible without them). None = body without the control.
+    conversion_gain: str | None = None
+    low_noise: bool | None = None
     notes: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class SensorModes:
+    """Readout modes the camera is currently in (None = not supported/known).
+
+    * ``hcg`` — conversion gain: True = HCG (lowest read noise, small full
+      well), False = LCG (max full well / DR), None when the body cannot
+      switch. The IMX571 in the ATR2600M switches with a gain ratio of 3.01
+      (manual §2.6; hardware-measured DN ratio 2.81 on 2026-09-20).
+    * ``low_noise`` — the camera's low-noise readout (slower frame rate,
+      lower read noise). Stills are DN-neutral across it (measured 0.996×);
+      only the *live stream* reads ~0.83× the DN in low-noise on the
+      ATR2600M (measured), so preview metering shifts when it toggles.
+    """
+
+    hcg: bool | None = None
+    low_noise: bool | None = None
 
 
 @dataclass
@@ -120,6 +143,10 @@ class CameraCapabilities:
     live_view_zoom: bool = True
     #: TEC cooler with a readable sensor temperature and a setpoint.
     cooling: bool = False
+    #: HCG/LCG conversion-gain switch (Touptek flag CG).
+    conversion_gain: bool = False
+    #: Low-noise readout mode (Touptek flag LOW_NOISE).
+    low_noise: bool = False
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -158,6 +185,35 @@ class CameraBackend(ABC):
             f"{type(self).__name__} neumí nastavit gain"
         )
 
+    # ------------------------------------------------------- readout modes (optional)
+
+    def get_modes(self) -> SensorModes:
+        """Current readout modes (conversion gain, low noise)."""
+        return SensorModes()
+
+    def set_conversion_gain(self, hcg: bool) -> SensorModes:
+        """Switch HCG/LCG; returns the modes as the camera reports them now.
+
+        Optional (``capabilities().conversion_gain``). Changing it changes
+        the DN↔electron mapping: the same exposure reads ~2.8× higher in HCG
+        (measured), so exposure must be re-solved after a switch.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} neumí přepínat konverzní gain"
+        )
+
+    def set_low_noise(self, enabled: bool) -> SensorModes:
+        """Enable/disable the low-noise readout; returns the modes now.
+
+        Optional (``capabilities().low_noise``). Costs frame rate (ATR2600M
+        full-res 16bit: 6.8 → 3.4 fps) and shifts the *live* DN scale
+        (~0.83×, measured; stills are DN-neutral) — re-meter the preview
+        after a switch.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} neumí low noise mód"
+        )
+
     @abstractmethod
     def start_live_view(self) -> None: ...
 
@@ -185,13 +241,19 @@ class CameraBackend(ABC):
 
     @abstractmethod
     def capture(self, destination: Path, filename_stem: str,
-                keep_live_view: bool = True) -> CaptureResult:
+                keep_live_view: bool = True, frames: int = 1,
+                progress=None) -> CaptureResult:
         """Expose and write the 16-bit frame to ``destination``.
 
         Always full sensor resolution at native bit depth, whatever the Live
         View stream was doing — the archive must not inherit a binned or
         cropped preview. ``keep_live_view`` asks the backend to resume the
         previous Live View mode afterwards.
+
+        ``frames > 1`` asks for the mean of that many consecutive exposures
+        archived as the single TIFF (individual frames are not kept);
+        backends that cannot burst-average must document what they do
+        instead. ``progress(k, n)`` optionally reports pulled exposures.
         """
 
     @property

@@ -50,6 +50,11 @@ log = logging.getLogger(__name__)
 #: own JSONs so reopening a folder restores the operator's work.
 SETTINGS_FILENAME = "develop_settings.json"
 
+#: Fallback no-flat reference: percentile of the frame's own above-black
+#: signal standing in for the flat level (design 04: percentile base is a
+#: preview fallback only, never a measurement).
+FLAT_FALLBACK_PERCENTILE = 99.9
+
 
 @dataclass
 class FrameEntry:
@@ -305,7 +310,24 @@ class DevelopProject:
         """
         entry = self.entry(name)
         dn = self.scan_above_black(entry)
-        flat_sig = self.flat_at(entry.shutter, entry.gain)
+        flat_fallback = self.flat_signal is None
+        if flat_fallback:
+            # No flat frames: the operator still must *see* the frame. A
+            # uniform reference from the frame's own highlights stands in for
+            # the flat (design 04: the percentile base is a preview fallback,
+            # never a measurement). Densities are then relative to the
+            # frame's brightest 0.1 % -- recorded in provenance, flagged in
+            # the GUI status; per-pixel flat structure is of course absent.
+            level = float(np.percentile(dn, FLAT_FALLBACK_PERCENTILE))
+            if level <= 0:
+                raise ValueError(
+                    f"{name} carries no signal and the project has no "
+                    f"flat frames -- nothing to measure or preview")
+            flat_sig = np.full(dn.shape, level, dtype=np.float64)
+            flat_shutter = entry.shutter
+        else:
+            flat_sig = self.flat_at(entry.shutter, entry.gain)
+            flat_shutter = self.flat_shutter
         # No separate gain-map correction: T = scan/flat per pixel *is* the
         # flat-field correction (per-pixel sensitivity and light fall-off
         # appear in numerator and denominator alike) -- dividing by a unit-mean
@@ -329,12 +351,13 @@ class DevelopProject:
             dark_files=tuple(p.name for p in self.dark_paths),
             flat_files=tuple(p.name for p in self.flat_paths),
             dark_shutter=self.dark_shutter,
-            flat_shutter=self.flat_shutter,
+            flat_shutter=flat_shutter,
             dmin_density=self.dmin_auto(),
             dmin_source=(self.base_sample.source if self.base_sample
                          else "none"),
             crop_rect=rect,
             valid_fraction=float(np.isfinite(d).mean()),
+            flat_fallback=flat_fallback,
         )
         if rect is not None and crop:
             x0, y0, x1, y1 = rect

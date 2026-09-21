@@ -2,12 +2,15 @@
 
 These are contract tests for the brief's hard rules, not pixel tests: the two
 preview modes must differ in the image but *not* in the histogram, the zoom
-selector must reconfigure the *stream* (binned overview vs hardware ROI), the
-Capture button must refuse a non-archival gain, and no camera call may run on
-the UI thread.
+selector must reconfigure the *stream* (binned overview vs hardware ROI), and
+no camera call may run on the UI thread. (The old "Capture refuses a
+non-archival gain" rule was removed 2026-09-19 on the operator's order —
+`test_capture_allowed_at_any_gain` pins the new freedom.)
 """
 
 from __future__ import annotations
+
+import json
 
 import re
 
@@ -149,6 +152,16 @@ class TestCaptureWorkflow:
         assert not window.btn_capture.isEnabled()
         assert not window.btn_dark.isEnabled()
 
+    def test_calibration_buttons_are_parented_into_the_box(self, window):
+        """Regression: the 2026-09 calibration-box refactor silently dropped
+        the Flat Field button — the widget was built, connected and styled,
+        but never addWidget()'ed, so it vanished from the UI. A widget with
+        no parent is no widget at all."""
+        for button in (window.btn_dark, window.btn_flat,
+                       window.btn_base_mode, window.btn_base_stream,
+                       window.btn_base_frame):
+            assert button.parent() is not None
+
     def test_session_start_enables_workflow(self, window, tmp_path, qtbot):
         from filmscan_studio.capture.session import CaptureSession, SessionPaths
 
@@ -159,15 +172,47 @@ class TestCaptureWorkflow:
         assert window.btn_capture.isEnabled()
 
         window._capture(kind="dark")
-        qtbot.waitUntil(lambda: window.session.state.dark_count == 1, timeout=10000)
+        qtbot.waitUntil(lambda: window.session.state.dark_count == 1, timeout=60000)
         window._capture(kind="flat")
-        qtbot.waitUntil(lambda: window.session.state.flat_count == 3, timeout=20000)
+        # 2026-09-19: a flat is ONE averaged set now, not three files.
+        qtbot.waitUntil(lambda: window.session.state.flat_count == 1, timeout=60000)
         window._capture(scan=True)
         qtbot.waitUntil(lambda: window.session.state.scan_count == 1, timeout=10000)
 
         sidecars = list(paths.frames.glob("*.json"))
-        assert len(sidecars) == 5
+        assert len(sidecars) == 3
         assert "3) Snímání" in window.stage_label.text()
+
+    def test_average_spin_defaults_to_one(self, qtbot, camera):
+        # Hermetic: a leaked setting from another test (or a real app run on
+        # this machine) must not decide what "default" means here — hence a
+        # window built fresh, after the key is wiped.
+        from PySide6.QtCore import QSettings
+
+        QSettings("filmscan-studio", "Capture").remove("capture/average_frames")
+        fresh = CaptureWindow(camera=camera)
+        qtbot.addWidget(fresh)
+        assert fresh.average_spin.value() == 1
+        assert fresh.average_spin.minimum() == 1
+
+    def test_scan_passes_average_count_to_backend(self, window, tmp_path, qtbot):
+        """The spinbox beside Capture is the exposure count the backend
+        averages into the single archived TIFF (operator ruling 2026-09-19)."""
+        from PySide6.QtCore import QSettings
+
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        settings = QSettings("filmscan-studio", "Capture")
+        settings.remove("capture/average_frames")     # hermetic start
+        film = FilmMetadata(film_id="HP5_AVG", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window.average_spin.setValue(3)
+        window._capture(scan=True)
+        qtbot.waitUntil(lambda: window.session.state.scan_count == 1, timeout=20000)
+        assert window.camera.last_capture_frames == 3
+        assert len(list(paths.frames.glob("frame*.tif"))) == 1
+        settings.remove("capture/average_frames")     # don't leak to the app
 
     def test_scan_triggers_post_capture_audit(self, window, tmp_path, qtbot):
         """The linear stream makes the TIFF audit a confirmation, but it still
@@ -532,29 +577,36 @@ class TestExposureControls:
         window.gain_spin.editingFinished.emit()
         assert window.camera.get_settings().gain == pytest.approx(4.0)
 
-    def test_gain_button_is_gone_but_archival_rule_stays(self, window):
+    def test_gain_button_is_gone_and_gain_lock_is_gone(self, window):
         # 2026-09: the "Gain 1.00× (archiv)" and "Auto Exposure" buttons are
-        # out of the UI (manual-only rig). The archival *rule* still guards
-        # Capture — it just reads the camera directly now.
+        # out of the UI (manual-only rig). 2026-09-19: the archival *rule*
+        # itself was removed on the operator's order — gain is a free control.
         assert not hasattr(window, "btn_gain_base")
         assert not hasattr(window, "btn_autoexposure")
         window.camera.set_gain(4.0)
         window._refresh_settings()   # syncs the gain spin to 4.00
         assert window.gain_spin.value() == pytest.approx(4.0)
 
-    def test_capture_blocked_until_gain_base(self, window):
-        # "při gain 1.00 a nastavuj jen expozici": at any other sensitivity
-        # the Capture button is grey and _capture_block_reason says why. The
-        # gain spin is the way back to 1.00× now (there is no archive button).
+    def test_capture_allowed_at_any_gain(self, window, tmp_path, qtbot):
+        """The gain lock is gone (operator order 2026-09-19): Capture works
+        at 4× just like at 1×, and the frame records the gain it got."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
         window.camera.set_gain(4.0)
         window._refresh_settings()
         window._refresh_buttons()
-        reason = window._capture_block_reason()
-        assert reason is not None and "gain 1.00" in reason and "4.00" in reason
-        assert not window.btn_capture.isEnabled()
-        window.gain_spin.setValue(1.0)
-        window.gain_spin.editingFinished.emit()
         assert window._capture_block_reason() is None
+
+        film = FilmMetadata(film_id="HP5_G4", operator="JG")
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film, paths=paths)
+        window._refresh_buttons()
+        assert window.btn_capture.isEnabled()
+        window._capture(scan=True)
+        qtbot.waitUntil(lambda: window.session.state.scan_count == 1, timeout=20000)
+        payload = json.loads(
+            (paths.frames / "frame001.tif.json").read_text(encoding="utf-8"))
+        assert payload["acquisition"]["gain"] == pytest.approx(4.0)
 
     def test_shutter_text_edit_applies(self, window):
         window.shutter_edit.setEditText("1/125")
@@ -971,8 +1023,9 @@ class TestFilmBaseMinPoint:
         window._refresh_buttons()
         window._on_base_rect(QRect(10, 20, 110, 120))
         window._capture_base_frame()
+        # The frame now averages CALIBRATION_AVERAGE exposures (mock: ~8 s).
         qtbot.waitUntil(lambda: window.session.state.base_count == 1,
-                        timeout=15000)
+                        timeout=60000)
         qtbot.waitUntil(lambda: bool(window.session.base_samples()),
                         timeout=5000)
         sample = window.session.base_samples()[0]

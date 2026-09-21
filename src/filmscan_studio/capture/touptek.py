@@ -59,6 +59,7 @@ from filmscan_studio.capture.camera import (
     CaptureResult,
     LiveFrame,
     NotConnectedError,
+    SensorModes,
 )
 from filmscan_studio.core.exposure import (
     ARCHIVE_GAIN,
@@ -79,11 +80,24 @@ log = logging.getLogger(__name__)
 
 #: Fallback identity when the camera reports no usable resolution list.
 DEFAULT_SENSOR = SensorSize(6224, 4168)
-#: The SDK speaks microseconds; this is the clamp the shutter setter uses
-#: (0.3 ms to 30 minutes) until a narrower range is probed on hardware.
-EXPO_TIME_RANGE_US = (300, 1_800_000_000)
-#: Permille divisor: the SDK's ExpoAGain 1000 means 1.0x.
-GAIN_UNIT = 1000.0
+#: The SDK speaks microseconds; this is the clamp the shutter setter uses.
+#: The floor is the hardware floor, measured 2026-09-19 (camera_tests,
+#: probe_min_exposure.py): below 100 µs the firmware rejects put_ExpoTime
+#: with E_INVALIDARG. Caveat carried by the readback in ``set_shutter``:
+#: below ~400 µs the exposure is quantised in ~75 µs steps (IMX571 global
+#: shutter), so a requested 150 µs may come back as e.g. 175 µs.
+EXPO_TIME_RANGE_US = (100, 1_800_000_000)
+#: Divisor: the SDK's ExpoAGain is a *percent* Gain Value — 100 means 1.0x
+#: (toupcam.h: "percent, such as 300", TOUPCAM_EXPOGAIN_MIN = 100; the ATR2600M
+#: reports get_ExpoAGainRange() = (100, 10000, 100) = 1x–100x, hardware-checked
+#: 2026-09-20). The module historically divided by 1000 (permille), which
+#: made the app call Gain Value 1000 "1.00x" when it is physically 10x
+#: (+20 dB, ~1/10 of the LCG full well). Do not "fix" this back.
+GAIN_UNIT = 100.0
+#: TOUPCAM_OPTION_CG values (manual §2.6: the ATR2600M switches conversion
+#: gain with a ratio of 3.01; hardware-checked 2026-09-20: DN ratio 2.81).
+CG_LCG = 0   #: Low Conversion Gain: max full well / dynamic range (scanner)
+CG_HCG = 1   #: High Conversion Gain: lowest read noise (astro, little light)
 #: How long the live-view poll tolerates a silent stream before erroring.
 FRAME_TIMEOUT_S = 5.0
 #: Grace on top of the current exposure: a frame cannot arrive faster than
@@ -205,6 +219,49 @@ def disable_camera_autoexposure(hcam) -> list[str]:
     return notes
 
 
+def apply_default_modes(hcam, flags: int, *, lcg: bool = True,
+                        low_noise: bool = True) -> list[str]:
+    """Put the sensor into the scanner's preferred readout; returns notes.
+
+    The ATR2600M ships/persists in **HCG** (hardware-checked: CG reads 1 at
+    connect) — the astro mode: ~3.01× the gain, ~1/3 the full well. A film
+    scanner has plenty of light and lives on full well and linearity, so the
+    raw contract includes **LCG**. Low-noise readout halves the frame rate
+    (6.8→3.4 fps full-res, measured) for a few e− of read noise — with the
+    rig's strong light it is a preview-cadence trade the *operator* owns;
+    defaulting it on matches the archived optimum (max DR at low gain), and
+    the GUI can flip both live.
+
+    Like every other option write here the read-back is the contract, and
+    a body without the capability flag is not asked at all (it refuses with
+    E_INVALIDARG).
+    """
+    notes: list[str] = []
+    if flags & sdk.TOUPCAM_FLAG_CG:
+        wanted = CG_LCG if lcg else CG_HCG
+        try:
+            hcam.put_Option(sdk.TOUPCAM_OPTION_CG, wanted)
+            got = hcam.get_Option(sdk.TOUPCAM_OPTION_CG)
+        except sdk.HRESULTException as exc:
+            notes.append(f"konverzní gain ({'LCG' if lcg else 'HCG'}) odmítnuto "
+                         f"(hr=0x{exc.hr & 0xffffffff:x})")
+            return notes
+        if got != wanted:
+            notes.append(f"konverzní gain: kamera hlásí {got}, žádáno {wanted}")
+    if flags & sdk.TOUPCAM_FLAG_LOW_NOISE:
+        wanted = 1 if low_noise else 0
+        try:
+            hcam.put_Option(sdk.TOUPCAM_OPTION_LOW_NOISE, wanted)
+            got = hcam.get_Option(sdk.TOUPCAM_OPTION_LOW_NOISE)
+        except sdk.HRESULTException as exc:
+            notes.append(f"low noise mód odmítnut "
+                         f"(hr=0x{exc.hr & 0xffffffff:x})")
+            return notes
+        if got != wanted:
+            notes.append(f"low noise mód: kamera hlásí {got}, žádáno {wanted}")
+    return notes
+
+
 def _decode_name(raw: object) -> str:
     """EnumV2 names are bytes on macOS/Linux (c_char_p), str on Windows."""
     if isinstance(raw, bytes):
@@ -212,20 +269,22 @@ def _decode_name(raw: object) -> str:
     return str(raw or "")
 
 
-def parse_gain_range(range_permille: tuple[int, int, int]) -> tuple[float, float]:
-    """``get_ExpoAGainRange`` (min, max, default) in permille -> multipliers.
+def parse_gain_range(range_value: tuple[int, int, int]) -> tuple[float, float]:
+    """``get_ExpoAGainRange`` (min, max, default) in Gain Values -> multipliers.
 
-    A camera reporting a nonsensical range (all-zero on a broken read) is
-    reported as a fixed 1.0x rather than a range that would divide by zero.
+    The Gain Value is a percent (100 = 1.00x), so the ATR2600M's reported
+    (100, 10000, 100) is its manual range 1x–100x. A camera reporting a
+    nonsensical range (all-zero on a broken read) is reported as a fixed
+    1.0x rather than a range that would divide by zero.
     """
-    low, high, _default = range_permille
+    low, high, _default = range_value
     if low <= 0 or high < low:
         return (ARCHIVE_GAIN, ARCHIVE_GAIN)
     return (low / GAIN_UNIT, high / GAIN_UNIT)
 
 
-def gain_to_permille(gain: float) -> int:
-    """Linear multiplier -> the integer permille the SDK takes."""
+def gain_to_value(gain: float) -> int:
+    """Linear multiplier -> the integer Gain Value (percent) the SDK takes."""
     if gain <= 0:
         raise ValueError("gain must be a positive multiplier")
     return max(1, round(gain * GAIN_UNIT))
@@ -285,10 +344,17 @@ class TouptekCamera(CameraBackend):
     ``cam_id`` is an enumeration id from :meth:`enumerate`; ``None`` opens
     the first camera found. Ids change between sessions — pass a
     ``"sn:<serial>"`` string for a stable identity.
+
+    ``default_lcg`` / ``default_low_noise`` are the readout modes applied at
+    connect (the scanner optimum: LCG + low noise); the GUI passes what the
+    operator last checked so the choice survives reconnects.
     """
 
-    def __init__(self, cam_id: str | None = None) -> None:
+    def __init__(self, cam_id: str | None = None, *, default_lcg: bool = True,
+                 default_low_noise: bool = True) -> None:
         self._cam_id = cam_id
+        self._default_lcg = default_lcg
+        self._default_low_noise = default_low_noise
         self._hcam = None
         self._info: CameraInfo | None = None
         self._sensor = DEFAULT_SENSOR
@@ -297,6 +363,10 @@ class TouptekCamera(CameraBackend):
         self._raw_options = options_for_flags(sdk.TOUPCAM_FLAG_MONO)
         self._live_view = False
         self._cooling = False
+        #: Readout-mode support from EnumV2 flags (FLAG_CG / FLAG_LOW_NOISE);
+        #: a camera without the flag must not even be asked (E_INVALIDARG).
+        self._has_cg = False
+        self._has_low_noise = False
         self._frames: queue.Queue = queue.Queue(maxsize=1)
         # Stream mode the pull loop is configured for right now:
         self._binning = OVERVIEW_BINNING
@@ -344,8 +414,12 @@ class TouptekCamera(CameraBackend):
             flags = (int(getattr(dev.model, "flag", 0)) if dev is not None
                      else sdk.TOUPCAM_FLAG_MONO)
             self._raw_options = options_for_flags(flags)
+            self._has_cg = bool(flags & sdk.TOUPCAM_FLAG_CG)
+            self._has_low_noise = bool(flags & sdk.TOUPCAM_FLAG_LOW_NOISE)
             notes = disable_camera_autoexposure(hcam)
             notes += apply_raw_contract(hcam, self._raw_options)
+            notes += apply_default_modes(hcam, flags, lcg=self._default_lcg,
+                                         low_noise=self._default_low_noise)
             gain_range = parse_gain_range(hcam.get_ExpoAGainRange())
             try:
                 hcam.get_Option(_option_const("TECTARGET"))
@@ -396,7 +470,50 @@ class TouptekCamera(CameraBackend):
     def capabilities(self) -> CameraCapabilities:
         return CameraCapabilities(
             shutter=True, gain=True, live_view_zoom=True, cooling=self._cooling,
+            conversion_gain=self._has_cg, low_noise=self._has_low_noise,
         )
+
+    # --------------------------------------------------------------- readout modes
+
+    def get_modes(self) -> SensorModes:
+        if self._hcam is None:
+            return SensorModes()
+        hcg: bool | None = None
+        low_noise: bool | None = None
+        if self._has_cg:
+            try:
+                hcg = self._hcam.get_Option(_option_const("CG")) == CG_HCG
+            except sdk.HRESULTException:
+                hcg = None
+        if self._has_low_noise:
+            try:
+                low_noise = bool(self._hcam.get_Option(
+                    _option_const("LOW_NOISE")))
+            except sdk.HRESULTException:
+                low_noise = None
+        return SensorModes(hcg=hcg, low_noise=low_noise)
+
+    def set_conversion_gain(self, hcg: bool) -> SensorModes:
+        """Switch HCG/LCG — the DN↔electron mapping changes (~2.8× measured).
+
+        The ATR2600M accepts the write while streaming (hardware-checked,
+        unlike BINNING/ROI), so no Stop/Start dance is needed; the *caller*
+        still has to re-solve exposure afterwards.
+        """
+        self._require()
+        if not self._has_cg:
+            raise CameraError("kamera nehlásí přepínání konverzního gainu")
+        self._hcam.put_Option(_option_const("CG"), CG_HCG if hcg else CG_LCG)
+        return self.get_modes()
+
+    def set_low_noise(self, enabled: bool) -> SensorModes:
+        """Low-noise readout on/off: 6.8→3.4 fps full-res; the *live* stream
+        reads ~0.83× the DN (measured), stills are DN-neutral (0.996×)."""
+        self._require()
+        if not self._has_low_noise:
+            raise CameraError("kamera nehlásí low noise mód")
+        self._hcam.put_Option(_option_const("LOW_NOISE"), 1 if enabled else 0)
+        return self.get_modes()
 
     # ----------------------------------------------------------------- exposure
 
@@ -421,8 +538,8 @@ class TouptekCamera(CameraBackend):
         self._require()
         lo, hi = self._info.gain_range or (ARCHIVE_GAIN, ARCHIVE_GAIN)
         applied = max(lo, min(hi, gain))
-        self._hcam.put_ExpoAGain(gain_to_permille(applied))
-        # Read the accepted permille back — the ladder is integer-coarse.
+        self._hcam.put_ExpoAGain(gain_to_value(applied))
+        # Read the accepted Gain Value back — the ladder is integer-coarse.
         accepted = self._hcam.get_ExpoAGain() / GAIN_UNIT
         self._settings = self._settings.with_gain(accepted)
         return accepted
@@ -588,8 +705,9 @@ class TouptekCamera(CameraBackend):
     # ------------------------------------------------------------------ capture
 
     def capture(self, destination: Path, filename_stem: str,
-                keep_live_view: bool = True) -> CaptureResult:
-        """One full-sensor 1:1 frame written as a mono TIFF.
+                keep_live_view: bool = True, frames: int = 1,
+                progress=None) -> CaptureResult:
+        """Full-sensor 1:1 frame(s) written as one mono TIFF.
 
         Never the streamed frame — the archive must not inherit a binned or
         cropped preview (``CameraBackend.capture`` contract). Stop the live
@@ -600,8 +718,18 @@ class TouptekCamera(CameraBackend):
         for any waitMS, and waitMS=0 additionally means "return immediately"
         rather than a sensible default, whatever the docstring says). Then
         restore the previous Live View mode when asked.
+
+        ``frames > 1`` averages that many consecutive exposures *inside one*
+        still session (one reconfiguration, N Snaps) and archives the mean —
+        the operator's ruling from 2026-09-19: the individual frames are not
+        kept. The accumulation runs in float32 so the mean keeps sub-DN
+        precision the noise measurement relies on; the stored values stay on
+        the same DN scale as a single exposure, so the density maths of the
+        developer layer is averaging-blind. ``progress(k, n)`` (optional)
+        fires after each pulled exposure for the GUI's status bar.
         """
         self._require()
+        frames = max(1, int(frames))
         started = time.monotonic()
         notes: list[str] = []
         was_live = self._live_view
@@ -626,46 +754,68 @@ class TouptekCamera(CameraBackend):
             still_events: queue.Queue = queue.Queue()
             self._hcam.StartPullModeWithCallback(
                 lambda event, _ctx: still_events.put(event), None)
+            accumulated: np.ndarray | None = None
             try:
-                self._hcam.Snap(0xFFFFFFFF)     # 0xffffffff = current res
-                # Exposure time + readout + download headroom; the ATR2600M
-                # delivered a 1 s still in ~1.9 s.
-                deadline = (time.monotonic() + self._settings.shutter
-                            + STILL_WAIT_HEADROOM_S)
-                arrived = False
-                while time.monotonic() < deadline:
-                    try:
-                        event = still_events.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    if event == sdk.TOUPCAM_EVENT_STILLIMAGE:
-                        arrived = True
-                        break
-                if not arrived:
-                    still_error = CameraError(
-                        f"still expozice {self._settings.shutter:g} s "
-                        "nedodala snímek (do 15 s žádná STILLIMAGE událost) "
-                        "— zkontroluj napájení a kabel")
-                    raise still_error
-                self._hcam.PullStillImageV2(buf, 16, info)
+                for taken in range(frames):
+                    self._hcam.Snap(0xFFFFFFFF)     # 0xffffffff = current res
+                    # Exposure time + readout + download headroom; the ATR2600M
+                    # delivered a 1 s still in ~1.9 s.
+                    deadline = (time.monotonic() + self._settings.shutter
+                                + STILL_WAIT_HEADROOM_S)
+                    arrived = False
+                    while time.monotonic() < deadline:
+                        try:
+                            event = still_events.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        if event == sdk.TOUPCAM_EVENT_STILLIMAGE:
+                            arrived = True
+                            break
+                    if not arrived:
+                        still_error = CameraError(
+                            f"still expozice {self._settings.shutter:g} s "
+                            f"nedodala snímek {taken + 1}/{frames} "
+                            "(do 15 s žádná STILLIMAGE událost) "
+                            "— zkontroluj napájení a kabel")
+                        raise still_error
+                    self._hcam.PullStillImageV2(buf, 16, info)
+                    frame = np.frombuffer(
+                        buf, dtype=np.uint16, count=width * height
+                    ).reshape(height, width)
+                    # float32 copy: the buffer is reused by the next Snap and
+                    # the mean must not lose sub-DN precision to integer math.
+                    accumulated = (frame.astype(np.float32)
+                                   if accumulated is None
+                                   else accumulated + frame)
+                    if progress is not None:
+                        progress(taken + 1, frames)
             except sdk.HRESULTException as exc:
                 still_error = CameraError(
                     f"exposice nedodala snímek (hr=0x{exc.hr & 0xffffffff:x})")
                 raise still_error
-            still = (np.frombuffer(buf, dtype=np.uint16, count=width * height)
-                     .reshape(height, width))
+            still = np.rint(accumulated / frames).astype(np.uint16)
             temp = self.get_temperature_c()
+            # The DN scale is mode-dependent (HCG ~2.8x LCG, measured; low
+            # noise shifts only the live stream), so the mode belongs in the
+            # frame's provenance.
+            modes = self.get_modes()
             acquisition = AcquisitionMetadata(
                 camera=self._info.model,
                 camera_serial=self._info.serial,
                 iso=None,
                 gain=self._settings.gain,
                 exposure_time=self._settings.shutter,
+                frames_averaged=frames,
+                conversion_gain=(None if modes.hcg is None
+                                 else ("HCG" if modes.hcg else "LCG")),
+                low_noise=modes.low_noise,
             )
             destination.mkdir(parents=True, exist_ok=True)
             target = destination / f"{filename_stem}.tif"
             write_frame(target, still, acquisition=acquisition,
                         black_level=0.0, white_level=WHITE_LEVEL_16BIT)
+            if frames > 1:
+                notes.append(f"average: uložen průměr z {frames} expozic")
             # V4 wraps the V3 record; expotime lives on the inner struct.
             if info.v3.expotime:
                 notes.append(f"expotime hlášen {info.v3.expotime} us")
@@ -694,6 +844,8 @@ class TouptekCamera(CameraBackend):
             elapsed=time.monotonic() - started,
             sensor_temperature_c=temp,
             bit_depth=16,
+            conversion_gain=acquisition.conversion_gain,
+            low_noise=acquisition.low_noise,
             notes=tuple(notes),
         )
 

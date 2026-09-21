@@ -46,6 +46,13 @@ from filmscan_studio.core.rawio import RawFrame, open_frame
 #: window of it (degC). Dark current roughly halves per ~6 degC drop, so a
 #: mismatch of more than half a degree leaves a visible residual gradient.
 DARK_TEMPERATURE_TOLERANCE_C = 0.5
+#: Calibration frames are averaged over this many exposures by default
+#: (operator order 2026-09-19): dark, flat and base are references measured
+#: once — their whole job is to be *right*, and averaging K exposures cuts
+#: readout/light noise ~√K for a one-off wait. Independent of the scan
+#: averaging spinbox: the operator chooses that per session, calibration
+#: averages always. The single archived TIFF replaces the old N-file stack.
+CALIBRATION_AVERAGE = 10
 
 log = logging.getLogger(__name__)
 
@@ -145,31 +152,50 @@ class CaptureSession:
 
     # ---------------------------------------------------------------- workflow
 
-    def capture_dark(self, count: int = 1) -> list[CaptureResult]:
-        """Capture dark frames. Caller must have capped the light path first."""
-        return self._capture_frames(count, FrameKind.DARK)
+    def capture_dark(self, count: int = 1, average: int = CALIBRATION_AVERAGE,
+                     progress=None) -> list[CaptureResult]:
+        """Capture dark frames. Caller must have capped the light path first.
 
-    def capture_flat(self, count: int = 3) -> list[CaptureResult]:
+        ``count`` is how many separate dark *sets* (files) to produce — each
+        one is now the mean of ``average`` consecutive exposures (2026-09-19:
+        the same averaging the scan spinbox does, but implicit; a reference
+        frame is measured once in its life and √K is free).
+        """
+        return self._capture_frames(count, FrameKind.DARK, average=average,
+                                    progress=progress)
+
+    def capture_flat(self, count: int = 1, average: int = CALIBRATION_AVERAGE,
+                     progress=None) -> list[CaptureResult]:
         """Capture flat-field frames.
 
-        Defaults to three because flats are stacked, and a median of one gives no
-        way to detect a cosmic-ray hit in the stack.
+        Each set used to be three separate files for a median stack on disk;
+        since 2026-09-19 one set is ONE averaged TIFF (``average`` exposures,
+        default CALIBRATION_AVERAGE) — averaging √10 beats the old √3 and the
+        median's cosmic-ray robustness was worth less than the noise floor on
+        this sensor (no ionising radiation in a film archive). ``count`` still
+        produces that many independent files if someone wants repeats.
         """
-        return self._capture_frames(count, FrameKind.FLAT)
+        return self._capture_frames(count, FrameKind.FLAT, average=average,
+                                    progress=progress)
 
     def capture_base(self, rect: tuple[int, int, int, int] | None = None,
-                     ) -> tuple[CaptureResult, FilmBaseSample]:
+                     average: int = CALIBRATION_AVERAGE,
+                     progress=None) -> tuple[CaptureResult, FilmBaseSample]:
         """Capture a film base / min point frame and measure the rect on it.
 
         A real exposure (unlike the stream reading the GUI can also take): the
         frame is archived as a ``base`` capture with its own sidecar — shutter,
         gain, temperature — exactly like a dark or a flat, because a later
         scaling of this reference onto other-exposure frames needs all three.
+        Averaged over ``average`` exposures like the rest of calibration: the
+        min-point number is a measurement that gets propagated into every
+        density of the roll, so it deserves the √K.
         ``rect`` is in *sensor* pixels (the frame is full-size; the GUI
         converts from stream px before calling). The measured mean lands in the
         per-film ``film_base.json`` next to the archive record.
         """
-        result = self._capture_frames(1, FrameKind.BASE)[0]
+        result = self._capture_frames(1, FrameKind.BASE, average=average,
+                                      progress=progress)[0]
         # The measurement is this capture's whole point: an unreadable frame
         # is an error here, not a sidecar-worth-saving degradation.
         frame = self._read_frame(result.path)
@@ -199,7 +225,7 @@ class CaptureSession:
 
     def capture_scan(self, frame_number: int | None = None,
                      crop_rect: tuple[int, int, int, int] | None = None,
-                     ) -> CaptureResult:
+                     average: int = 1, progress=None) -> CaptureResult:
         """Capture one film frame under its film-advance number.
 
         ``crop_rect`` is the operator's red frame (= the picture's edge) in
@@ -207,6 +233,13 @@ class CaptureSession:
         calling, the same contract as :meth:`capture_base`'s rect. It rides
         into the sidecar (``CaptureRecord.crop_rect``) so the developer GUI
         can crop by it without re-measuring.
+
+        ``average`` is how many consecutive exposures the backend averages
+        into the single archived TIFF (the GUI's averaging spinbox; measured
+        benefit saturates around K≈8 on this rig — camera_tests README (b)).
+        Darks and flats stay multi-file on purpose: the calibration stack
+        *is* their averaging (``core/calibration.stack``) and it needs the
+        individual frames for the median.
         """
         number = (
             frame_number
@@ -216,7 +249,8 @@ class CaptureSession:
         if number < 1:
             raise ValueError("frame numbers start at 1")
         return self._capture_frames(
-            1, FrameKind.SCAN, frame_number=number, crop_rect=crop_rect
+            1, FrameKind.SCAN, frame_number=number, crop_rect=crop_rect,
+            average=average, progress=progress,
         )[0]
 
     # ----------------------------------------------------------------- internals
@@ -224,6 +258,7 @@ class CaptureSession:
     def _capture_frames(
         self, count: int, kind: FrameKind, frame_number: int | None = None,
         crop_rect: tuple[int, int, int, int] | None = None,
+        average: int = 1, progress=None,
     ) -> list[CaptureResult]:
         results: list[CaptureResult] = []
         for _ in range(count):
@@ -239,6 +274,7 @@ class CaptureSession:
                 result = self.camera.capture(
                     self.paths.frames, stem,
                     keep_live_view=self.keep_live_view,
+                    frames=average, progress=progress,
                 )
             except Exception as exc:  # noqa: BLE001 - surfaced to the GUI via last_error
                 self._last_error = str(exc)
@@ -267,6 +303,15 @@ class CaptureSession:
                 "iso": result.settings.iso,
                 "gain": result.settings.gain,
                 "capture_date": acquisition.capture_date or datetime.now().astimezone(),
+                # Readout modes travel from the capture itself (the embedded
+                # JSON carries them too); a backend without the controls
+                # reports None and the pre-mode value in the file survives.
+                "conversion_gain": (result.conversion_gain
+                                    if result.conversion_gain is not None
+                                    else acquisition.conversion_gain),
+                "low_noise": (result.low_noise
+                              if result.low_noise is not None
+                              else acquisition.low_noise),
             }
         )
         record = CaptureRecord(

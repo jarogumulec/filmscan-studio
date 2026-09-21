@@ -57,11 +57,11 @@ class TestWindow:
 
     def test_exposure_slider_rerenders(self, window, qtbot) -> None:
         before = np.array(window.view._image.constBits()[:64], copy=True)
-        window.sl_ev.setValue(30)   # +10 EV -- picture must respond
+        window.sl_ev.setValue(400)   # +4 EV -- picture must respond
         qtbot.wait(20)
         after = np.array(window.view._image.constBits()[:64], copy=True)
         assert not np.array_equal(before, after)
-        assert window.current_params().exposure_ev == pytest.approx(10.0)
+        assert window.current_params().exposure_ev == pytest.approx(4.0)
 
     def test_curve_sliders_feed_params(self, window) -> None:
         window.sl_toe.setValue(70)
@@ -153,11 +153,114 @@ class TestWindow:
         assert np.array_equal(exported, expected)
 
 
+class TestExposureSpin:
+    """Jemný krok expozice: spin pojme i hodnoty mimo krok jezdce."""
+
+    def test_spin_accepts_off_step_value(self, window) -> None:
+        window.spin_ev.setValue(0.15)
+        assert window.current_params().exposure_ev == pytest.approx(0.15)
+        # jezdec se prisune na nejbлиžnich 5 ticku (0,05)
+        assert window.sl_ev.value() == 15
+
+    def test_slider_drives_spin(self, window) -> None:
+        window.sl_ev.setValue(-75)                    # -0,75 EV
+        assert window.spin_ev.value() == pytest.approx(-0.75)
+        assert window.current_params().exposure_ev == pytest.approx(-0.75)
+
+    def test_no_oscillation_slider_spin(self, window) -> None:
+        # retezec obojstrannych spojeni se musi zastavit na jedne hodnote
+        window.spin_ev.setValue(2.37)
+        assert window.sl_ev.value() == 237
+        assert window.spin_ev.value() == pytest.approx(2.37)
+
+
+class TestPixelProbe:
+    """Hover nad nahledem: oranzova cara v histogramu + D/cislo do statusu."""
+
+    def test_hover_reports_density_and_out(self, window, qtbot) -> None:
+        from PySide6.QtCore import QPoint, QPointF, QEvent
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtWidgets import QApplication
+        before = window.lbl_status.text()
+        img = window.view._image
+        assert img is not None
+        # stred obrazu v widget souradnicich: map_px * zoom + origin
+        z = window.view._zoom
+        cx = img.width() * z / 2 + window.view._origin.x()
+        cy = img.height() * z / 2 + window.view._origin.y()
+        # qtbot.mouseMove v offscreen neposila hover bez tlacitka --
+        # sinteticky QMouseEvent je to, co Qt posila pri skutecnem mysi-pohybu
+        QApplication.sendEvent(
+            window.view,
+            QMouseEvent(QEvent.Type.MouseMove, QPointF(cx, cy),
+                        QPointF(cx, cy), Qt.MouseButton.NoButton,
+                        Qt.MouseButton.NoButton,
+                        Qt.KeyboardModifier.NoModifier))
+        qtbot.wait(20)
+        assert "pixel D" in window.lbl_status.text()
+        assert window.histogram._cursor_d is not None
+        window.view.leaveEvent(None)
+        qtbot.wait(20)
+        assert window.histogram._cursor_d is None
+        assert window.lbl_status.text() == before
+
+
+class TestHistogramAxis:
+    def test_axis_extends_below_zero(self, window) -> None:
+        d = np.array([[-0.3, -0.1, 0.0, 0.5, 1.2]] * 4, dtype=np.float32)
+        window.histogram.set_density(d)
+        assert window.histogram._xmin < -0.25   # data vlevo se nesmi oříznout
+
+    def test_axis_never_thinner_than_min_span(self, window) -> None:
+        d = np.full((8, 8), 0.05, dtype=np.float32)
+        window.histogram.set_density(d)
+        assert (window.histogram._xmax - window.histogram._xmin
+                >= 0.5 - 1e-9)
+
+
+class TestFlatlessProject:
+    """Bez flatů musí náhled vyjít a status musí radit, ne tvrdit, že
+    nemám otevřenou složku."""
+
+    def test_preview_shows_and_status_flags_fallback(self, qtbot,
+                                                     session, tmp_path) -> None:
+        for p in (session / "frames").glob("flat_*.tif*"):
+            p.unlink()
+        proj = DevelopProject.open(session)
+        w = MainWindow(project=proj)
+        qtbot.addWidget(w)
+        qtbot.waitUntil(lambda: w._density is not None, timeout=5000)
+        assert w.view._image is not None            # náhled je
+        assert "bez flat" in w.lbl_status.text()    # a říká proč
+        assert w.chk_dmin_auto.isChecked() is False  # Dmin ručně
+        # Tlačítka exportu se mají odblokovat i bez flatu.
+        assert w.btn_save_density.isEnabled()
+
+    def test_dmax_auto_stays_above_dmin(self, qtbot, session,
+                                        monkeypatch) -> None:
+        # Relativní D bez flatu může mít dmax < Dmin (reálné test4: 0,15 vs
+        # výchozích 0,2): auto dmax musí Dmin přece jen přesáhnout, jinak
+        # RenderParams spadne.
+        for p in (session / "frames").glob("flat_*.tif*"):
+            p.unlink()
+        proj = DevelopProject.open(session)
+        monkeypatch.setattr(proj, "suggested_dmax", lambda _n: 0.1)
+        w = MainWindow(project=proj)
+        qtbot.addWidget(w)
+        qtbot.waitUntil(lambda: w._density is not None, timeout=5000)
+        # Proposal musel spodní bod stáhnout, aby dmax (0,1) prošlo.
+        assert w.spin_dmin.value() < 0.1
+        w.chk_dmax_auto.setChecked(False)
+        w.chk_dmax_auto.setChecked(True)              # znova p99,9 + okraj
+        qtbot.wait(20)
+        assert w.spin_dmax.value() > w.spin_dmin.value()
+
+
 class TestPerFrameSettings:
     def test_slider_move_is_remembered_per_frame(self, window, tmp_path,
                                                  qtbot) -> None:
         window.project.root = tmp_path
-        window.sl_ev.setValue(15)                      # +5 EV
+        window.sl_ev.setValue(500)                     # +5 EV
         qtbot.wait(20)
         stored = window.project.frame_settings["frame001.tif"]
         assert stored["exposure_ev"] == pytest.approx(5.0)
@@ -178,7 +281,7 @@ class TestPerFrameSettings:
         window.set_project(proj2)
         qtbot.wait(20)
         assert window.frame_list.count() == 2
-        window.sl_ev.setValue(-9)                      # -3 EV on frame001
+        window.sl_ev.setValue(-300)                    # -3 EV on frame001
         qtbot.wait(20)
         window.frame_list.setCurrentRow(1)             # frame002: fresh
         qtbot.wait(50)
@@ -189,7 +292,7 @@ class TestPerFrameSettings:
 
     def test_settings_reload_on_reopen(self, window, tmp_path, qtbot) -> None:
         window.project.root = tmp_path
-        window.sl_ev.setValue(6)                       # +2 EV
+        window.sl_ev.setValue(200)                     # +2 EV
         qtbot.wait(20)
         from filmscan_studio.developer.project import DevelopProject
         again = DevelopProject.open(tmp_path)
@@ -224,3 +327,37 @@ class TestPositiveRender:
         flipped = rnd.quantise16(rnd.render_density(
             d[:, ::-1], window.current_params()))
         assert np.array_equal(exported, flipped)
+
+
+class TestHistogram:
+    def test_density_histogram_counts_finite_only(self) -> None:
+        from filmscan_studio.developer.gui import density_histogram
+        d = np.array([[0.1, 0.2, np.nan, np.inf, -np.inf, 0.2]],
+                     dtype=np.float32)
+        h = density_histogram(d, xmax=3.2, bins=64)
+        assert h.max() == pytest.approx(1.0)      # normalizováno na peak
+        assert h.shape == (64,)
+        # inf/NaN nesmily vytvořit sloupec na koncích.
+        assert h[0] == 0.0 and h[-1] == 0.0
+
+    def test_widget_receives_density_and_params(self, window) -> None:
+        assert window.histogram._hist is not None
+        assert window.histogram._params is not None
+        assert window.histogram._params.dmax == pytest.approx(
+            window.spin_dmax.value(), abs=1e-3)
+
+    def test_widget_rerenders_on_slider(self, window, qtbot) -> None:
+        before = window.histogram._params.fingerprint()
+        window.sl_ev.setValue(300)
+        qtbot.wait(20)
+        assert window.histogram._params.exposure_ev == pytest.approx(3.0)
+        assert window.histogram._params.fingerprint() != before
+
+    def test_widget_paints_without_crash(self, window, qtbot) -> None:
+        # render() spouští paintEvent -- ten musí přežít prázdný i naplněný
+        # stav (kdysi spadlý paintEvent kreslil dokola v nekonečné smyčce).
+        from PySide6.QtGui import QImage
+        img = QImage(window.histogram.size(), QImage.Format.Format_ARGB32)
+        window.histogram.render(img)
+        window.histogram.set_density(None)
+        window.histogram.render(img)
