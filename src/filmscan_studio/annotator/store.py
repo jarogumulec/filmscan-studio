@@ -461,8 +461,14 @@ COMMON_FIELDS: tuple[str, ...] = (
     "gps_lat_exif_dms", "gps_lon_exif_dms",
     "tags", "rating",
 )
-#: Bulk-transferable only by explicit opt-in.
-OPT_IN_FIELDS: tuple[str, ...] = ("title", "note")
+#: Bulk-transferable only by explicit opt-in. Rotation joined 2026-09-22:
+#: "Použít na vybrané" silently dropped a 90° set on the form (the operator
+#: clicked otočit 90 → apply → sidecars kept 0). It is opt-in rather than
+#: common because the radio ALWAYS holds a value — as a common field it
+#: would reset every selected frame to the checked frame's rotation on any
+#: date-stamp. The GUI opts it in exactly when the operator moved the radio
+#: away from the frame's stored rotation ("zapnul otočení"), never by accident.
+OPT_IN_FIELDS: tuple[str, ...] = ("title", "note", "rotation_degrees")
 
 
 def build_common_patch(form: dict, transfer: dict | None = None) -> dict:

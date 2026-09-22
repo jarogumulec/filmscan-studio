@@ -93,6 +93,18 @@ class RenderParams:
     #: displayed pixels. Contrast pivots at display mid-grey 0.5.
     brightness: float = 0.0
     contrast: float = 1.0
+    #: Output sharpening — unsharp-mask strength in PERCENT (0..200 %),
+    #: applied to the display-referred pixels *after* everything else (user
+    #: order 2026-09-22: „přidej sharpening … s velmi konzervativním
+    #: defaultem“ + „unsharp mask dej v procentech — tj ne do 2 ale do 200“).
+    #: Photoshop convention: Amount 20 % is the light hand here — a bite on a
+    #: 100 % view, no white halos on film grain; 0 is off, byte-exact.
+    sharpen: float = 20.0
+    #: Unsharp-mask Gaussian radius in PIXELS (Photoshop's Radius knob —
+    #: „přepiš na šoupátko jen px“, order 2026-09-22). Absolute, like every
+    #: other sharpening tool: what looks sharp at 100 % zoom is what ships.
+    #: < 0,3 px is a no-op (nothing left to unsharp).
+    sharpen_radius: float = 1.0
 
     def __post_init__(self) -> None:
         if self.dmax <= self.dmin:
@@ -108,6 +120,13 @@ class RenderParams:
             raise ValueError(f"brightness must be within -0.5..0.5, got {self.brightness}")
         if not 0.1 <= self.contrast <= 4.0:
             raise ValueError(f"contrast must be within 0.1..4.0, got {self.contrast}")
+        if not 0.0 <= self.sharpen <= 200.0:
+            raise ValueError(
+                f"sharpen must be within 0..200 (%), got {self.sharpen}")
+        if not 0.0 <= self.sharpen_radius <= 50.0:
+            raise ValueError(
+                f"sharpen_radius must be within 0..50 px, "
+                f"got {self.sharpen_radius}")
 
     @property
     def span(self) -> float:
@@ -124,6 +143,8 @@ class RenderParams:
             "shadow_band": self.shadow_band,
             "brightness": self.brightness,
             "contrast": self.contrast,
+            "sharpen": self.sharpen,
+            "sharpen_radius": self.sharpen_radius,
             **self.profile.to_dict(),
         }
 
@@ -152,6 +173,12 @@ class RenderParams:
             shadow_band=float(d.get("shadow_band", 0.01)),
             brightness=float(d.get("brightness", 0.0)),
             contrast=float(d.get("contrast", 1.0)),
+            # Ostření: fallbacky se rovnají výchozím polí (konvence výše) —
+            # nastavení z dob před ostřením se hrají SOUČASNOU konzervativní
+            # předvolbou, ne nulou. Fingerprint se novými klíči mění tak jako
+            # tak; operátorovo vypnutí (0) se ukládá explicitně a drží.
+            sharpen=float(d.get("sharpen", 20.0)),
+            sharpen_radius=float(d.get("sharpen_radius", 1.0)),
         )
 
 
@@ -232,11 +259,64 @@ def quantise16(image: np.ndarray, nan_fill: float = 0.0) -> np.ndarray:
     return np.clip(filled * 65535.0 + 0.5, 0, 65535).astype(np.uint16)
 
 
+def _gaussian_blur(a: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian with reflect padding, pure numpy.
+
+    No cv2 border quirks on tiny arrays: the kernel radius clamps to the
+    array extent, so even a 2-px strip blurs instead of raising.
+    """
+    radius = int(np.ceil(3.0 * sigma))
+    cur = a
+    for axis in (0, 1):
+        n = a.shape[axis]
+        r = min(radius, n - 1)
+        if r <= 0:
+            continue
+        taps = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+        taps /= taps.sum()
+        acc = np.zeros_like(a, dtype=np.float64)
+        for k, w in zip(range(-r, r + 1), taps):
+            idx = np.abs(np.arange(n) + k)          # reflect below 0 (excl. edge)
+            idx = np.where(idx >= n, 2 * n - 2 - idx, idx)   # reflect above n
+            acc += w * np.take(cur, idx, axis=axis)
+        cur = acc
+    return cur
+
+
+def sharpen_output(display: np.ndarray, params: RenderParams) -> np.ndarray:
+    """Unsharp mask on display-referred pixels — the very last output step.
+
+    ``out = display + amount · (display − blur(display))``, clipped back to
+    0..1. Photoshop knobs: ``sharpen`` is the amount in percent (0..200),
+    ``sharpen_radius`` the Gaussian radius in pixels — absolute, so 100 % zoom
+    is what ships. NaN ("no light") never acquires a tone: it is excluded from
+    the blur (normalised weights, so no dark halo) and stays NaN out.
+    ``sharpen == 0`` is a byte-exact pass-through — settings saved without
+    sharpening must keep rendering identically when the operator zeroes it.
+    """
+    a = np.asarray(display, dtype=np.float64)
+    amount = params.sharpen / 100.0
+    if amount <= 0.0 or params.sharpen_radius < 0.3 or a.ndim != 2 \
+            or min(a.shape) < 2:
+        return a
+    sigma = params.sharpen_radius
+    finite = np.isfinite(a)
+    filled = np.where(finite, a, 0.0)
+    blur = _gaussian_blur(filled, sigma)
+    if not finite.all():
+        weights = _gaussian_blur(finite.astype(np.float64), sigma)
+        blur = blur / np.maximum(weights, 1e-6)
+    out = filled + amount * (filled - blur)
+    return np.where(finite, np.clip(out, 0.0, 1.0), np.nan)
+
+
 def render_for_display(d: np.ndarray, params: RenderParams) -> np.ndarray:
-    """Full on-screen render: density -> curve -> display transfer (NaN kept).
+    """Full on-screen render: density -> curve -> display transfer -> sharpen.
 
     This is what the preview shows and what export must match byte-for-byte:
     ``render_density`` followed by :func:`apply_display` with the params' own
-    ``gamma_display``.
+    ``gamma_display``, then the output sharpening (which is a no-op when
+    ``sharpen == 0``).
     """
-    return apply_display(render_density(d, params), params)
+    return sharpen_output(apply_display(render_density(d, params), params),
+                          params)

@@ -218,6 +218,10 @@ class MainWindow(QMainWindow):
         self.project: AnnotatedProject | None = None
         self.current: AnnotationItem | None = None
         self.current_row: int = -1
+        #: Rotation the form loaded from the current frame's sidecar — the
+        #: bulk action transfers rotation only when the radio moved away
+        #: from it (K16O- 2026-09-22: apply dropped/discorded rotation).
+        self._loaded_rotation: int = 0
         self._loading_form = True   # until the panels are built (Qt signals fire)
         self._thumbs: dict[int, QPixmap] = {}   # row -> cached source thumb
         self._fs = FullscreenViewer(self)      # before the panel: signals fire
@@ -440,7 +444,8 @@ class MainWindow(QMainWindow):
         self.btn_apply.setToolTip(
             "Přepíše datum / geo / hodnocení / štítky u všech vybraných "
             "snímků; prázdná pole nechává být. Název a popis se přenášejí "
-            "jen zaškrtnutím políčka „přenášet název / popis“.")
+            "jen zaškrtnutím políčka „přenášet název / popis“. Otočení se "
+            "přenáší, jen když jsi ho v tomhle snímku právě změnil.")
         self.btn_apply.clicked.connect(self._apply_to_selected)
         self.btn_reload = QPushButton("Znovu načíst")
         self.btn_reload.clicked.connect(lambda: self._frame_selected(
@@ -793,9 +798,15 @@ class MainWindow(QMainWindow):
         self.spin_rating.setValue(int(rating) if rating is not None else 0)
         self.chk_rating_use.setChecked(rating is not None)
         deg = int(ann.get("rotation_degrees") or 0) % 360
+        self._loaded_rotation = deg
         (self.rot_group.button(deg) or self.rot_group.button(0)
          ).setChecked(True)
         self._loading_form = False
+        # The form now mirrors the disk — make the thumbnail say the same.
+        # Without this, an apply/reload that changed the radio left the
+        # cached thumb rotated while the radio and sidecar said 0
+        # (operator complaint 2026-09-22).
+        self._regen_thumb(row)
         self._refresh_gps_label()
         self._load_acq_form()
         self.statusBar().showMessage(
@@ -854,7 +865,11 @@ class MainWindow(QMainWindow):
             "gps_input": self.ed_gps.text().strip(),
             "rating": (self.spin_rating.value()
                        if self.chk_rating_use.isChecked() else None),
-            "rotation_degrees": self.rot_group.checkedId(),
+            # checkedId() is -1 with nothing checked (defensive: the group
+            # always has a checked button in practice) — that is 0, not a
+            # value the annotation model should reject on save/apply.
+            "rotation_degrees": (self.rot_group.checkedId()
+                                 if self.rot_group.checkedId() >= 0 else 0),
         }
 
     def _annotation_from_form(self) -> dict:
@@ -892,10 +907,18 @@ class MainWindow(QMainWindow):
                                     "Vyber jeden nebo více snímků.")
             return
         try:
+            checked = self.rot_group.checkedId()
+            rotation_on_form = checked % 360 if checked >= 0 else 0
             patch = build_common_patch(
                 self._form_values(),
                 transfer={"title": self.chk_transfer_title.isChecked(),
-                          "note": self.chk_transfer_note.isChecked()})
+                          "note": self.chk_transfer_note.isChecked(),
+                          # the radio travels only when the operator actually
+                          # turned it (K16O- 2026-09-22: it was silently
+                          # dropped, or worse — always travelled and reset
+                          # every selected frame to the current one)
+                          "rotation_degrees":
+                              rotation_on_form != self._loaded_rotation})
         except ValueError as exc:
             QMessageBox.critical(self, "Použít na vybrané", str(exc))
             return

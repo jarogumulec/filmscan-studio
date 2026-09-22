@@ -323,6 +323,60 @@ class TestOrientation:
         assert proj.rect_apply((1, 2, 3, 4), (64, 48)) == (1, 2, 3, 4)
         assert proj.rect_apply(None, (64, 48)) is None
 
+    @pytest.mark.parametrize("rot", [90, 180, 270])
+    @pytest.mark.parametrize("extra_flags", [
+        {}, {"mirrored_vertical": True}])
+    def test_rect_apply_rotation_matches_pixels(self, session, rot,
+                                                extra_flags) -> None:
+        """The displayed ROI rect must contain exactly rotate_frame's crop.
+
+        The 90° per-frame rotation joins the rect transform chain: drawing
+        the ROI in the rotated preview and cropping the raw sensor map have
+        to select the same content (maska v rotovaném náhledu, 2026-09-22).
+        Checked against the real :meth:`rotate_frame`, not a formula.
+        """
+        sc = session / "frames" / "frame001.tif.json"
+        record = json.loads(sc.read_text(encoding="utf-8"))
+        record["annotation"] = {"rotation_degrees": rot}
+        record["film"] = {"film_id": "x", **extra_flags}
+        sc.write_text(json.dumps(record), encoding="utf-8")
+        proj = DevelopProject.open(session)
+        assert proj.frame_rotation("frame001.tif") == rot
+        d = np.arange(48 * 64, dtype=np.float32).reshape(48, 64)
+        disp = proj.rotate_frame(proj.orientation_apply(d), "frame001.tif")
+        sensor = (10, 5, 26, 19)
+        shown = proj.rect_apply(sensor, (64, 48), rot)
+        # viewer extents swap at 90°/270°
+        vw, vh = (64, 48) if rot == 180 else (48, 64)
+        assert 0 <= shown[0] and shown[2] <= vw
+        assert 0 <= shown[1] and shown[3] <= vh
+        assert np.array_equal(disp[shown[1]:shown[3], shown[0]:shown[2]],
+                              proj.rotate_frame(
+                                  proj.orientation_apply(
+                                      d[sensor[1]:sensor[3],
+                                        sensor[0]:sensor[2]]),
+                                  "frame001.tif"))
+
+    @pytest.mark.parametrize("rot", [90, 180, 270])
+    def test_rect_unapply_inverts_apply(self, session, rot) -> None:
+        """The drawn-rect -> stored-rect journey is the exact inverse.
+
+        90° is NOT an involution (its inverse is 270°) — the GUI must not
+        reuse rect_apply for the way back (2026-09-22: the drawn mask saved
+        mirrored into the wrong half of the sensor frame).
+        """
+        (session / "project.json").write_text(json.dumps(
+            {"film": {"film_id": "x", "mirrored_vertical": True}}))
+        proj = DevelopProject.open(session)
+        sensor = (10, 5, 26, 19)
+        shown = proj.rect_apply(sensor, (64, 48), rot)
+        assert proj.rect_unapply(shown, (64, 48), rot) == sensor
+
+    def test_rect_unapply_without_transforms_is_identity(self, session) -> None:
+        proj = DevelopProject.open(session)
+        assert proj.rect_unapply((1, 2, 3, 4), (64, 48)) == (1, 2, 3, 4)
+        assert proj.rect_unapply(None, (64, 48)) is None
+
 
 class TestSettingsPersistence:
     def test_manual_rect_survives_reopen(self, session) -> None:

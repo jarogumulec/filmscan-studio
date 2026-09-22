@@ -36,8 +36,17 @@ Za tónovou křivkou následuje zobrazovací gamma 2,2 (``gamma_display``) —
 shodná v náhledu i v exportu (WYSIWYG); export JPEG i TIFF se kvantizuje až
 za ní. Hodnota se v UI **nenastavuje**: je definována ICC profilem
 Gray Gamma 2.2, který exporty nesou (dokument 07; uživatel 2026-09-21).
-Flat pro Capture One zůstává bez křivky, bez gammy i bez profilu — je
-lineární v hustotě.
+Posledním krokem je volitelné **ostření** (unsharp mask ovládaný jako ve
+Photoshopu: Množství v % 0–200, Poloměr v px; konzervativní předvolba
+20 % / 1 px; rozkazy 2026-09-22), rovněž shodné v náhledu i exportu. Flat
+pro Capture One zůstává bez křivky, bez gammy i bez profilu — je lineární
+v hustotě a bez ostření.
+
+Exportní panel (rozkaz 2026-09-22): kromě jednoho „Export" je i **„Export
+vše"** (všechny snímky aktuálně vybraným formátem, každý se svými uloženými
+parametry) a zaškrtátko **„Export včetně okraje filmu"** s počtem px (100
+implicitně) — přidá kraj z filmu kolem ROI (v výměněch, kam to sahá; jinak
+„po kraj"). Hustotní archiv okraj nikdy nedostává: je to měření, ne fotka.
 """
 
 from __future__ import annotations
@@ -54,7 +63,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QSlider, QSizePolicy, QSplitter, QVBoxLayout, QWidget,
+    QSlider, QSizePolicy, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from filmscan_studio.core import density as dens
@@ -868,9 +877,33 @@ class MainWindow(QMainWindow):
         self.spin_br = self._spin(-0.5, 0.5, 0.0, 0.01)
         self.sl_ct = self._slider(10, 400, 100)       # 0,10 … 4,00
         self.spin_ct = self._spin(0.1, 4.0, 1.0, 0.01)
+        # Ostření = poslední krok řetězce (unsharp mask na display pixelech).
+        # Photoshop konvence (rozkaz 2026-09-22): Množství v PROCENTECH
+        # 0…200 %, Poloměr v PIXELS — absolutní, co sedí na 100 % zoomu,
+        # to jede do exportu. Konzervativní předvolba 20 % / 1,0 px;
+        # nastavení uložená před ostřením berou totéž (fallbacky from_dict
+        # = defaulty polí), operátorovo vypnutí je explicitní nula a ta drží.
+        self.sl_sh = self._slider(0, 200, 20)          # 0 … 200 %
+        self.spin_sh = self._spin(0.0, 200.0, 20.0, 1.0, decimals=0,
+                                  suffix=" %")
+        self.sl_shr = self._slider(0, 20, 10)          # 0,0 … 2,0 px (po 0,1)
+        self.spin_shr = self._spin(0.0, 50.0, 1.0, 0.1, decimals=1,
+                                   suffix=" px")
         form.addRow("Display gamma", QLabel("2,2 — dáno profilem"))
         self._bind_row(form, "Jas (display)", self.sl_br, self.spin_br)
         self._bind_row(form, "Kontrast (display)", self.sl_ct, self.spin_ct)
+        self._bind_row(form, "Ostření (unsharp)", self.sl_sh, self.spin_sh,
+                       scale=1.0)
+        self._bind_row(form, "Poloměr ostření [px]", self.sl_shr,
+                       self.spin_shr, scale=10.0)
+        self.spin_sh.setToolTip("Množství ostření (unsharp mask) v procentech "
+                                "jako ve Photoshopu. Konzervativních 10–30 % "
+                                "prokreslí hrany bez bílých lemov; 0 vypíná. "
+                                "Předvolba Proposalu je 20 %.")
+        self.spin_shr.setToolTip("Poloměr Gaussovy masky v pixelech — jako "
+                                 "ve Photoshopu. Malý poloměr (0,5–1,5 px) "
+                                 "opatrně zvedne detail; nad ~3 px rostou "
+                                 "bílá lemování kolem hran.")
         return box
 
     #: Formáty exportu: (popisek combo, metoda). Popisky říkají bitovou hloubku
@@ -893,22 +926,81 @@ class MainWindow(QMainWindow):
         # Jeden seznam + jedno tlačítko místo čtyř čudlíů (uživatel
         # 2026-09-21). Combo nese i formáty, které nejsou display-referred
         # (flat, archiv) — pravidla pro ICC/encoding mají vlastní, ta
-        # vyřizuje metoda, ne výběr.
+        # vyřizuje metoda, ne výběr. „Export vše" (rozkaz 2026-09-22) přepne
+        # snímek po snímku a spustí vždy týž vybraný formát.
         self.cmb_export = QComboBox()
         self.cmb_export.addItems([label for label, _ in self.EXPORT_FORMATS])
         self.btn_export = QPushButton("Export")
         self.btn_export.clicked.connect(self.export_current)
         self.btn_export.setEnabled(False)
+        self.btn_export_all = QPushButton("Export vše")
+        self.btn_export_all.setToolTip(
+            "Exportuje všechny snímky projektu aktuálně vybraným formátem; "
+            "každý se svými uloženými parametry.")
+        self.btn_export_all.clicked.connect(self.export_all)
+        self.btn_export_all.setEnabled(False)
         row = QHBoxLayout()
         row.addWidget(self.cmb_export, 1)
         row.addWidget(self.btn_export)
+        row.addWidget(self.btn_export_all)
         h.addLayout(row)
+        # Okraj z filmu kolem ořezu (rozkaz 2026-09-22, implicitně odškrtnutý):
+        # hrana držáku, která vadila při korekci, se do exportu vrátí až teď —
+        # o px na každou stranu od ROI, ale „po kraj", kdyby jich bylo málo.
+        # Hustotní archiv okraj nedostává: je to měření, ne fotka.
+        self.chk_border = QCheckBox("Export včetně okraje filmu")
+        self.chk_border.setToolTip(
+            "Přidá ke každému renderu kraj z filmu kolem ořezu (ROI) — ten, "
+            "který při korekci vadí. Nemá-li snímek v daném směru tolik "
+            "pixelů, jde až po kraj.")
+        self.spin_border = QSpinBox()
+        self.spin_border.setRange(1, 4000)
+        self.spin_border.setValue(100)
+        self.spin_border.setSuffix(" px/stranu")
+        self.spin_border.setEnabled(False)
+        self.chk_border.toggled.connect(self.spin_border.setEnabled)
+        border_row = QHBoxLayout()
+        border_row.addWidget(self.chk_border)
+        border_row.addWidget(self.spin_border)
+        border_row.addStretch(1)
+        h.addLayout(border_row)
         return box
+
+    def _border_px(self) -> int:
+        """Okraj exportu [px]: zaškrtnuto → hodnota, odškrtnuto → 0."""
+        return int(self.spin_border.value()) if self.chk_border.isChecked() \
+            else 0
 
     def export_current(self) -> None:
         """Volba ze seznamu → příslušná exportová metoda."""
         _label, method = self.EXPORT_FORMATS[self.cmb_export.currentIndex()]
         getattr(self, method)()
+
+    def export_all(self) -> None:
+        """Všechny snímky aktuálním formátem (rozkaz 2026-09-22).
+
+        Přepínání přes QListWidget je záměr: ``_frame_selected`` nahraje
+        per-snímková nastavení i ROI a naředí ``_density`` — týž kód, který
+        obsluhuje ruční klik, takže batch nemůže používat jiné parametry
+        než co by operátor viděl v náhledu. Selhavší snímek se přeskočí."""
+        if self.project is None or not self.frame_list.count():
+            return
+        total = self.frame_list.count()
+        previous = self.frame_list.currentRow()
+        done, skipped = 0, []
+        for i in range(total):
+            self.frame_list.setCurrentRow(i)
+            if self._density is None:
+                skipped.append(self.frame_list.item(i).text())
+                continue
+            self.export_current()
+            done += 1
+        if previous != self.frame_list.currentRow():
+            self.frame_list.setCurrentRow(max(previous, 0))
+        msg = f"Export vše: {done}/{total} snímků → {self.cmb_export.currentText()}"
+        if skipped:
+            msg += f" · přeskočeno {len(skipped)} (nelze měřit)"
+        self.statusBar().showMessage(msg, 10000)
 
     # ------------------------------------------------------------- actions
 
@@ -978,7 +1070,8 @@ class MainWindow(QMainWindow):
             # rámeček se kreslí převrácený, aby seděl na to, co vidíš.
             self.view.set_rect(self.project.rect_apply(
                 self.project.rect_for(self.project.entry(name)),
-                (d.shape[1], d.shape[0])))
+                (d.shape[1], d.shape[0]),
+                self.project.frame_rotation(name)))
             saved = self.project.frame_settings.get(name)
             if saved:
                 self._load_params(rnd.RenderParams.from_dict(saved),
@@ -992,6 +1085,7 @@ class MainWindow(QMainWindow):
         self.histogram.set_density(d)
         self.lbl_hist_stats.setText(self.histogram.stats_text())
         self.btn_export.setEnabled(True)
+        self.btn_export_all.setEnabled(True)
         self.rerender()
 
     # ----------------------------------------------------------- parametry
@@ -1028,11 +1122,15 @@ class MainWindow(QMainWindow):
         měření (auto) nebo ho zadal operátor. RenderParams to neumí nést,
         proto putuje zvlášť přes uložený payload.
         """
-        # Auto Dmin má smysl jen když existuje měření film base.
-        self.chk_dmin_auto.setChecked(not dmin_manual
-                                      and self._dmin_auto is not None)
+        # Auto Dmin má smysl jen když existuje měření film base. Při autu
+        # je závazné AKTUÁLNÍ měření, ne uložená hodnota z dřívějška —
+        # uložená nula z rozbitého base vzorku by jinak přežívala navěky
+        # i po opravě měření (K16O02, 2026-09-22). Ruční hodnotu respektujeme.
+        auto_dmin = not dmin_manual and self._dmin_auto is not None
+        self.chk_dmin_auto.setChecked(auto_dmin)
         self.chk_dmax_auto.setChecked(params.dmax_source == "frame")
-        self.spin_dmin.setValue(round(params.dmin, 3))
+        self.spin_dmin.setValue(
+            round(self._dmin_auto if auto_dmin else params.dmin, 3))
         self.spin_dmax.setValue(round(params.dmax, 3))
         self.sl_ev.setValue(int(round(params.exposure_ev * 100.0)))
         self.spin_ev.setValue(round(params.exposure_ev, 2))
@@ -1049,6 +1147,11 @@ class MainWindow(QMainWindow):
         self.spin_br.setValue(params.brightness)
         self.sl_ct.setValue(int(round(params.contrast * 100)))
         self.spin_ct.setValue(params.contrast)
+        # sharpen je uz primo v procentech, radius v px (scale 10 = 0,1 krok)
+        self.sl_sh.setValue(int(round(params.sharpen)))
+        self.spin_sh.setValue(params.sharpen)
+        self.sl_shr.setValue(int(round(params.sharpen_radius * 10)))
+        self.spin_shr.setValue(params.sharpen_radius)
         self.spin_dmin.setEnabled(not self.chk_dmin_auto.isChecked())
         self.spin_dmax.setEnabled(not self.chk_dmax_auto.isChecked())
 
@@ -1069,6 +1172,8 @@ class MainWindow(QMainWindow):
             shadow_band=self.spin_sb.value(),
             brightness=self.spin_br.value(),
             contrast=self.spin_ct.value(),
+            sharpen=self.spin_sh.value(),
+            sharpen_radius=self.spin_shr.value(),
         )
 
     def _settings_payload(self) -> dict:
@@ -1108,8 +1213,9 @@ class MainWindow(QMainWindow):
         params = self.current_params()
         # Náhled vidí orientaci diváka + otočení snímku z anotátoru;
         # archiv zůstává surový.
-        sub = _subsample(self.project.rotate_frame(
-            self.project.orientation_apply(d), prov.source), PREVIEW_MAX_DIM)
+        view_d = self.project.rotate_frame(
+            self.project.orientation_apply(d), prov.source)
+        sub = _subsample(view_d, PREVIEW_MAX_DIM)
         display = rnd.render_for_display(sub, params)
         # Exposure warning: co render ořízl na konce stupnice. Měří se na
         # čisté ose x před ořezem -- NaN (bez světla) do neither koše.
@@ -1118,7 +1224,11 @@ class MainWindow(QMainWindow):
         lo = ((x <= 0.0) & ~np.isnan(x)) | np.isneginf(x)
         # _subsample je stride-sám o sobě deterministický: display[i,j]
         # pochází z sub[i,j], takže kurzor vidí týž pixel v D i v renderu.
-        self.view.set_image(display, (d.shape[1], d.shape[0]), densities=sub,
+        # map_wh jsou rozměry DIVÁKOVA (po zrcadlech i rotaci) — display i
+        # ROI se počítají v nich; senzorové (d.shape) by při 90° prohodily
+        # osy a škálování rámčku i ořez histogramu sedly vedle.
+        self.view.set_image(display, (view_d.shape[1], view_d.shape[0]),
+                            densities=sub,
                             warn=(hi, lo),
                             warn_on=self.chk_warn.isChecked())
         self.histogram.set_params(params)
@@ -1137,7 +1247,8 @@ class MainWindow(QMainWindow):
             self.out_histogram.set_output(display, x=x)
             return
         h, w = display.shape
-        fx, fy = w / max(self._whole_wh()[0], 1), h / max(self._whole_wh()[1], 1)
+        vw, vh = self._viewer_wh()
+        fx, fy = w / max(vw, 1), h / max(vh, 1)
         x0, y0, x1, y1 = rect
         sl = (slice(int(y0 * fy), max(int(y1 * fy), 1)),
               slice(int(x0 * fx), max(int(x1 * fx), 1)))
@@ -1145,21 +1256,34 @@ class MainWindow(QMainWindow):
         self.out_histogram.set_output(crop if crop.size else None, x=x[sl])
 
     def _whole_wh(self) -> tuple[int, int]:
+        """Senzorové (W, H) aktuálního snímku — doména uloženého ROI."""
         assert self._density is not None
         h, w = self._density[0].shape
+        return w, h
+
+    def _viewer_wh(self) -> tuple[int, int]:
+        """(W, H) náhledu = senzor po zrcadlech; při 90°/270° prohozené."""
+        w, h = self._whole_wh()
+        if self.project is not None and \
+                self.project.frame_rotation(self._current) % 180 == 90:
+            return h, w
         return w, h
 
     def rect_selected(self, rect: tuple[int, int, int, int]) -> None:
         """ROI z Shift+kreslení: přepočítá měření (archiv se krájí) i status.
 
         Rámeček přišel v souřadnicích otočeného náhledu; senzorový
-        (uložitelný) tvar dá týž ``rect_apply`` — zrcadlení i rotace 180°
-        jsou involuce, převod je sám sobě invertní.
+        (uložitelný) tvar dává ``rect_unapply`` — zpětná cesta řetězcem
+        zrcadlo → rotace. Rotace 90° NENÍ involuce (naruby je 270°),
+        ``rect_apply`` zpět by rámeček uložel otočený kolem špatného rohu
+        (maska v rotovaném náhledu, operátor 2026-09-22).
         """
         item = self.frame_list.currentItem()
         if item is None or self.project is None:
             return
-        stored = self.project.rect_apply(rect, self._whole_wh())
+        stored = self.project.rect_unapply(rect, self._whole_wh(),
+                                           self.project.frame_rotation(
+                                               item.text()))
         assert stored is not None
         self.project.set_rect(item.text(), stored)
         self.project.save_settings()      # rámček přežije reopen
@@ -1196,7 +1320,12 @@ class MainWindow(QMainWindow):
     def _dmin_toggled(self) -> None:
         if self._loading:
             return
-        self.spin_dmin.setEnabled(not self.chk_dmin_auto.isChecked())
+        auto = self.chk_dmin_auto.isChecked()
+        if auto and self._dmin_auto is not None:
+            # Zapnutí auta znamená "chci aktuální měření", ne "ponech si
+            # co v spinu je" (stejný kontrakt jako _load_params).
+            self.spin_dmin.setValue(round(self._dmin_auto, 3))
+        self.spin_dmin.setEnabled(not auto)
         self._setting_changed()
 
     def _scale_toggled(self) -> None:
@@ -1234,14 +1363,22 @@ class MainWindow(QMainWindow):
         return f"{prefix}_{stem}.{suffixes}" if prefix else \
             f"{stem}.{suffixes}"
 
-    def _cropped_density(self) -> tuple[np.ndarray, dens.DensityProvenance] \
+    def _cropped_density(self,
+                         border: int = 0) -> tuple[np.ndarray, dens.DensityProvenance] \
             | None:
-        """Archiv i rendery se krájí na ROI (vize uživatele); náhled ne."""
+        """Archiv i rendery se krájí na ROI (vize uživatele); náhled ne.
+
+        ``border`` px navíc na každou stranu (zaškrtátko „včetně okraje",
+        rozkaz 2026-09-22) — klade se na STAROU ROI, ne na už oříznutou mapu:
+        hustota se počítá z celého snímku, kraj dráždku v ní už je."""
         if self._density is None or self.project is None:
             return None
-        return self.project.build_density(self._density[1].source, crop=True)
+        return self.project.build_density(self._density[1].source, crop=True,
+                                          border=border)
 
     def save_density(self) -> None:
+        # Archiv = měření: okraj fotky sem nepatří ani zaškrtnuté (zdokumentované
+        # rozhodnutí — okraj je výpravný trik pro render, ne pro D data).
         cropped = self._cropped_density()
         if cropped is None:
             return
@@ -1265,7 +1402,7 @@ class MainWindow(QMainWindow):
         aby export i metadata sdílely tytéž parametry. NaN nechává na
         volajícím — každý formát ho lijí do černé jinak (8b rint, 10b posun).
         """
-        cropped = self._cropped_density()
+        cropped = self._cropped_density(border=self._border_px())
         if cropped is None or self.project is None:
             return None
         d, prov = cropped
@@ -1398,7 +1535,7 @@ class MainWindow(QMainWindow):
             + (" · EXIF+XMP vloženo" if exif or xmp else " · bez anotací"))
 
     def _export_render(self, flat: bool) -> None:
-        cropped = self._cropped_density()
+        cropped = self._cropped_density(border=self._border_px())
         if cropped is None or self.project is None:
             return
         d, prov = cropped

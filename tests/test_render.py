@@ -346,3 +346,110 @@ class TestDoc08Acceptance:
                            render.render_density(d, b))
         assert not np.allclose(render.render_for_display(d, a),
                                render.render_for_display(d, b))
+
+
+class TestOutputSharpening:
+    """Ostření výstupu — rozkaz 2026-09-22: „přidej sharpening do toho
+    výstupního nastavení s nějakým velmi konzervativním defaultem"."""
+
+    def test_default_is_conservative(self) -> None:
+        """Photoshop konvence (rozkaz 2026-09-22): množstvi v %, radius v px."""
+        p = render.RenderParams()
+        assert 0.0 < p.sharpen <= 30.0        # lehká ruka v procentech
+        assert 0.3 <= p.sharpen_radius <= 2.0
+        assert render.RenderParams(sharpen=200.0).sharpen == 200.0  # strop 200
+
+    def test_zero_is_byte_exact_passthrough(self) -> None:
+        """Nastavení uložená před ostřením (sharpen=0) musí renderovat
+        identicky — reprodukovatelnost exportů má přednost."""
+        p = render.RenderParams(sharpen=0.0)
+        d = np.linspace(0.2, 2.6, 64 * 64).reshape(64, 64)
+        plain = render.apply_display(render.render_density(d, p), p)
+        assert np.array_equal(render.render_for_display(d, p), plain)
+
+    def test_edge_gains_local_contrast(self) -> None:
+        """Unsharp mask: u hrany přibudou lemmy na obou stranách (tmavá
+        temnější, světlá světlejší) a nic nepřesáhne 0..1."""
+        d = np.full((64, 64), 0.7, dtype=np.float64)
+        d[:, 32:] = 2.1                        # střed → středně hustá hrana
+        base = dict(dmin=0.2, dmax=2.6, shadow_band=0.0, gamma_display=1.0)
+        soft = render.render_for_display(
+            d, render.RenderParams(sharpen=0.0, **base))
+        sharp = render.render_for_display(
+            d, render.RenderParams(sharpen=100.0, sharpen_radius=1.0, **base))
+        assert abs(sharp[32, 32] - sharp[32, 31]) \
+            > abs(soft[32, 32] - soft[32, 31])     # ostřejší přechod
+        assert sharp[32, 31] < soft[32, 31]        # lem na tmavé straně
+        assert sharp[32, 32] > soft[32, 32]        # lem na světlé straně
+        assert sharp.min() >= 0.0 and sharp.max() <= 1.0   # clip drží
+
+    def test_uniform_area_untouched(self) -> None:
+        """Bez detailu nic brousit — plochá oblast zůstává plochá."""
+        d = np.full((48, 48), 1.4, dtype=np.float64)
+        p = render.RenderParams(dmin=0.2, dmax=2.6, sharpen=100.0)
+        out = render.render_for_display(d, p)
+        assert np.allclose(out, out[0, 0])
+
+    def test_nan_never_acquires_tone(self) -> None:
+        """NaN (bez světla) zůstává NaN a neudělá černý lem kolem sebe:
+        maska normalizuje váhy blur, soused nesmí spadnout pod měkkou verzi."""
+        d = np.full((64, 64), 1.4, dtype=np.float64)
+        d[28:36, 28:36] = np.nan
+        p = render.RenderParams(dmin=0.2, dmax=2.6, sharpen=100.0)
+        soft = render.render_for_display(
+            d, render.RenderParams(dmin=0.2, dmax=2.6, sharpen=0.0))
+        sharp = render.render_for_display(d, p)
+        assert np.isnan(sharp[30, 30])
+        assert np.isfinite(sharp[20, 20])
+        assert abs(float(sharp[27, 32]) - float(soft[27, 32])) < 0.02
+
+    def test_fingerprint_and_roundtrip(self) -> None:
+        base = render.RenderParams()
+        assert (render.RenderParams(sharpen=0.5).fingerprint()
+                != base.fingerprint())
+        assert (render.RenderParams(sharpen_radius=1.5).fingerprint()
+                != base.fingerprint())
+        p = render.RenderParams(sharpen=42.0, sharpen_radius=0.7)
+        assert render.RenderParams.from_dict(p.to_dict()).fingerprint() \
+            == p.fingerprint()
+
+    def test_legacy_dict_loads_current_sharpen_preset(self) -> None:
+        """Archivy nastavení z dob před ostřením se hrají současnou
+        konzervativní předvolbou (konvence from_dict: fallbacky = defaulty
+        polí, ne nuly). Vypnutí musí zapsat explicitní nula — ta drží."""
+        legacy = {"dmin": 0.2, "dmax": 2.6, "exposure_ev": 0.0,
+                  "name": "neutral", "toe": 0.0, "gamma": 1.0,
+                  "shoulder": 0.0}
+        p = render.RenderParams.from_dict(legacy)
+        assert p.sharpen == pytest.approx(render.RenderParams().sharpen)
+        assert p.sharpen_radius == pytest.approx(
+            render.RenderParams().sharpen_radius)
+        # explicitní nula zůstanou respektované
+        assert render.RenderParams.from_dict({**legacy, "sharpen": 0.0}) \
+            .sharpen == 0.0
+
+    def test_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValueError, match="sharpen"):
+            render.RenderParams(sharpen=201.0)      # > 200 %
+        with pytest.raises(ValueError, match="sharpen"):
+            render.RenderParams(sharpen=-1.0)
+        with pytest.raises(ValueError, match="sharpen_radius"):
+            render.RenderParams(sharpen_radius=-0.1)
+        with pytest.raises(ValueError, match="sharpen_radius"):
+            render.RenderParams(sharpen_radius=60.0)
+
+    def test_radius_is_absolute_pixels(self) -> None:
+        """Poloměr je v px, ne relativně — stejné rozlišení, stejný výsledek;
+        jemný radius 0,1 px je prakticky no-op a musí zůstat rozumný."""
+        d = np.full((64, 64), 1.4, dtype=np.float64)
+        d[:, 32:] = 2.1
+        a = render.render_for_display(d, render.RenderParams(
+            dmin=0.2, dmax=2.6, sharpen=80.0, sharpen_radius=1.0))
+        b = render.render_for_display(d, render.RenderParams(
+            dmin=0.2, dmax=2.6, sharpen=80.0, sharpen_radius=1.0))
+        assert np.array_equal(a, b)                    # determinismus
+        tiny = render.render_for_display(d, render.RenderParams(
+            dmin=0.2, dmax=2.6, sharpen=80.0, sharpen_radius=0.1))
+        plain = render.render_for_display(d, render.RenderParams(
+            dmin=0.2, dmax=2.6, sharpen=0.0))
+        assert np.array_equal(tiny, plain)             # < 0,3 px = nic k brousení

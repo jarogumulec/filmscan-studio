@@ -766,6 +766,49 @@ def test_rotation_radio_rotates_thumb_before_save(tmp_path, qtbot,
     assert win._rotation_for(1) == 0
 
 
+def test_apply_to_selected_transfers_rotation_only_when_moved(
+        tmp_path, qtbot) -> None:
+    """The 2026-09-22 complaint: otočit 90 → „Použít na vybrané" left the
+    sidecars at 0 while the preview stayed rotated. The radio's new value
+    must reach every selected sidecar, and the form/thumbnail must agree
+    with the disk afterwards."""
+    pytest.importorskip("pytestqt")
+    from filmscan_studio.annotator.gui import MainWindow
+
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    _write_sidecar(frames, "frame001.tif", "scan")
+    _write_sidecar(frames, "frame002.tif", "scan")
+    win = MainWindow(project=load_folder(tmp_path))
+    qtbot.addWidget(win)
+
+    # the operator turns the radio on frame001 and applies to all
+    win.rot_group.button(90).setChecked(True)
+    win.grid.selectAll()
+    win._apply_to_selected()
+
+    for num in (1, 2):
+        ann = json.loads((frames / f"frame{num:03d}.tif.json")
+                         .read_text())["annotation"]
+        assert ann["rotation_degrees"] == 90
+    # radio + model follow the disk — no stale 0 / stale preview
+    assert win.rot_group.checkedId() == 90
+    assert win._rotation_for(0) == 90 and win._rotation_for(1) == 90
+    # ⟳ appears in both row labels now
+    assert "⟳" in win.grid.item(0).text()
+    assert "⟳" in win.grid.item(1).text()
+
+    # the trap in the other direction: a plain date-stamp must NOT reset
+    # rotations that the operator set earlier
+    win.ed_date.setText("1.1.2026")
+    win.grid.selectAll()
+    win._apply_to_selected()
+    for num in (1, 2):
+        ann = json.loads((frames / f"frame{num:03d}.tif.json")
+                         .read_text())["annotation"]
+        assert ann["rotation_degrees"] == 90      # untouched by the date run
+
+
 # ------------------------------------------------------------- empty state
 
 def test_empty_app_shows_placeholder_not_dead_splitter(tmp_path,

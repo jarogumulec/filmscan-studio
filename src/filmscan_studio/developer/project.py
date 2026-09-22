@@ -228,18 +228,13 @@ class DevelopProject:
         rot = self.frame_rotation(name)
         return np.rot90(image, -(rot // 90)) if rot % 360 else image
 
-    def rect_apply(self, rect: tuple[int, int, int, int] | None,
-                   frame_wh: tuple[int, int]) -> tuple[int, int, int, int] | None:
-        """Transform a whole-frame rect [D] (x0, y0, x1, y1) into viewer orientation.
+    def _flip_rect(self, rect: tuple[int, int, int, int],
+                   frame_wh: tuple[int, int]) -> tuple[int, int, int, int]:
+        """The film-flag flips (mirrored H/V, rotated 180) on a rect.
 
-        ``orientation_apply`` flips pixel maps; a rectangle needs the corners
-        mapped by the same transforms, so a rect drawn in the displayed image
-        lands on the right sensor pixels. ``frame_wh`` is the whole-frame
-        (W, H) the rect lives in; 180° rotation keeps the shape, mirrors swap
-        the relevant axis around the frame extent.
+        Involution: applying it twice returns the input, which is what lets
+        the GUI use one function for both directions of the film flips.
         """
-        if rect is None or not self.oriented:
-            return rect
         x0, y0, x1, y1 = rect
         w, h = frame_wh
         if self.rotated_180:
@@ -250,6 +245,74 @@ class DevelopProject:
         if self.mirrored_vertical:
             y0, y1 = h - y1, h - y0
         return (int(x0), int(y0), int(x1), int(y1))
+
+    @staticmethod
+    def _rotate_rect(rect: tuple[int, int, int, int],
+                     frame_wh: tuple[int, int],
+                     rot: int, *, inverse: bool = False) -> tuple[int, int, int, int]:
+        """Per-frame CW rotation of a rect; (W, H) are the SENSOR extents.
+
+        Matches :meth:`rotate_frame` (``np.rot90(a, -k)`` = CW): a sensor
+        point (x, y) lands at (H − y, x) for 90°, and the inverse rotation —
+        which is NOT the same transform, 90° is no involution — maps a
+        displayed point back. Drawing the ROI and reading a drawn ROI are
+        inverse journeys and need ``inverse=True`` on the way back
+        (maska v otočeném náhledu, operátor 2026-09-22).
+        """
+        x0, y0, x1, y1 = rect
+        w, h = frame_wh
+        if rot == 90:
+            if not inverse:    # x' = H - y ; y' = x
+                return (h - y1, x0, h - y0, x1)
+            return (y0, h - x1, y1, h - x0)     # x = y' ; y = H - x'
+        if rot == 270:
+            if not inverse:    # x' = y ; y' = W - x
+                return (y0, w - x1, y1, w - x0)
+            return (w - y1, x0, w - y0, x1)     # x = W - y' ; y = x'
+        # 180° is an involution, same formula both ways
+        return (w - x1, h - y1, w - x0, h - y0)
+
+    def rect_apply(self, rect: tuple[int, int, int, int] | None,
+                   frame_wh: tuple[int, int],
+                   rotation_degrees: int = 0) -> tuple[int, int, int, int] | None:
+        """Transform a SENSOR whole-frame rect into viewer orientation.
+
+        ``orientation_apply`` + :meth:`rotate_frame` flip/rotate pixel maps;
+        a rectangle needs its corners mapped by the same transforms in the
+        same order — film flags first, per-frame 90° rotation last (the
+        rotation is baked after the crop in the render pipeline). ``frame_wh``
+        is the SENSOR (W, H); the returned rect lives in the viewer extents
+        (for 90/270 that is (H, W)).
+        """
+        if rect is None:
+            return None
+        if self.oriented:
+            rect = self._flip_rect(rect, frame_wh)
+        rot = rotation_degrees % 360
+        if rot:
+            rect = self._rotate_rect(rect, frame_wh, rot)
+        return tuple(int(v) for v in rect)
+
+    def rect_unapply(self, rect: tuple[int, int, int, int] | None,
+                     frame_wh: tuple[int, int],
+                     rotation_degrees: int = 0) -> tuple[int, int, int, int] | None:
+        """A rect drawn in VIEWER coords back to SENSOR coords.
+
+        The exact inverse of :meth:`rect_apply`: undo the per-frame rotation
+        first (with its inverse, which is NOT the forward transform), then
+        the film-flag flips (those are involutions). Using ``rect_apply``
+        here — as long as only flips existed and inverting meant re-calling
+        — silently mirrored a drawn ROI into the wrong half of the frame
+        once 90° rotations existed.
+        """
+        if rect is None:
+            return None
+        rot = rotation_degrees % 360
+        if rot:
+            rect = self._rotate_rect(rect, frame_wh, rot, inverse=True)
+        if self.oriented:
+            rect = self._flip_rect(rect, frame_wh)
+        return tuple(int(v) for v in rect)
 
     # ------------------------------------------------------------ settings
 
@@ -360,7 +423,7 @@ class DevelopProject:
         return dn
 
     def build_density(
-        self, name: str, crop: bool = True
+        self, name: str, crop: bool = True, border: int = 0
     ) -> tuple[np.ndarray, dens.DensityProvenance]:
         """Density map for one frame, cropped to its image rect if known.
 
@@ -368,6 +431,12 @@ class DevelopProject:
         (see module docstring). The returned map is float32 with NaN where the
         reading is not a measurement; provenance records the crop and the
         valid-pixel fraction.
+
+        ``border`` (export "including border", user order 2026-09-22) grows
+        the crop rect by that many sensor pixels on each side before clamping
+        — the film edge the ROI hides from correction rides into the export.
+        Where the frame runs out sooner than ``border``, the crop goes to the
+        frame edge in that direction ("pokud by zbývalo méně, dej po kraj").
         """
         entry = self.entry(name)
         dn = self.scan_above_black(entry)
@@ -422,6 +491,11 @@ class DevelopProject:
         )
         if rect is not None and crop:
             x0, y0, x1, y1 = rect
+            if border:
+                # Rozšíření O border pixelů: teprve pak se clampuje na rámec —
+                # ubude-li pixelů méně než border, směr jde „po kraj“.
+                x0, y0 = x0 - int(border), y0 - int(border)
+                x1, y1 = x1 + int(border), y1 + int(border)
             h, w = d.shape
             x0, y0 = max(0, min(int(x0), w - 1)), max(0, min(int(y0), h - 1))
             x1, y1 = max(x0 + 1, min(int(x1), w)), max(y0 + 1, min(int(y1), h))

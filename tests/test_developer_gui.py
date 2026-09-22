@@ -90,6 +90,23 @@ class TestWindow:
         # Auto value from the measurement is restored into the spin.
         assert abs(window.spin_dmin.value() - 0.40) < 0.02
 
+    def test_dmin_auto_replaces_stale_saved_value(self, window) -> None:
+        # The trap (K16O02, 2026-09-22): a frame saved with dmin=0 while the
+        # base measurement was broken must NOT keep rendering at 0 after the
+        # measurement is fixed — auto means the *current* measurement wins.
+        window.project.frame_settings["frame001.tif"] = {
+            "dmin": 0.0, "dmax": 1.75, "dmin_manual": False,
+            "dmax_source": "frame", "exposure_ev": 0.0}
+        window._frame_selected(window.frame_list.item(0))
+        assert window.chk_dmin_auto.isChecked()
+        assert abs(window.spin_dmin.value() - 0.40) < 0.02
+        # A manual value is still honoured (the operator outranks the rig).
+        window.project.frame_settings["frame001.tif"]["dmin_manual"] = True
+        window.project.frame_settings["frame001.tif"]["dmin"] = 0.55
+        window._frame_selected(window.frame_list.item(0))
+        assert not window.chk_dmin_auto.isChecked()
+        assert window.spin_dmin.value() == pytest.approx(0.55)
+
     def _drag_roi(self, window, qtbot) -> None:
         v = window.view
         v.set_image(np.full((200, 200), 0.5), (64, 48))
@@ -110,6 +127,24 @@ class TestWindow:
         assert x0 >= 0 and y0 >= 0 and x1 > x0 and y1 > y0
         assert window.project.rect_for(
             window.project.entry("frame001.tif")) == rect
+
+    def test_rect_on_rotated_frame_round_trips(self, window) -> None:
+        """Maska v 90° otočeném náhledu: nakreslený rámeček se musí uložit
+        jako přesná inverze zobrazeného — ne aplikací stejné rotace
+        (90° není involuce; operátor 2026-09-22: „rotuje, ale špatně se
+        zrcadlí maska“)."""
+        window.project.frames[0].record["annotation"] = \
+            {"rotation_degrees": 90}
+        sensor = (10, 5, 26, 19)
+        # senzorový ROI → co vidíme v náhledu (set_rect cesta)
+        shown = window.project.rect_apply(sensor, (64, 48), 90)
+        # operátor rámeček v náhledu potvrdí → uložený tvar
+        window.frame_list.setCurrentRow(0)
+        window.rect_selected(shown)
+        stored = window.project.rect_for(window.project.entry("frame001.tif"))
+        assert stored == sensor
+        # and the drawn-rect view of it lands back where the operator drew
+        assert window.project.rect_apply(stored, (64, 48), 90) == shown
 
     def test_small_drag_is_not_a_rect(self, window, qtbot) -> None:
         v = window.view
@@ -816,6 +851,189 @@ class TestDoc08Layout:
         assert window.sl_toe.value() == window.sl_toe.maximum()
         assert window.sl_gamma.value() == window.sl_gamma.maximum()
         assert window.sl_sb.value() == window.sl_sb.maximum()
+
+
+class TestOutputSharpeningUi:
+    """Ostření do výstupního nastavení (rozkaz 2026-09-22, konzervativní
+    předvolba) — páčka patří do Zobrazení, hodnoty se pamatují per-snímek."""
+
+    def test_conservative_preset_on_fresh_frame(self, window) -> None:
+        """Photoshop konvence: % (0–200) a px — rozkaz 2026-09-22 večer."""
+        p = window.current_params()
+        assert 0.0 < p.sharpen <= 30.0
+        assert p.sharpen == pytest.approx(20.0)
+        assert p.sharpen_radius == pytest.approx(1.0)
+        assert window.spin_sh.suffix() == " %"
+        assert window.spin_shr.suffix() == " px"
+        assert window.spin_sh.maximum() == pytest.approx(200.0)
+
+    def test_sharpen_row_lives_in_display_box(self, window) -> None:
+        def box_of(w):
+            q = w.parent()
+            while q is not None and not isinstance(q, QGroupBox):
+                q = q.parent()
+            return q
+        assert box_of(window.sl_sh) is box_of(window.sl_br)
+
+    def test_sharpen_is_remembered_and_restored(self, window, tmp_path,
+                                                qtbot) -> None:
+        window.project.root = tmp_path
+        window.spin_sh.setValue(65.0)
+        qtbot.wait(20)
+        stored = window.project.frame_settings["frame001.tif"]
+        assert stored["sharpen"] == pytest.approx(65.0)
+        assert window.sl_sh.value() == 65             # jezdec prime v %
+        window.spin_sh.setValue(0.0)              # mezitím jiná hodnota
+        qtbot.wait(20)
+        window.project.frame_settings["frame001.tif"]["sharpen"] = 65.0
+        window._frame_selected(window.frame_list.item(0))
+        assert window.current_params().sharpen == pytest.approx(65.0)
+        # explicitní vypnutí se taky uchová — nula drží, předvolba se nevrátí
+        window.project.frame_settings["frame001.tif"]["sharpen"] = 0.0
+        window._frame_selected(window.frame_list.item(0))
+        assert window.current_params().sharpen == 0.0
+
+    def test_sharpen_changes_export_pixels(self, window, tmp_path) -> None:
+        """Páčka musí dosáhnout na export (ne jen na náhled) — ostatně je to
+        nastavení výstupu."""
+        import tifffile
+        window.project.root = tmp_path
+        window.spin_sh.setValue(0.0)
+        window.save_render()
+        off = tifffile.imread(tmp_path / "derived" / "frame001.positive.tif")
+        window.spin_sh.setValue(100.0)
+        window.save_render()
+        on = tifffile.imread(tmp_path / "derived" / "frame001.positive.tif")
+        assert not np.array_equal(off, on)
+
+
+class TestExportAllAndBorder:
+    """Rozkazy 2026-09-22 večer: „Export vše" ve vybraném formátu a volitelný
+    okraj filmu kolem ořezu (implicitně odškrtnutý, 100 px)."""
+
+    def _second_frame(self, window) -> None:
+        from filmscan_studio.core.rawio import open_frame
+        from tests.test_project import _write, SHUTTER_SCAN
+        fr = open_frame(window.project.entry("frame001.tif").frame.path)
+        _write(window.project.entry("frame001.tif").frame.path.parent
+               / "frame002.tif", fr.data, "scan", SHUTTER_SCAN)
+        window.set_project(DevelopProject.open(window.project.root))
+
+    def test_border_defaults_unchecked_100px(self, window) -> None:
+        assert not window.chk_border.isChecked()
+        assert window.spin_border.value() == 100
+        assert not window.spin_border.isEnabled()   # až se zaškrtne
+        assert window._border_px() == 0
+        window.chk_border.setChecked(True)
+        assert window.spin_border.isEnabled()
+        assert window._border_px() == 100
+
+    def test_border_grows_crop_to_frame_edge(self, window, tmp_path) -> None:
+        """ROI 8 px od okraje + okraj 100 px → clamp „po kraj": výstup je
+        o 8 px větší na každé straně, ne o 100 px za snímek."""
+        import tifffile
+        window.project.root = tmp_path
+        window.project.set_rect("frame001.tif", (8, 8, 56, 40))
+        window._density = window.project.build_density("frame001.tif",
+                                                       crop=False)
+        window.chk_border.setChecked(True)
+        window.spin_border.setValue(100)
+        window.save_render()
+        with_b = tifffile.imread(tmp_path / "derived"
+                                 / "frame001.positive.tif")
+        assert with_b.shape == (48, 64)           # celý snímek — po kraj
+        window.chk_border.setChecked(False)
+        window.save_render()
+        plain = tifffile.imread(tmp_path / "derived"
+                                / "frame001.positive.tif")
+        assert plain.shape == (32, 48)            # jen ROI bez okraje
+
+    def test_border_partial_uses_requested_amount(self, window,
+                                                  tmp_path) -> None:
+        """Dostatek pixelů → okraj sedí přesně na px na každou stranu."""
+        import tifffile
+        window.project.root = tmp_path
+        window.project.set_rect("frame001.tif", (16, 16, 48, 32))
+        window._density = window.project.build_density("frame001.tif",
+                                                       crop=False)
+        window.chk_border.setChecked(True)
+        window.spin_border.setValue(10)
+        window.save_jpeg()
+        import cv2
+        loaded = cv2.imread(str(tmp_path / "derived" / "frame001.jpg"),
+                            cv2.IMREAD_GRAYSCALE)
+        # ROI 16..48 × 16..32 (W=32, H=16) + 10 px na každou stranu →
+        # W=52, H=36; cv2 vrací (H, W).
+        assert loaded.shape == (36, 52)
+
+    def test_density_archive_ignores_border(self, window, tmp_path) -> None:
+        """Archiv je měření — okraj fotky do něj nepatří (rozhodnutí k povelu)."""
+        import tifffile
+        window.project.root = tmp_path
+        window.project.set_rect("frame001.tif", (8, 8, 56, 40))
+        window._density = window.project.build_density("frame001.tif",
+                                                       crop=False)
+        window.chk_border.setChecked(True)
+        window.spin_border.setValue(100)
+        window.save_density()
+        with tifffile.TiffFile(tmp_path / "derived"
+                               / "frame001.density.tif") as tf:
+            assert tf.pages[0].shape == (32, 48)   # jen ROI, bez okraje
+
+    def test_export_all_exports_every_frame_selected_format(
+            self, window, tmp_path) -> None:
+        """Batch přepne snímek po snímku a vždy spustí vybraný formát; po
+        dokončení se vrátí na původní snímek."""
+        self._second_frame(window)
+        window.project.root = tmp_path
+        assert window.frame_list.count() == 2
+        labels = [window.cmb_export.itemText(i)
+                  for i in range(window.cmb_export.count())]
+        window.cmb_export.setCurrentText(next(t for t in labels
+                                               if t.startswith("JPEG 8b gray")))
+        window.btn_export_all.click()
+        assert (tmp_path / "derived" / "frame001.jpg").exists()
+        assert (tmp_path / "derived" / "frame002.jpg").exists()
+        assert window.frame_list.currentRow() == 0
+
+    def test_export_all_uses_per_frame_settings(self, window, tmp_path,
+                                                qtbot) -> None:
+        """Batch nesmí exportovat vše aktuálními páčkami — každý snímek má
+        svá uložená nastavení (týž kontrakt jako ruční přepínání)."""
+        from filmscan_studio.core import render as rnd
+        self._second_frame(window)
+        window.project.root = tmp_path
+        window.spin_ev.setValue(3.0)               # +3 EV jen pro frame001
+        qtbot.wait(20)
+        window.frame_list.setCurrentRow(1)         # frame002: čerstvý, 0 EV
+        qtbot.wait(50)
+        labels = [window.cmb_export.itemText(i)
+                  for i in range(window.cmb_export.count())]
+        window.cmb_export.setCurrentText(next(t for t in labels
+                                               if t.startswith("JPEG 8b gray")))
+        window.btn_export_all.click()
+        d1, _ = window.project.build_density("frame001.tif", crop=True)
+        p1 = rnd.RenderParams.from_dict(
+            window.project.frame_settings["frame001.tif"])
+        assert p1.exposure_ev == pytest.approx(3.0)
+        imported = cv2_read(tmp_path / "derived" / "frame001.jpg")
+        expected = np.rint(rnd.render_for_display(d1, p1) * 255.0)
+        assert abs(imported.astype(float) - expected).mean() < 3.0
+        # frame002 zůstal u svého 0 EV — žádné přetékání páček mezi snímky
+        p2 = rnd.RenderParams.from_dict(
+            window.project.frame_settings["frame002.tif"])
+        assert p2.exposure_ev == pytest.approx(0.0)
+
+    def test_export_all_disabled_without_project(self, qtbot) -> None:
+        w = MainWindow()                            # prázdné okno
+        qtbot.addWidget(w)
+        assert not w.btn_export_all.isEnabled()
+        w.export_all()                              # nesmí selhat
+
+
+def cv2_read(path):
+    import cv2
+    return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
 
 
 class TestExportMetadata:
