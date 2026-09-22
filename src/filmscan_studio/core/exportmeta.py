@@ -3,26 +3,33 @@
 Standardizovaná data jdou do standardních tagů — čtečka fotek je vidí bez
 znalosti Filmscan Studio:
 
-    Make / Model          ← film.camera (foťák na filmu, Make=první token)
+    Make / Model          ← film.camera_make / film.camera_model (přímá
+                            pole z anotátoru); fallback: heuristicý rozpad
+                            volného textu film.camera (see split_camera)
     LensModel             ← film.shooting_lens
     ISOSpeedRatings       ← film.film_iso (text "400/27°" → 400)
     DateTimeOriginal      ← annotation.capture_datetime (datum záběru)
     DateTimeDigitized     ← acquisition.capture_date (čas na riggu)
     GPS IFD               ← annotation.gps_lat / gps_lon (+ refs)
     Rating/RatingPercent  ← annotation.rating (0–5 → 0–100 %)
-    ImageDescription      ← annotation.title
-    Orientation           ← annotation.rotation_degrees — developer rotaci
-                            do pixelů NEzapéká (filmové příznaky ano), tag
-                            ji naopak nařídí čtečce; výsledek je totéž co
-                            otočený náhled anotátoru
+    ImageDescription      ← celý popis (komentář + strojní kusy; viz níže)
     Software              ← Filmscan Studio
 
-Zbytek (digitalizační kamera/objektiv/expozice/vývojka/push/…) putuje za
-uživatelský komentář do UserComment jako " ; Key: value" — komentář je VŽDY
-první, prázdné kusy se přeskočí, středník uvnitř hodnoty se nahradí "–", aby
-szpětné dělení podle "; " zůstalo jednoznačné. Popisky kusů jsou anglické
-(rozhodnutí uživatele: UI česky, metadata machine-neutral). Tagy jdou dvakrát:
-XMP dc:subject (Lightroom) i textově v komentáři (čtečky bez XMP).
+XMP nese co EXIF neumí (ASCII-only tagy by češtinu zmlaskly — změřeno):
+dc:title (název — první kolonka Bridge), dc:description (popis v UTF-8) a
+dc:subject (štítky); xmp:Rating k EXIF Ratingu (čtečky čtou jen jednu z dvojic).
+
+POPIS (rozkaz 2026-09-22: „do ImageDescription dej to, cos dal do usercomment;
+to, cos dal do ImageDescription, patří do Title"): komentář uživatele je VŽDY
+první, pak „ ; Key: value" kusy toho, co nemá vlastní tag — prázdné kusy se
+přeskočí, středník uvnitř hodnoty se nahradí „–", aby dělení podle „ ; "
+zůstalo jednoznačné. Popisky kusů anglicky (UI česky, metadata strojově
+neutralní). Do EXIF ImageDescription jde ASCII-fold verze (ě→e), plné UTF-8
+texty žijí v XMP.
+
+Rotation_degrees se zapéká do pixelů přímo vývojářem (rozkaz 2026-09-22),
+EXIF Orientation se tedy NEZAPISUJE — tag by se s otočenými pixely sečetl
+a čtečka by otočila podruhé.
 
 Vrací se hotové BYTY — writeři v icc.py je jen předají zapisovačům. TIFF cesta
 se nemění (JSON v ImageDescription, dok. 07): exiftool TIFF EXIF pod tagem
@@ -31,6 +38,7 @@ se nemění (JSON v ImageDescription, dok. 07): exiftool TIFF EXIF pod tagem
 from __future__ import annotations
 
 import re
+import unicodedata
 from fractions import Fraction
 
 from PIL.Image import Exif
@@ -38,16 +46,23 @@ from PIL.TiffImagePlugin import IFDRational
 
 SOFTWARE_AGENT = "Filmscan Studio"
 
-#: EXIF Orientation pro rotace náhledu (annotation.rotation_degrees, CW).
-_ORIENTATION_FOR_ROTATION = {90: 6, 180: 3, 270: 8}
-
-_SPLIT_CAMERA = re.compile(r"^(?P<make>\S+)\s+(?P<model>.+)$")
-
 
 def _clean(value: object) -> str:
-    """Text bez středníků — oddělovač kusů UserComment musí zůstat jediný."""
+    """Text bez středníků — oddělovač kusů popisu musí zůstat jediný."""
     text = str(value).strip() if value is not None else ""
     return text.replace(";", "–")
+
+
+def _ascii_fold(text: str) -> str:
+    """Přes ASCII bez '?' — EXIF tagy jsou latentně ASCII a Pillow by
+    ěščřžý srazil na otazníky (změřeno). NFKD rozklad + zahození diakritiky:
+    'vyvolávka' → 'vyvolavka'. Pomlčka se musí vyměnit DŘÍV, než ji
+    ascii/ignore zahodí — je to náhrada středníku v popisu, ztrácet ji
+    nechceme. Plná verze zůstává v XMP."""
+    decomposed = unicodedata.normalize("NFKD", text.replace("–", "-"))
+    folded = "".join(c for c in decomposed
+                     if not unicodedata.combining(c))
+    return folded.encode("ascii", "ignore").decode("ascii")
 
 
 def _exif_str(raw: object) -> str:
@@ -88,17 +103,41 @@ def parse_iso(text: object) -> int | None:
 
 
 def split_camera(text: object) -> tuple[str, str]:
-    """'Nikon FM2' → ('Nikon', 'FM2'); jeden token → Make ''.
+    """Rozpad volného textu foťáku na (Make, Model).
 
-    Stejná heuristika jako load-camera v anotátoru — EXIF chce Make a Model
-    zvlášť a operátor zadává 'značka model'."""
+    Vyhlášená past (uživatel 2026-09-22): „ERNST LEITZ WETZLAR GMBH Leica R4s
+    MOD.2" není dělitelný mezerou — make je celý uppercase-run, model zbytek.
+    'Nikon FM2' zůstává první token / zbytek. Pravidla:
+
+    * ≥2 úvodní tokeny OPS (každý obsahuje písmena a je celý VELKÝ) a něco
+      za nimi → make = run, model = zbytek ('ERNST LEITZ WETZLAR GMBH' |
+      'Leica R4s MOD.2'; 'OLYMPUS' | 'OM-1' je jeden token → pravidlo 2),
+    * jinak make = první token, model = zbytek ('Nikon' | 'FM2',
+      'OLYMPUS' | 'OM-1', 'PENTAX' | 'AUTO 1000'),
+    * jeden token → make '' a model on sám ('Zenit').
+
+    Anotátor i migrace sidecarů volají TOHLE — jeden zdroj pravdy."""
     s = re.sub(r"\s+", " ", str(text).strip()) if text else ""
-    m = _SPLIT_CAMERA.match(s)
-    return ("", s) if not m else (m.group("make"), m.group("model").strip())
+    tokens = s.split(" ")
+    if len(tokens) < 2:
+        return "", s
+
+    def is_upper_word(token: str) -> bool:
+        return any(c.isalpha() for c in token) and token == token.upper()
+
+    run = 0
+    for token in tokens:
+        if is_upper_word(token):
+            run += 1
+        else:
+            break
+    if run >= 2 and run < len(tokens):
+        return " ".join(tokens[:run]), " ".join(tokens[run:])
+    return tokens[0], " ".join(tokens[1:])
 
 
 def _dms_triple(magnitude: float) -> tuple:
-    """Desítkový stupeň → (deg, min, sec) IFDRational; sekundy na 9 DESetin."""
+    """Desítkový stupeň → (deg, min, sec) IFDRational."""
     degrees = int(magnitude)
     rest = (magnitude - degrees) * 60
     minutes = int(rest)
@@ -156,9 +195,10 @@ def _collect(record: dict) -> dict:
         "gps_lon": ann.get("gps_lon"),
         "gps_lat_ref": ann.get("gps_lat_ref"),
         "gps_lon_ref": ann.get("gps_lon_ref"),
-        "rotation_degrees": ann.get("rotation_degrees") or 0,
         # film — čím a na co exponováno + razítko dílny
         "camera": film.get("camera"),
+        "camera_make": film.get("camera_make"),
+        "camera_model": film.get("camera_model"),
         "shooting_lens": film.get("shooting_lens"),
         "film_iso": film.get("film_iso"),
         "film_name": film.get("film_name"),
@@ -191,7 +231,7 @@ def _fmt_number(value: object) -> str:
     return f"{f:g}"
 
 
-def _comment_pieces(meta: dict) -> list:
+def _description_pieces(meta: dict) -> list:
     """Kusy bez vlastního EXIF tagu, anglické popisky (dok. 09 + strojová
     neutralita metadat). Hodnoty bez středníků, prázdné vynechat."""
     film_label = _clean(meta["film_name"])
@@ -227,23 +267,25 @@ def _comment_pieces(meta: dict) -> list:
     return [f"{key}: {value}" for key, value in pairs if key and value]
 
 
-def user_comment_text(record: dict) -> str:
-    """UserComment: komentář uživatele FIRST, pak ' ; ' kusy (dok. 09)."""
+def description_text(record: dict) -> str:
+    """Popis snímku: komentář uživatele FIRST, pak ' ; ' kusy (dok. 09).
+
+    Jde do EXIF ImageDescription (ASCII-fold) a do XMP dc:description (plné
+    UTF-8). Dřív UserComment — ten čtečky stejně netušily (rozkaz 2026-09-22)."""
     meta = _collect(record)
     pieces = ([_clean(meta["note"])] if meta["note"] else []) \
-        + _comment_pieces(meta)
+        + _description_pieces(meta)
     return " ; ".join(p for p in pieces if p)
 
 
-def _encode_comment(text: str) -> bytes:
-    """UserComment musí být RAW bajty s prefixem znakové sady — Pillow
-    (re)kóduje jen str, a ASCII/UNICODE prefix je povinnost Exifu. Čeština
-    jde UTF-16BE (ověřeno exiftool 2026-09-22)."""
-    try:
-        text.encode("ascii")
-        return b"ASCII\x00\x00\x00" + text.encode("ascii")
-    except UnicodeEncodeError:
-        return b"UNICODE\x00" + text.encode("utf-16-be")
+def _camera_parts(meta: dict) -> tuple[str, str]:
+    """(Make, Model): přímá pole anotátoru mají přednost, fallback je
+    heuristický rozpad volného `camera` (split_camera)."""
+    make = _clean(meta["camera_make"])
+    model = _clean(meta["camera_model"])
+    if make or model:
+        return make, model
+    return split_camera(meta["camera"])
 
 
 def build_exif_bytes(record: dict) -> bytes | None:
@@ -256,49 +298,45 @@ def build_exif_bytes(record: dict) -> bytes | None:
     exif_ifd = exif.get_ifd(0x8769)
     used = False
 
-    if meta["title"]:
-        exif[0x010E] = meta["title"]                       # ImageDescription
+    description = _ascii_fold(description_text(record))
+    if description:
+        exif[0x010E] = description          # ImageDescription ← celý popis
         used = True
-    make, model = split_camera(meta["camera"])
+    make, model = _camera_parts(meta)
     if model:
-        exif[0x0110] = model                               # Model ← foťák
+        exif[0x0110] = _ascii_fold(model)                # Model
         used = True
     if make:
-        exif[0x010F] = make                                # Make ← značka
+        exif[0x010F] = _ascii_fold(make)                  # Make
         used = True
+
+
     iso = parse_iso(meta["film_iso"])
     if iso:
-        exif_ifd[0x8827] = iso                             # ISOSpeedRatings
+        exif_ifd[0x8827] = iso                           # ISOSpeedRatings
         used = True
     if meta["shooting_lens"]:
-        exif_ifd[0xA434] = _clean(meta["shooting_lens"])   # LensModel
+        exif_ifd[0xA434] = _ascii_fold(
+            _clean(meta["shooting_lens"]))               # LensModel
         used = True
 
     shot_dt = _exif_str(meta["capture_datetime"])
     if shot_dt:
-        exif_ifd[0x9003] = shot_dt                         # DateTimeOriginal
+        exif_ifd[0x9003] = shot_dt                       # DateTimeOriginal
         used = True
     dev_dt = _exif_str(meta["dev_date"])
     if dev_dt:
-        exif_ifd[0x9004] = dev_dt        # DateTimeDigitized (0x900D je
-        used = True                      # FormattingSensitivity — past hlídá)
-
-    comment = user_comment_text(record)
-    if comment:
-        exif_ifd[0x9286] = _encode_comment(comment)        # UserComment
-        used = True
+        exif_ifd[0x9004] = dev_dt      # DateTimeDigitized (0x900D je
+        used = True                    # FormattingSensitivity — past hlídá)
 
     rating = meta["rating"]
     if isinstance(rating, int) and 0 <= rating <= 5:
-        exif_ifd[0x4746] = rating                          # Rating 0–5
-        exif_ifd[0x4747] = round(rating / 5 * 100)         # RatingPercent
+        exif_ifd[0x4746] = rating                        # Rating 0–5
+        exif_ifd[0x4747] = round(rating / 5 * 100)       # RatingPercent
         used = True
 
-    orientation = _ORIENTATION_FOR_ROTATION.get(
-        int(meta["rotation_degrees"] or 0) % 360)
-    if orientation:
-        exif[0x0112] = orientation
-        used = True
+    # Orientation se NEPIŠE: vývoják rotaci zapéká do pixelů (dok. 09),
+    # tag by u čtečky způsobil druhé otočení.
 
     gps = {}
     lat = gps_to_dms(meta["gps_lat"], "lat", meta["gps_lat_ref"])
@@ -308,25 +346,37 @@ def build_exif_bytes(record: dict) -> bytes | None:
     if lon:
         gps[3], gps[4] = lon
     if lat and lon:
-        gps[0] = b"\x02\x03\x00\x00"                       # GPSVersionID 2.3
+        gps[0] = b"\x02\x03\x00\x00"                     # GPSVersionID 2.3
     if gps:
         exif.get_ifd(0x8825).update(gps)
         used = True
 
     if not used:
         return None
-    exif[0x0131] = SOFTWARE_AGENT                          # Software
+    exif[0x0131] = SOFTWARE_AGENT                        # Software
     return exif.tobytes()
 
 
 def build_xmp_bytes(record: dict) -> bytes | None:
-    """XMP packet s dc:subject (štítky) + xmp:Rating; None když nic z toho.
+    """XMP packet: dc:title (název — první kolonka Bridge), dc:description
+    (popis v UTF-8, verze bez ztráty diakritiky), dc:subject (štítky) a
+    xmp:Rating; None když je vše prázdné.
 
     Některé čtečky (macOS Foto) čtou hodnocení jen z jednoho z dvojic —
     proto EXIF Rating i xmp:Rating (otevřená otázka dok. 09: odpověď ano)."""
     meta = _collect(record)
     tags = [str(t).strip() for t in meta["tags"] if str(t).strip()]
     parts = []
+    if meta["title"]:
+        parts.append(
+            f'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">'
+            f'{_xml_escape(meta["title"])}</rdf:li></rdf:Alt></dc:title>')
+    description = description_text(record)
+    if description:
+        parts.append(f"<dc:description><rdf:Alt>"
+                     f'<rdf:li xml:lang="x-default">'
+                     f"{_xml_escape(description)}</rdf:li>"
+                     f"</rdf:Alt></dc:description>")
     if tags:
         items = "".join(f"<li>{_xml_escape(t)}</li>" for t in tags)
         parts.append(f"<dc:subject><rdf:Seq>{items}</rdf:Seq></dc:subject>")

@@ -1,172 +1,200 @@
 # FilmScan Studio
 
-Reproducible digitisation of photographic film on a **Touptek TS2600MP-G2**
-mono astro camera (Sony IMX571, 6224×4168, 16-bit, TEC-cooled). Two
-deliberately separate modules: **Capture** (camera → 16-bit TIFF + metadata)
-and **Developer** (TIFF → developed 16-bit TIFF). Acquisition never influences
-development and neither module can corrupt the other's data.
+![The FilmScan digitising rig — a vintage diapositive duplicator converted into a film scanner](filmscan_duplicator.jpeg)
+
+**Open-hardware, open-source digitisation of photographic film.** A DIY scanner
+holder + duplicator transport, a true 16-bit linear monochrome camera, and
+Python software that turns B&W negatives into physically calibrated digital
+positives — and keeps every fact about the strip (film, development, dates,
+GPS) attached to the pixels all the way into the exported JPEG/HEIC.
+
+The sensor chain is treated as a **measurement instrument**: the Sony IMX571
+runs its native 16-bit ADC, mono (no demosaic), no gamma, no auto-brightness —
+what the stream measures is what the file holds. That lets the software compute
+real **optical density** per pixel (`D = −log10 T`) instead of guessing at
+curves, and it is what makes the result reproducible years later.
+
+## The workflow — three commands, in this order
+
+```bash
+uv sync                        # install everything (Python 3.12 + uv)
+
+uv run filmscan-studio         # 1. CAPTURE   — camera → 16-bit TIFFs + metadata
+uv run filmscan-annotate       # 2. ANNOTATE  — titles, dates, GPS, film log
+uv run filmscan-develop-gui    # 3. DEVELOP   — densities → tone curve → exports
+```
+
+### 1. Capture — `uv run filmscan-studio`
+
+The capture GUI (PySide6, Czech UI) drives the camera and builds **one project
+folder per film strip**. Inside the app, work through the boxes in this
+sequence — each step produces calibration that the develop step needs:
+
+1. **Nový film** — film metadata (stock, ID, developer, dates, orientation…).
+2. **Dark Frame** — sensor dark current with the light path capped.
+3. **Flat Field** — illumination without film (divides out vignetting/dust).
+4. **Film base** ("min point") — a drag-rect over a patch of **clear film
+   base**; this measured floor becomes Dmin in step 3. This is *not* the flat —
+   the flat is shot without film, the base measures the held film itself.
+5. **Capture** — frame by frame, auto-numbered to match the canister. Optional
+   averaging of N exposures per frame; LCG + low-noise readout (the sensor
+   optimum, see `camera_tests/`) are on by default. After every frame the TIFF
+   is **audited** (metering rect on/off) and the next frame's shutter is
+   corrected automatically.
+6. **Exportovat projekt** — the folder is complete.
+
+Stored per film: untouched **16-bit linear mono TIFFs** in `frames/`, one
+`.tif.json` sidecar per frame (exposure, gain, temperature, calibration
+provenance…), `catalog.sqlite`, `project.json`, `film_base.json`. Raw files
+are copied, never rewritten — metadata never lives inside the TIFF.
+
+Run `uv run filmscan-studio --mock` to explore the GUI with a simulated camera,
+no hardware needed.
+
+### 2. Annotate — `uv run filmscan-annotate [folder]`
+
+Opens a captured project folder and lets you fill in what the camera cannot
+know: title, description, star rating, tags, **capture date & time** (a
+readable date on the film canister label is auto-applied to all frames,
+sequentially offset by one minute each; bulk apply works the same way),
+**GPS**, camera make/model, shooting lens, film ISO, developing chemicals,
+push/pull, expiry, per-frame 90° rotation. Everything is written into the JSON
+sidecars — the develop step reads it back and burns it into the exported
+files' EXIF/XMP.
+
+### 3. Develop — `uv run filmscan-develop-gui [folder]`
+
+The "developer" opens the density archive and renders the **positive**
+(bright scene = dense film = bright pixel). For each frame it computes:
 
 ```
-uv run filmscan-studio          # Capture GUI (PySide6)
-uv run filmscan-studio --mock   #   …with a simulated TS2600MP-G2, no camera needed
-uv run filmscan-develop frameNNN.tif ...  # Developer CLI → 16-bit TIFF + sidecar
-uv run filmscan-annotate [slozka]  # Anotátor metadat (název, datum, geo, štítky)
-uv run pytest                   # tests
+raw DN ──dark──► flat ──► transmittance T ──► density D = −log10 T ──►
+Dmin (from film-base measurement) ──► Dmax (auto p99.9, or manual) ──►
+exposure EV ──► tone curve (toe · mid contrast γ · shoulder) ──►
+display gamma 2.2 (defined by the ICC profile) ──► export
 ```
 
-## Design rules the code enforces
+The tone-curve model is a Fritsch–Carlson spline filmic curve, designed with
+[darktable's **negadoctor**](https://github.com/darktable-org/darktable) module
+as the inspiration/checked counterpart (our own density-based take on it —
+see `Documentation_image_processing/02_rozbor_negadoctor.md`).
 
-| Rule | Where |
+**Tuning order** (full walkthrough in
+[`Documentation_image_processing/08_ui_ladeni_dmin_dmax_a_krivky.md`](Documentation_image_processing/08_ui_ladeni_dmin_dmax_a_krivky.md)):
+first the **film scale** (Dmin — leave it on *from film-base measurement*; Dmax
+— start on *auto from frame*, tighten against the right edge of the density
+histogram), then the **picture** (mid contrast γ ≈ 1.35–1.7, toe compresses
+shadows, shoulder compresses highlights), and finally nothing — display gamma
+2.2 is fixed by the export profile, not a creative control. The annotated
+metadata (GPS, time, camera, developer…) flows into the export's EXIF/XMP
+automatically. A `Shift`-drag draws the ROI (frame crop) that both preview and
+exports respect; orientation flags from the capture are baked into the pixels.
+
+A headless CLI also exists: `uv run filmscan-develop frame001.tif --dark … --flat … -o out/`.
+
+### Export formats
+
+Everything exports to `<project>/derived/`, named
+`<FILMID>_frameNNN.<kind>` (e.g. `K16O04_frame001.mono10.heic`). The tone
+curve lands in the pixels **exactly once**; ICC profiles are interpretation
+wrappers, never a second gamma.
+
+| Format | Suffix | Depth | Profile | For |
+|---|---|---|---|---|
+| Positive TIFF 16b gray | `.positive.tif` | 16-bit | Gray Gamma 2.2 | master positive, WYSIWYG with the preview |
+| JPEG 8b gray | `.jpg` | 8-bit | Gray Gamma 2.2 | everyday viewing |
+| JPEG 8b sRGB | `.srgb.jpg` | 8-bit | hand-built sRGB wrapper | readers that insist on colour |
+| HEIF 10b mono | `.mono10.heic` | 10-bit | Gray Gamma 2.2 | Apple Photos, small + deep |
+| HEIC 10b sRGB | `.srgb10.heic` | 10-bit | sRGB wrapper | Apple ecosystem, RGB for reader safety |
+| Flat for Capture One | `.flat.tif` | 16-bit | **none** — linear in density | grading from scratch |
+| Density archive | `.density.tif` | float32 | none — absolute optical D | the archival measurement; regenerates every row above |
+
+EXIF + XMP (title, description, rating, GPS, dates, camera make/model, lens,
+film ISO, developer, digitisation data…) are embedded in the JPEG and HEIC
+exports; TIFFs keep their JSON sidecar instead. Any export is reproducible —
+each carries a parameter fingerprint.
+
+## Software branches
+
+- **`main`** — built around the **TEC-cooled Touptek TS2600MP-G2** (Sony
+  IMX571, APS-C **mono**, 6224×4168, native 16-bit ADC, USB3): the sensor
+  optimum for **B&W 35mm** film — full well, no Bayer interpolation artefacts,
+  no white balance to chase.
+- **`D750`** branch (`git checkout D750`) — the same software driving a
+  **Nikon D750** as the digitising camera through the Nikon SDK
+  (`Nikon_SDK/`, driven from an x86_64 helper process).
+
+## Hardware
+
+| Part | What it is | Notes / source |
+|---|---|---|
+| Camera | Touptek TS2600MP-G2 (= ATR2600M), Sony IMX571 APS-C mono astro camera | 6224×4168 @ 16-bit USB3, two-stage TEC cooling to ΔT −42 °C, **needs 11–14 V DC power** |
+| Digitising lens | Meopta Meogon-S 4/80 enlarging lens | |
+| Bellows | "Macro Extension Bellows Lens Wrap Belt for Nikon F-Mount" | [AliExpress 1005010760273220](https://www.aliexpress.com/item/1005010760273220.html) — holds lens at copy distance |
+| Light source | "8 Inch LED Photography Video Panel Light Photo Studio Lighting Kit" | [AliExpress 1005006408823817](https://www.aliexpress.com/item/1005006408823817.html) — the **middle brightness preset runs at 4440 K with the best homogeneity**; that preset is what we digitise with |
+| Film holder | printed modification of **"35mm film DSLR digitizing rig"** by OndrejP_SK | Thingiverse [thing:4379458](https://www.thingiverse.com/thing:4379458); our SketchUp + STL modifications live in [`3Dmodels_scanner_holder/`](3Dmodels_scanner_holder) (incl. a 6×6 medium-format holder) |
+| Film advance | **vintage diapositive duplicator** (a device for copying slide film / diapositives), most likely made by **Ihagee** | [reference](https://photobutmore.de/exakta/zubehoer/diakopier/index.php) — see the photo up top; the holder bolts where the duplicator held its slide carrier |
+| Alternative camera | Nikon D750 via Nikon SDK | `D750` branch |
+
+## Repository layout
+
+```
+src/filmscan_studio/
+  __main__.py        filmscan-studio      — capture GUI entry point
+  capture/           camera backends: Touptek SDK wrapper (_toupcam/, vendored dylib),
+                     mock camera, capture session, post-capture quality audit
+  core/              the physics + imaging core, shared by both GUIs:
+                     calibration (dark/flat), density (T→D archive), render
+                     (tone curve), filmic, icc (profiles), exportmeta (EXIF/XMP),
+                     filmbase, histogram, zoom, models (pydantic metadata schema)
+  gui/               capture GUI widgets (PySide6)
+  annotator/         filmscan-annotate    — metadata annotator GUI
+  developer/         filmscan-develop[-gui] — density archive, develop pipeline, GUI
+tests/               pytest suite (598 tests, runs against MockCamera — no hardware)
+Documentation_image_processing/
+                     01–09 design docs: physical model, negadoctor analysis,
+                     rendering layers, ROI, ICC/histograms, Dmin/Dmax/curve UI
+                     guide, annotation & EXIF contract — start with its README
+3Dmodels_scanner_holder/   SketchUp + STL models modifying the Thingiverse rig
+camera_tests/              sensor characterisation scripts (LCG/HCG × low-noise SNR,
+                           averaging, min exposure, temperature) + result plots
+Nikon_SDK/                 Nikon SDK payload (D750 branch)
+Touptek_SDK/               vendor SDK distribution (the used dylib is vendored
+                           inside src/filmscan_studio/capture/_toupcam/)
+scripts/                   hardware probe helpers (cooling, manual film-base probe)
+Documentation_image_processing/darktable_source/   frozen negadoctor sources (GPLv3)
+AGENTS.md                  contributor/agent rules: design invariants, retired features
+CHANGELOG.md               what changed, by date
+```
+
+## Requirements & installation
+
+- [uv](https://docs.astral.sh/uv/) and Python ≥ 3.12 (uv fetches it), then
+  `uv sync` — installs PySide6, numpy, OpenCV, Pillow, pillow-heif, tifffile,
+  pydantic. No downloads for either camera SDK: both are vendored in the repo.
+- Camera: a USB3 port and **11–14 V DC power** for the Touptek. Without power
+  the camera may not enumerate on USB at all.
+- macOS is the development platform (the vendored dylib is universal
+  x86_64+arm64); Linux/Windows packaging is planned.
+- Tests: `uv run pytest` (598 tests, `--mock` camera — no hardware needed).
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
 |---|---|
-| Metadata lives in JSON sidecars + SQLite, **never** written into the TIFF | `capture/session.py` — raw files are copied, never opened for writing |
-| Histogram, auto exposure and preview all read the **same linear sensor stream** — one honest path, they can never disagree | `core/histogram.py`, `core/exposure.py`, `gui/capture_window.py` |
-| Auto exposure targets the **99.9th percentile** with 0.4 EV headroom | `capture/autoexposure.py` |
-| Working Positive preview (invert + base + curve) **cannot touch the stored raw** | preview is a display-only transform in `core/positive.py` |
-| Dark frames rescale by **shutter ratio only** (dark current precedes electronic gain); sensor pedestal is not scaled | `core/calibration.py::rescale_dark` |
-| Flat fields need **no matching exposure** — dark-subtracted, then mean-normalised | `developer/pipeline.py::_calibrate_above_black` |
-| One thread owns the camera at a time (the SDK is not thread-safe) | `gui/capture_window.py::CameraWorker`, `gui/liveview.py` |
-| Archival scans happen at **gain 1.00× only** — capture is blocked at any other sensitivity, exposure lives in the shutter | `core/exposure.py::ARCHIVE_GAIN`, `_capture_block_reason` |
-| Every scan is audited after capture (p99.9 target, optional red-rect region); the shutter for the *next* frame is corrected automatically | `capture/quality.py::audit_frame` |
-| Export **warns per frame number** when a scan has no dark measured within ±0.5 °C — dark subtraction on a cooled sensor only holds in a narrow temperature window | `capture/session.py::export_project` |
-| Display zoom is labelled in **sensor pixels** and drawn at a whole multiple of the delivered stream; ≥3× switches the sensor to a 1:1 hardware ROI (Stop → reconfigure → Start) | `core/zoom.py`, `gui/widgets.py::ZoomView` |
-| The zoom note states honestly what one stream pixel is worth (3×3 binned overview vs 1:1 ROI vs interpolation) | `gui/capture_window.py::_update_zoom_note` |
+| Camera never appears on USB | The 11–14 V supply is missing — power first, then plug USB in |
+| Live view too coarse up to 3× zoom | Intentional: the everyday stream is a 3×3-binned whole-sensor overview (honest for metering); ≥3× display zoom switches the sensor to a true 1:1 hardware ROI |
+| Export warns "scan has no dark within ±0.5 °C" | Dark subtraction on a cooled sensor only holds in a narrow temperature window — let the TEC settle (green semaphore) and re-shoot darks |
+| HEIC/JPEG look solarized in some reader | Use the shipped exports as-is — the ICC profiles are built to survive macOS ColorSync *and* lcms2 (see `tests/test_icc.py`); don't round-trip them through readers that rewrite profiles |
+| A frame renders all-white / "no film" | Density ≈ 0 everywhere usually means the holder was empty for that frame |
 
-## The camera
+## Documentation & status
 
-TS2600MP-G2 (= ATR2600M): IMX571 APS-C mono, 6224×4168 @ ~6.5 fps full
-16-bit USB3, native 16-bit ADC — no demosaic, no gamma, no auto-brightness;
-what the stream measures is what the file holds. Two-stage TEC to ΔT −42 °C.
-**Needs external 11–14 V power** — without it the camera may not enumerate on
-USB at all (the connect dialog says so). The vendor SDK
-(`capture/_touptek/`, universal dylib x86_64+arm64, vendored — see that
-directory) is driven directly over USB3.
-
-Stream design: a 3×3-binned whole-sensor overview (~2074×1389) is the honest
-everyday stream — one stream pixel is the mean of 3×3 sensor pixels, so
-metering on it is honest. Display zoom ≥3× swaps it for a 1200×1200 1:1
-hardware ROI around the point you are looking at (focusing at true pixel
-detail); below 3× the overview already shows every real detail and the swap
-is refused on principle.
-
-## Workflow
-
-**Capture:** Nový film (metadata dialog) → *Dark Frame* → *Flat Field* →
-frame-by-frame *Capture* (auto frame numbering matching the canister) →
-*Exportovat projekt*. Each film is a folder: untouched 16-bit TIFFs +
-`<raw>.tif.json` sidecars + `catalog.sqlite` + `project.json`. Scans run at
-**gain 1.00×** (the Capture button refuses any other sensitivity); *Auto
-Exposure* solves with the shutter alone while the archival-gain button is
-checked. The cooling panel shows current/target temperature with a
-traffic-light semaphore — green means "u cíle — darky platí". After every
-scan the TIFF is **audited** (whole frame, or the red AE rect — converted to
-sensor px, exact over the binned overview and over a moved ROI alike) and the
-next frame's shutter is corrected; a positive
-`frameNNN.jpg` is rendered from the TIFF beside it. The export lists any scan
-whose darks sit further than ±0.5 °C away.
-
-**Both rails are loud (2026-09):** overexposure is red everywhere (histogram
-bar + `PŘEPAL` flag + `clip: …` on the rail), underexposure is its blue mirror
-— histogram bar + `PODEXP` flag with the crushed-pixel %, a blue `černá … %`
-in the clip readout, a blue `PODEXP` on the meter line, and the post-capture
-audit's `PODEXPOZICOVÁNO` message now names how many percent of the metered
-area sit on black.
-
-**Film base / min point (third calibration, 2026-09):** *not* the flat field —
-a flat is shot **without** film and divides out vignetting/dust; the min point
-measures the held film's **clear base** (the subtraction floor of the
-emulsion, raw material for a per-film Hurter–Driffield curve: min from this,
-max from each frame). The calibration box has a third row: *Režim min point*
-switches the shift-drag rect from red (AE) to blue (base — both rects can
-coexist, the inactive one dims; the rect usually covers only a patch of clear
-edge, not the whole frame), and two ways to measure it:
-
-* **Měřit z proudu** — mean DN under the blue rect on a fresh Live View frame,
-  no new exposure; the frame's own exposure stamp plus shutter/gain/temperature
-  travel with the reading.
-* **Snímek base** — a real full-size archived capture (`kind: "base"`, sidecar
-  like a dark's) with the rect mean measured on it.
-
-Every reading lands in the project's `film_base.json` with its exposure, and
-`FilmBaseSample.scaled_above_black()` scales it onto differently exposed
-frames — signal by the shutter/gain ratio, pedestal never scaled. The rect
-collision (dragged on the 3×3-binned stream, measured on full-size frames) is
-resolved the same way as the audit's: the GUI converts stream px to sensor px
-before measurement. Nothing is applied to the preview yet; the level is
-measurement + archive only.
-
-**Two preview modes:** *RAW View* (display gamma only — judge exposure here)
-and *Working Positive* (auto base subtraction, inversion, preview exposure,
-Fritsch–Carlson spline filmic with Toe/Gamma/Shoulder — judge the picture
-here, it changes nothing on disk). The live Working Positive runs through a
-per-channel LUT (`FastPositivePreview`) so the tone curve costs one lookup
-per pixel. Mono sensor: no white balance to chase.
-
-**Developer:** `filmscan-develop frameNNN.tif --dark darks/ --flat flats/
---params look.json -o out/ --jpeg`. Pipeline: dark → flat → base subtraction
-→ inversion → exposure → filmic → 16-bit TIFF (+ `.develop.json` provenance
-with a parameter fingerprint, so any export can be re-generated
-bit-identically).
-
-## Developer GUI: jak ladit pozitiv
-
-`uv run filmscan-develop-gui` otevre hustotní archiv a vykreslí pozitiv. Ladění
-dělej v tomto pořadí:
-
-1. **Dmin** nech na `z měření film base`, pokud má projekt měření čiré
-  podložky. Dmin je černý bod pozitivu; není to nejtmavší motiv fotografie.
-2. **Dmax** nejdřív nech na `auto ze snímku (p99,9 + okraj)`. V horním
-  histogramu zkontroluj pravý konec hustot. Pokud je Dmax zbytečně daleko za
-  skutečnými daty, vypni automatiku a opatrně ho sniž. Tím se roztáhnou
-  střední a světlé tóny. Pokud je příliš nízko, světlá místa se oříznou na
-  bílou.
-3. **Kontrast středu (gamma)** dolaď pro celkový kontrast. Začni přibližně na
-  `1,35`; běžný rozsah je `1,35-1,70`. Hodnota `1,00` je neutrální, hodnoty
-  nad `2,2` jsou spíše zvláštní případy.
-4. **Patka (toe)** komprimuje stíny pozitivu. Vyšší hodnota stíny více slepí;
-  pro otevřenější stíny ji sniž.
-5. **Rameno (shoulder)** komprimuje světla pozitivu. Vyšší hodnota chrání
-  nejsvětlejší tóny před tvrdým ořezem, ale může je slít. Pro více roztažená
-  světla ho sniž.
-6. **Tolerance pod Dmin** (`shadow_band`) používej jen jako malou rezervu
-  měření, obvykle `0,00-0,03 D`. Nevrací skutečně oříznutý detail a vysoká
-  hodnota zvedne a vyšedí černou.
-7. **Display gamma** nech na `2,2`. Je to technický převod do koukatelného
-  gray prostoru, ne fotografický kontrast.
-
-Pravidlo pro rychlé rozhodnutí: **Dmin/Dmax nastavují měřítko filmu, gamma
-nastavuje kontrast a toe/shoulder tvarují konce.** Nejprve oprav rozsah dat,
-teprve potom dolaďuj vzhled. Horní bílá křivka slouží k posouzení filmové
-křivky před display transferem; dolní histogram a náhled ukazují výsledek po
-display gamma.
-
-Praktický start pro běžný snímek:
-
-```text
-Dmin: auto z film base
-Dmax: auto, případně ručně podle pravého okraje D histogramu
-toe: 0,10-0,25
-gamma: 1,25-1,60
-shoulder: 0,10-0,25
-shadow_band: 0,01-0,03 D
-gamma_display: 2,2
-```
-
-## Status
-
-- **This code:** Capture GUI + Touptek backend + test suite (283 tests)
-  complete against MockCamera; Developer CLI complete on mono TIFFs.
-- **Pending hardware verification** (`INSTRUCTIONS_TOUPTEK_CAMERA.md` §11):
-  real fps at the 0x83 binning, Snap-in-RAW-mode behaviour, ExpoAGain units,
-  enumeration under missing power, real TEC settling, the
-  `put_Roi(0,0,W,H)`-as-ROI-off assumption. Every assumption the fake SDK
-  (`tests/test_touptek.py::FakeHcam`) makes is listed there as a checklist
-  item in waiting.
-- Planned: Developer GUI (share `gui/widgets.py` + pipeline), film profiles
-  (`{name, toe, gamma, shoulder}` JSON), Linux packaging, Windows.
-
-## Requirements
-
-Python 3.12 via [uv](https://docs.astral.sh/uv/); `uv sync` installs
-everything (PySide6, numpy, OpenCV, tifffile, pydantic). The Touptek SDK
-dylib is vendored in the repo — nothing to download; the camera needs 11–14 V
-DC power and a USB3 port.
+- `Documentation_image_processing/README.md` — index of the nine design docs
+  (physical measurement model → negadoctor math → rendering layers → UI guide →
+  EXIF contract). Doc **08** is the user-side developing procedure; docs
+  **01–03** explain how the conversion works.
+- `AGENTS.md` — the invariants the code enforces and the features deliberately
+  retired (read before contributing).
+- Test suite: 598 tests green against MockCamera; real-hardware verification
+  checklist lives in `INSTRUCTIONS_TOUPTEK_CAMERA.md` §11.

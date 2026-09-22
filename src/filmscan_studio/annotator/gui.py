@@ -52,6 +52,7 @@ from filmscan_studio.annotator.store import (
     AnnotationItem,
     apply_common,
     auto_date_frames,
+    migrate_camera_split,
     build_common_patch,
     gps_fields,
     load_folder,
@@ -479,13 +480,17 @@ class MainWindow(QMainWindow):
                         "do všech snímků)")
         form = QFormLayout(box)
         self.ed_shot: dict[str, QLineEdit] = {}
-        for key, label in (("camera", "Foťák"),
-                           ("shooting_lens", "Objektiv"),
-                           ("film_iso", "ISO filmu")):
+        # Výrobce + Model místo jednoho „Foťáku" (povel 2026-09-22: „foťák
+        # neděl dle mezery — make je 'ERNST LEITZ WETZLAR GMBH', model
+        # 'Leica R4s MOD.2'"). EXIF chce Make/Model zvlášť a jednoválec
+        # nedělí ani heuristicky spolehlivě — operátor to zapíše rovnou.
+        for key, label, placeholder in (
+                ("camera_make", "Výrobce foťáku", "ERNST LEITZ WETZLAR GMBH"),
+                ("camera_model", "Model foťáku", "Leica R4s MOD.2 / FM2"),
+                ("shooting_lens", "Objektiv", "Nikkor 50/2"),
+                ("film_iso", "ISO filmu", "100")):
             edit = QLineEdit()
-            edit.setPlaceholderText(
-                "Nikon FM2" if key == "camera" else
-                "Nikkor 50/2" if key == "shooting_lens" else "100")
+            edit.setPlaceholderText(placeholder)
             self.ed_shot[key] = edit
             form.addRow(label, edit)
         self.btn_save_shot = QPushButton("Uložit záběr do všech snímků")
@@ -498,6 +503,11 @@ class MainWindow(QMainWindow):
             return
         patch = {key: edit.text().strip()
                  for key, edit in self.ed_shot.items()}
+        # volné „camera" je lidský souhrn — drž ho synchronní, ať ze sidecaru
+        # nezmizí ani po přepsání make/model na jiný foťák
+        patch["camera"] = " ".join(p for p in
+                                   (patch["camera_make"], patch["camera_model"])
+                                   if p)
         try:
             count = save_film(self.project, patch)
         except (ValueError, OSError) as exc:
@@ -621,6 +631,9 @@ class MainWindow(QMainWindow):
         # A readable Film start dates the whole roll on open (operator
         # 2026-09-22): frames that already carry a date are never touched.
         stamped, film_date = auto_date_frames(project)
+        # Legacy free-text "Foťák" gets split into make+model once (same
+        # order date, same never-overwrite rule — an operator edit wins).
+        split = migrate_camera_split(project)
         self.grid.clear()
         self._thumbs.clear()
         for row, item in enumerate(project.items):
@@ -633,6 +646,9 @@ class MainWindow(QMainWindow):
         if stamped:
             note += (f" · {stamped} datováno z Film startu {film_date} "
                      "(sekvenčně po minutách, uprav si ručně)")
+        if split:
+            note += (f" · {split}× rozdělen foťák na výrobce + model "
+                     "(zkontroluj)")
         self.statusBar().showMessage(f"Otevřeno: {project.root} — {note}")
         self._load_film_form()
         if project.items:

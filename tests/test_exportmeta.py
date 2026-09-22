@@ -1,8 +1,11 @@
 """EXIF/XMP stavit exportů (dok. 09 kontrakt).
 
 Round-tripy čestné — přes Pillow zápis/čtení, ne jen sestavený slovník:
-UserComment s češtinou, GPS rationals, ISO parsing a escape středníku se
-nesmí rozbít až v zapsaném souboru. exiftool potvrzen 2026-09-22 ručně.
+ImageDescription s češtinou (ASCII-fold), GPS rationals, ISO parsing a
+escape středníku se nesmí rozbít až v zapsaném souboru. exiftool potvrzen
+2026-09-22 ručně. Rozkaz 22:30: popis → ImageDescription (ne UserComment),
+název → XMP dc:title, Make/Model z přímých polů, Orientation SE NEPIŠE
+(vývoják zapéká rotaci do pixelů).
 """
 from __future__ import annotations
 
@@ -14,24 +17,13 @@ from filmscan_studio.core import exportmeta as em
 Image = pytest.importorskip("PIL.Image")
 
 
-def _comment(raw) -> str:
-    """UserComment at back as text — Pillow vrací raw bytes i decoded str."""
-    if isinstance(raw, str):
-        return raw
-    payload = bytes(raw)
-    if payload.startswith(b"ASCII\x00\x00\x00"):
-        return payload[8:].decode("ascii", "replace")
-    if payload.startswith(b"UNICODE\x00"):
-        return payload[8:].decode("utf-16-be", "replace")
-    return payload.decode("latin-1")
-
-
 def _record(**overrides) -> dict:
     """Typický anotovaný sidecar; overrides přepisují ploché klíče bloků."""
     record = {
         "film": {
             "film_id": "HP5_001", "film_name": "Ilford HP5 Plus",
-            "camera": "Nikon FM2", "shooting_lens": "Nikkor 50mm f/2",
+            "camera": "Nikon FM2", "camera_make": "Nikon",
+            "camera_model": "FM2", "shooting_lens": "Nikkor 50mm f/2",
             "film_iso": "400/27°", "format": "35mm",
             "development": "R 09 1:50", "pushed_stops": 1.0,
             "box_number": "BOX 7", "operator": "Operator",
@@ -76,8 +68,13 @@ class TestHelpers:
         assert em.parse_iso(None) is None
         assert em.parse_iso("bez udani") is None
 
-    def test_split_camera(self) -> None:
+    def test_split_camera_fallback_heuristic(self) -> None:
+        # vyhlášená past: velký výrobní název + model v jednom řetězci
+        assert em.split_camera(
+            "ERNST LEITZ WETZLAR GMBH Leica R4s MOD.2") \
+            == ("ERNST LEITZ WETZLAR GMBH", "Leica R4s MOD.2")
         assert em.split_camera("Nikon FM2") == ("Nikon", "FM2")
+        assert em.split_camera("OLYMPUS OM-1") == ("OLYMPUS", "OM-1")
         assert em.split_camera("Zenit") == ("", "Zenit")
         assert em.split_camera(None) == ("", "")
 
@@ -99,10 +96,16 @@ class TestHelpers:
         _, dms = em.gps_to_dms("49.999999999", "lat")
         assert (int(dms[0]), int(dms[1]), float(dms[2])) == (50, 0, 0.0)
 
+    def test_ascii_fold_keeps_dash_folds_haces(self) -> None:
+        assert em._ascii_fold("vyvolávka s ěščřžý") == "vyvolavka s escrzy"
+        # náhrada středníku (pomlčka) musí přežít, ne zmizet
+        assert em._ascii_fold("vacation 2026- kyvadlo") \
+            == "vacation 2015- kyvadlo"
 
-class TestUserComment:
+
+class TestDescription:
     def test_note_first_then_pieces(self) -> None:
-        text = em.user_comment_text(_record())
+        text = em.description_text(_record())
         pieces = text.split(" ; ")
         # komentář uživatele je VŽDY první (dok 09)
         assert pieces[0].startswith("vacation 2026")
@@ -113,7 +116,7 @@ class TestUserComment:
 
     def test_semicolon_inside_value_escaped(self) -> None:
         """Středník v hodnotě → '–', dělení podle ' ; ' zůstává jednoznačné."""
-        text = em.user_comment_text(_record())
+        text = em.description_text(_record())
         for piece in text.split(" ; "):
             assert ";" not in piece
 
@@ -122,7 +125,7 @@ class TestUserComment:
         record["annotation"]["note"] = ""
         record["film"]["development"] = None
         record["acquisition"]["conversion_gain"] = None
-        pieces = em.user_comment_text(record).split(" ; ")
+        pieces = em.description_text(record).split(" ; ")
         assert not [p for p in pieces if p.strip() == ""]
         assert not [p for p in pieces if p.endswith(": ")]
         assert not any(p.startswith("Development") for p in pieces)
@@ -144,30 +147,45 @@ class TestExifBuilder:
         exif = em.build_exif_bytes(_record())
         assert exif and exif.startswith(b"Exif\x00\x00")
         top = Image.Exif(); top.load(exif)
-        assert top[0x010E] == "Vacation 2026"          # ImageDescription ← title
-        assert top[0x010F] == "Nikon"               # Make
-        assert top[0x0110] == "FM2"                 # Model ← film.camera
+        # ImageDescription ← celý popis (komentář první), ASCII-fold
+        assert top[0x010E].startswith("vacation 2015- kyvadlo")
+        assert "Film: Ilford HP5 Plus (35mm)" in top[0x010E]
+        assert top[0x010F] == "Nikon"               # Make ← camera_make
+        assert top[0x0110] == "FM2"                 # Model ← camera_model
         assert top[0x0131] == em.SOFTWARE_AGENT     # Software
-        assert top[0x0112] == 6                     # Orientation ← rot 90° CW
+        # Orientation se nepíše — vývoják rotaci zapéká do pixelů
+        assert 0x0112 not in top
         ifd = top.get_ifd(0x8769)
+        assert 0x9286 not in ifd                    # UserComment pryč
         assert ifd[0x8827] == 400                   # ISO ← film_iso "400/27°"
         assert ifd[0xA434] == "Nikkor 50mm f/2"     # LensModel
         assert ifd[0x9003] == "2015:11:08 00:01:00" # DateTimeOriginal ← záběr
         assert ifd[0x9004] == "2026:09:20 16:53:17" # DateTimeDigitized ← rigg
         assert ifd[0x4746] == 4 and ifd[0x4747] == 80
-        # komentář má 'á' → UTF-16BE prefix, ne ASCII
-        raw = ifd[0x9286]
-        if isinstance(raw, bytes):
-            assert raw.startswith(b"UNICODE\x00")
-        assert "vacation" in _comment(raw)
 
-    def test_usercomment_utf16_for_czech(self) -> None:
+    def test_direct_make_model_beat_free_text(self) -> None:
+        """Přímá pole anotátoru mají přednost před heuristikou z `camera`."""
+        record = _record(film__camera="ERNST LEITZ WETZLAR GMBH Leica R4s MOD.2",
+                         film__camera_make="Leica", film__camera_model="R4s")
+        top = Image.Exif(); top.load(em.build_exif_bytes(record))
+        assert top[0x010F] == "Leica"
+        assert top[0x0110] == "R4s"
+
+    def test_free_text_fallback_when_no_direct_fields(self) -> None:
+        record = _record()
+        del record["film"]["camera_make"]
+        del record["film"]["camera_model"]
+        record["film"]["camera"] = "ERNST LEITZ WETZLAR GMBH Leica R4s MOD.2"
+        top = Image.Exif(); top.load(em.build_exif_bytes(record))
+        assert top[0x010F] == "ERNST LEITZ WETZLAR GMBH"
+        assert top[0x0110] == "Leica R4s MOD.2"
+
+    def test_description_ascii_folded_for_exif(self) -> None:
         record = _record()
         record["annotation"]["note"] = "Karlův most"
-        raw = Image.Exif(); raw.load(em.build_exif_bytes(record))
-        payload = raw.get_ifd(0x8769)[0x9286]
-        assert payload.startswith(b"UNICODE\x00")
-        assert "Karlův most" in payload[8:].decode("utf-16-be")
+        top = Image.Exif(); top.load(em.build_exif_bytes(record))
+        assert top[0x010E].startswith("Karluv most")
+        assert top[0x010E].isascii()
 
     def test_gps_ifd_rationals(self) -> None:
         top = Image.Exif()
@@ -186,24 +204,23 @@ class TestExifBuilder:
         gps = top.get_ifd(0x8825)
         assert gps[1] == "N" and 0 not in gps
 
-    def test_orientation_absent_without_rotation(self) -> None:
-        top = Image.Exif()
-        top.load(em.build_exif_bytes(
-            _record(annotation__rotation_degrees=0)))
-        assert 0x0112 not in top
-
 
 class TestXmp:
-    def test_tags_and_rating(self) -> None:
-        xmp = em.build_xmp_bytes(_record())
-        assert xmp and b"<li>" in xmp and "vacation".encode() in xmp \
-            and "trip".encode() in xmp
-        assert b"<xmp:Rating>4</xmp:Rating>" in xmp
-        assert xmp.startswith(b"<?xpacket begin=")
+    def test_title_and_description_and_tags(self) -> None:
+        xmp = em.build_xmp_bytes(_record()).decode("utf-8")
+        # název je Title (první kolonka Bridge), plná diakritika
+        assert '<dc:title><rdf:Alt><rdf:li xml:lang="x-default">' \
+            "Vacation 2026</rdf:li></rdf:Alt></dc:title>" in xmp
+        # popis v UTF-8 (ďábelská verze, ne ASCII-fold)
+        assert "vacation 2026" in xmp
+        assert "<dc:description>" in xmp
+        assert "<li>" in xmp and "trip" in xmp
+        assert "<xmp:Rating>4</xmp:Rating>" in xmp
+        assert xmp.startswith("<?xpacket begin=")
 
     def test_rating_none_and_zero_omitted(self) -> None:
-        assert em.build_xmp_bytes(_record(annotation__tags=[],
-                                          annotation__rating=None)) is None
+        # nic k zapsání (nula ani None do XMP nepatří, popis prázdný)
+        assert em.build_xmp_bytes({"annotation": {"rating": None}}) is None
         assert b"xmp:Rating" not in em.build_xmp_bytes(
             _record(annotation__tags=["a"], annotation__rating=0))
 
@@ -231,13 +248,15 @@ class TestRoundTripThroughFiles:
                             exif=exif, xmp=xmp)
         with Image.open(out) as im:
             top = im.getexif()
-            assert top[0x010E] == "Vacation 2026"
+            assert top[0x010E].startswith("vacation 2015-")
+            assert top[0x010F] == "Nikon"
             ifd = top.get_ifd(0x8769)
             assert ifd[0x8827] == 400
             assert ifd[0x9003] == "2015:11:08 00:01:00"
-            assert _comment(ifd[0x9286]).startswith("vacation")
             assert float(top.get_ifd(0x8825)[2][0]) == 50.0
-            assert "trip".encode() in im.info["xmp"]
+            xmp_bytes = im.info["xmp"]
+            assert "trip".encode() in xmp_bytes
+            assert "Vacation 2026".encode() in xmp_bytes
 
     def test_heic_mono_carries_all(self, both, tmp_path) -> None:
         import pillow_heif

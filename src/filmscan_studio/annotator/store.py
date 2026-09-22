@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from filmscan_studio.core.exportmeta import split_camera
 from filmscan_studio.core.models import (
     AcquisitionMetadata,
     CaptureRecord,
@@ -163,6 +164,44 @@ def auto_date_frames(project: "AnnotatedProject") -> tuple[int, str]:
     count = apply_common(todo, {"capture_datetime": date,
                                 "_sequential_time": True})
     return count, date
+
+
+def migrate_camera_split(project: "AnnotatedProject") -> int:
+    """Split the legacy free-text ``film.camera`` into make+model, once.
+
+    Operator's order 2026-09-22: „foťák neděl dle mezery… systematické
+    řešení: do anotátoru dej make a model, a tuto sadu už v jsonech rozděl."
+    A sidecar that already carries either split field is left ALONE (the
+    operator may have fixed 'ERNST LEITZ…' by hand); where both are empty
+    and free text exists, :func:`~filmscan_studio.core.exportmeta.split_camera`
+    proposes the split and it is written to every sidecar + project.json —
+    so the JSONs are migrated and the developer reads make/model directly.
+
+    Returns the number of sidecars rewritten (0 = nothing to migrate)."""
+    todo: list[AnnotationItem] = []
+    proposed: dict | None = None
+    for item in project.items:
+        film = item.record.get("film") or {}
+        camera = str(film.get("camera") or "").strip()
+        if not camera or film.get("camera_make") or film.get("camera_model"):
+            continue
+        todo.append(item)
+        if proposed is None:
+            proposed = dict(film)
+            proposed["camera_make"], proposed["camera_model"] = \
+                split_camera(camera)
+    if not todo or proposed is None:
+        return 0
+    film_dump = FilmMetadata.model_validate(
+        {**proposed, "film_id": proposed.get("film_id")
+         or project.film_id or ""}).model_dump(mode="json")
+    for item in todo:
+        payload = dict(item.record)
+        payload["film"] = film_dump
+        _write_sidecar(item, payload)
+        item.record["film"] = film_dump
+    _sync_project_json(project.root, film_dump)
+    return len(todo)
 
 
 def _parse_one_coord(text: str, is_lat: bool) -> tuple[float, str]:
@@ -510,7 +549,8 @@ ACQUISITION_FIELDS: tuple[str, ...] = (
 #: flags are NOT here — id is the folder's identity and orientation belongs
 #: to how the strip sat in the holder (developer's business).
 FILM_FIELDS: tuple[str, ...] = (
-    "film_name", "camera", "shooting_lens", "film_iso", "format",
+    "film_name", "camera", "camera_make", "camera_model",
+    "shooting_lens", "film_iso", "format",
     "film_type_class",
     "development", "development_start", "development_end", "content",
     "digitising_lens", "digitising_light", "digitising_holder",

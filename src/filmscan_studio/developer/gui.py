@@ -1104,10 +1104,12 @@ class MainWindow(QMainWindow):
     def rerender(self) -> None:
         if self._density is None or self.project is None:
             return
-        d, _prov = self._density
+        d, prov = self._density
         params = self.current_params()
-        # Náhled vidí orientaci diváka; archiv zůstává surový.
-        sub = _subsample(self.project.orientation_apply(d), PREVIEW_MAX_DIM)
+        # Náhled vidí orientaci diváka + otočení snímku z anotátoru;
+        # archiv zůstává surový.
+        sub = _subsample(self.project.rotate_frame(
+            self.project.orientation_apply(d), prov.source), PREVIEW_MAX_DIM)
         display = rnd.render_for_display(sub, params)
         # Exposure warning: co render ořízl na konce stupnice. Měří se na
         # čisté ose x před ořezem -- NaN (bez světla) do neither koše.
@@ -1220,6 +1222,18 @@ class MainWindow(QMainWindow):
         out.mkdir(exist_ok=True)
         return out
 
+    def _out_name(self, stem: str, suffixes: str) -> str:
+        """Jméno exportu: prefix filmu + stem + přípony.
+
+        Povel 2026-09-22: „do exportů přidej první část názvu identifikátoru:
+        z 'K16O04_2026-07-22' udělej název 'K16O04_frame001.mono10.heic'".
+        Prefix je první část film_id před podtržítkem; bez film_id zůstává
+        staré jméno (testy i archivy bez filmu se nemusí měnit)."""
+        assert self.project is not None
+        prefix = self.project.export_prefix
+        return f"{prefix}_{stem}.{suffixes}" if prefix else \
+            f"{stem}.{suffixes}"
+
     def _cropped_density(self) -> tuple[np.ndarray, dens.DensityProvenance] \
             | None:
         """Archiv i rendery se krájí na ROI (vize uživatele); náhled ne."""
@@ -1234,7 +1248,7 @@ class MainWindow(QMainWindow):
         d, prov = cropped
         stem = Path(prov.source).stem
         path = dens.write_density_tiff(
-            self._derived_dir() / f"{stem}.density.tif", d, prov)
+            self._derived_dir() / self._out_name(stem, "density.tif"), d, prov)
         self.statusBar().showMessage(f"Uloženo: {path}", 8000)
 
     def save_render(self) -> None:
@@ -1255,8 +1269,10 @@ class MainWindow(QMainWindow):
         if cropped is None or self.project is None:
             return None
         d, prov = cropped
-        # Uložená orientace: totéž co vidí náhled. Archiv above flipem zůstává.
-        d = self.project.orientation_apply(d)
+        # Uložená orientace + otočení snímku: totéž co vidí náhled. Archiv
+        # above flipem zůstává.
+        d = self.project.rotate_frame(self.project.orientation_apply(d),
+                                      prov.source)
         params = self.current_params()
         self.project.frame_settings[prov.source] = self._settings_payload()
         self.project.save_settings()
@@ -1298,7 +1314,7 @@ class MainWindow(QMainWindow):
         # NaN = „bez světla" -> černá (nan_fill); JPEG nezná NaN.
         data = np.rint(np.where(np.isfinite(display), display, 0.0)
                        * 255.0).astype(np.uint8)
-        out = self._derived_dir() / f"{stem}.jpg"
+        out = self._derived_dir() / self._out_name(stem, "jpg")
         profile = icc.profile_for(params.gamma_display)
         exif, xmp = self._export_metadata(stem)
         icc.write_gray_jpeg(out, data, profile, exif=exif, xmp=xmp)
@@ -1322,7 +1338,7 @@ class MainWindow(QMainWindow):
         g = np.rint(np.where(np.isfinite(display), display, 0.0)
                     * 255.0).astype(np.uint8)
         rgb = np.dstack([g, g, g])
-        out = self._derived_dir() / f"{stem}.srgb.jpg"
+        out = self._derived_dir() / self._out_name(stem, "srgb.jpg")
         profile = icc.build_srgb_profile()
         exif, xmp = self._export_metadata(stem)
         icc.write_srgb_jpeg(out, rgb, profile, exif=exif, xmp=xmp)
@@ -1350,7 +1366,7 @@ class MainWindow(QMainWindow):
         display, params, stem = got
         q16 = rnd.quantise16(display)                 # 0..65535, NaN -> černá
         rgb = np.dstack([q16, q16, q16]).astype(">u2")  # pillow_heif sám škáluje
-        out = self._derived_dir() / f"{stem}.srgb10.heic"
+        out = self._derived_dir() / self._out_name(stem, "srgb10.heic")
         profile = icc.build_srgb_profile()
         exif, xmp = self._export_metadata(stem)
         icc.write_srgb_heic(out, rgb, profile, exif=exif, xmp=xmp)
@@ -1372,7 +1388,7 @@ class MainWindow(QMainWindow):
             return
         display, params, stem = got
         q16 = rnd.quantise16(display)                 # 0..65535, NaN -> černá
-        out = self._derived_dir() / f"{stem}.mono10.heic"
+        out = self._derived_dir() / self._out_name(stem, "mono10.heic")
         profile = icc.profile_for(params.gamma_display)
         exif, xmp = self._export_metadata(stem)
         icc.write_mono_heic(out, q16, profile, exif=exif, xmp=xmp)
@@ -1386,8 +1402,10 @@ class MainWindow(QMainWindow):
         if cropped is None or self.project is None:
             return
         d, prov = cropped
-        # Uložená orientace: totéž co vidí náhled. Archiv above flipem zůstává.
-        d = self.project.orientation_apply(d)
+        # Uložená orientace + otočení snímku: totéž co vidí náhled. Archiv
+        # above flipem zůstává.
+        d = self.project.rotate_frame(self.project.orientation_apply(d),
+                                      prov.source)
         params = self.current_params()
         self.project.frame_settings[prov.source] = self._settings_payload()
         self.project.save_settings()
@@ -1399,7 +1417,7 @@ class MainWindow(QMainWindow):
         data = rnd.quantise16(full)
         stem = Path(prov.source).stem
         kind = "flat" if flat else "positive"
-        out = self._derived_dir() / f"{stem}.{kind}.tif"
+        out = self._derived_dir() / self._out_name(stem, f"{kind}.tif")
         # Kontrakt dokumentu 07: display-referred pozitiv nese ICC profil
         # Gray Gamma 2.2 (stejná TRC jako apply_display — žádná druhá gamma
         # do pixelů, profil jen říká čtečkám, jak data interpretovat). Flat
@@ -1414,7 +1432,7 @@ class MainWindow(QMainWindow):
             "encoding": encoding,
             "parameters": params.to_dict(),
             "fingerprint": params.fingerprint(),
-            "density_source": f"{stem}.density.tif",
+            "density_source": self._out_name(stem, "density.tif"),
         }
         if profile is not None:
             meta["icc_profile"] = icc.PROFILE_NAME

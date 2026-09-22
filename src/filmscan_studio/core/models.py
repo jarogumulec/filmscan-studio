@@ -143,6 +143,14 @@ class FilmMetadata(BaseModel):
     #: Body the scan was made on, typed rather than taken from EXIF: the operator
     #: records what they believe they used, and may be digitising on a spare body.
     camera: str | None = None
+    #: Camera maker / model as EXIF wants them apart (2026-09-22, operator
+    #: order: „foťák neděl dle mezery — make je 'ERNST LEITZ WETZLAR GMBH',
+    #: model 'Leica R4s MOD.2'"). Free-text one-field ``camera`` stays the
+    #: human string; these two are the split pair — filled by the annotator's
+    #: two boxes or migrated from ``camera`` by the split heuristic, and the
+    #: developer's EXIF prefers them over re-splitting the free text.
+    camera_make: str | None = None
+    camera_model: str | None = None
     #: Lens the *photographs were taken with* (e.g. "Nikkor 50/2") — added by
     #: the annotator's film panel 2026-09-21 evening at the operator's order
     #: ("dej tam i políčko objektiv"). Deliberately NOT called ``lens``: that

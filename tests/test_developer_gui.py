@@ -846,22 +846,65 @@ class TestExportMetadata:
     def test_jpeg_export_embeds_exif_and_xmp(self, window, session,
                                              tmp_path) -> None:
         Image = pytest.importorskip("PIL.Image")
-        from tests.test_exportmeta import _comment
         self._annotate(session)
         window.project = DevelopProject.open(session)
         window.project.root = tmp_path
         window.save_jpeg()
-        with Image.open(tmp_path / "derived" / "frame001.jpg") as im:
+        with Image.open(tmp_path / "derived" / "HP5_frame001.jpg") as im:
             top = im.getexif()
-            assert top[0x010E] == "Vacation 2026"
-            assert top[0x0110] == "FM2"
+            # popis (komentář první) → ImageDescription, název → dc:title
+            assert top[0x010E].startswith("uvodni komentar")
+            assert top[0x0110] == "FM2"            # fallback split z "Nikon FM2"
+            assert top[0x010F] == "Nikon"
+            # rotace se zapéká do pixelů, tag Orientation se nepíše
+            assert 0x0112 not in top
             ifd = top.get_ifd(0x8769)
             assert ifd[0x8827] == 400
             assert ifd[0x9003] == "2015:11:08 00:01:00"
-            assert _comment(ifd[0x9286]).startswith("uvodni")
+            assert 0x9286 not in ifd               # UserComment už se nepíše
             assert float(top.get_ifd(0x8825)[2][0]) == 50.0
+            assert b"<dc:title>" in im.info["xmp"]
+            assert "Vacation 2026".encode() in im.info["xmp"]
             assert "vacation".encode() in im.info["xmp"]
             assert b"<xmp:Rating>3" in im.info["xmp"]
+
+    def test_export_names_carry_film_prefix(self, window, session,
+                                            tmp_path) -> None:
+        """Rozkaz 2026-09-22: „z 'K16O04_2026-07-22' udělej název
+        'K16O04_frame001.mono10.heic'". Prefix = film_id před první
+        podtržítkem; bez film_id zůstává staré jméno."""
+        self._annotate(session)                    # FILM má film_id HP5_001
+        window.project = DevelopProject.open(session)
+        assert window.project.film_id == "HP5_001"
+        assert window.project.export_prefix == "HP5"
+        window.project.root = tmp_path
+        window.save_jpeg()
+        window.save_density()
+        assert (tmp_path / "derived" / "HP5_frame001.jpg").exists()
+        assert (tmp_path / "derived" / "HP5_frame001.density.tif").exists()
+        # bez filmu (film_id prázdné) → bez prefixu
+        window.project.film_id = ""
+        window.save_jpeg()
+        assert (tmp_path / "derived" / "frame001.jpg").exists()
+
+    def test_rotation_baked_into_pixels(self, window, session,
+                                        tmp_path) -> None:
+        """Rozkaz 2026-09-22: „orientation je ok, jen implementuj a ť exportovaný
+        soubor je takto otočen developerem" — rotation_degrees se zapéká do
+        pixelů (48×64 → 64×48), Archivní density TIFF se neotáčí."""
+        Image = pytest.importorskip("PIL.Image")
+        self._annotate(session)                    # ANNOTATION má rotaci 90
+        window.project = DevelopProject.open(session)
+        window.project.root = tmp_path
+        window.save_jpeg()
+        with Image.open(tmp_path / "derived" / "HP5_frame001.jpg") as im:
+            assert im.size == (48, 64)             # JPEG: výška×šířka prohozeně
+            assert 0x0112 not in im.getexif()      # žádný tag, jen pixely
+        window.save_density()                      # archiv zůstává neotočený
+        import tifffile
+        with tifffile.TiffFile(tmp_path / "derived"
+                               / "HP5_frame001.density.tif") as tf:
+            assert tf.pages[0].shape == (48, 64)
 
     def test_record_without_data_has_no_exif(self, window, tmp_path) -> None:
         """Prázdný record = žádné APP1/XMP — export byte shodný s minulostí."""
@@ -883,7 +926,7 @@ class TestExportMetadata:
         window.project.root = tmp_path
         window.save_heic_mono()
         heif = pillow_heif.read_heif(tmp_path / "derived"
-                                     / "frame001.mono10.heic")
+                                     / "HP5_frame001.mono10.heic")
         top = Image.Exif()
         top.load(heif.info["exif"])
         assert top[0x010F] == "Nikon"

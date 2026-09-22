@@ -18,6 +18,7 @@ from filmscan_studio.annotator.store import (
     build_common_patch,
     gps_fields,
     load_folder,
+    migrate_camera_split,
     parse_capture_datetime,
     parse_wgs84_pair,
     save_annotation,
@@ -139,6 +140,62 @@ def test_load_folder_orientation_prefers_project_json(tmp_path: Path) -> None:
     proj = load_folder(tmp_path)
     assert proj.rotated_180 is True
     assert proj.mirrored_vertical is False
+
+
+# --------------------------------------------------------- camera split migration
+
+def _camera_session(tmp_path: Path, camera: str,
+                    already_split: bool = False) -> Path:
+    """Skutečná K16O01/06 situace: volné `film.camera` napříč sidecary."""
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    film = {"schema_version": 3, "film_id": "K16_X", "camera": camera}
+    if already_split:
+        film.update(camera_make="ERNST LEITZ WETZLAR GMBH",
+                    camera_model="Leica R4s MOD.2")
+    for num in (1, 2):
+        _write_sidecar(frames, f"frame{num:03d}.tif", "scan", film=film)
+    return frames
+
+
+def test_migrate_camera_split_leica_once(tmp_path: Path) -> None:
+    """Povel 2026-09-22: „tuto sadu už v jsonech rozděl dle návrhu" —
+    'ERNST LEITZ WETZLAR GMBH Leica R4s MOD.2' musi splitnout na entire
+    uppercase run + zbytek, zapsat do každého sidecaru."""
+    frames = _camera_session(tmp_path,
+                             "ERNST LEITZ WETZLAR GMBH Leica R4s MOD.2")
+    proj = load_folder(tmp_path)
+    assert migrate_camera_split(proj) == 2
+    for num in (1, 2):
+        film = json.loads((frames / f"frame{num:03d}.tif.json")
+                          .read_text(encoding="utf-8"))["film"]
+        assert film["camera_make"] == "ERNST LEITZ WETZLAR GMBH"
+        assert film["camera_model"] == "Leica R4s MOD.2"
+        assert film["camera"] == "ERNST LEITZ WETZLAR GMBH Leica R4s MOD.2"
+    # druhý průchod už nic nepřepíše (idempotentní — operátor mohl ručně fixnout)
+    assert migrate_camera_split(load_folder(tmp_path)) == 0
+
+
+def test_migrate_camera_split_never_touches_manual_fix(tmp_path: Path) -> None:
+    """Sidecar s make/model už rozděleným (ručně) se NESMÍ přepsat heuristikou."""
+    frames = _camera_session(tmp_path, "Zenit E", already_split=True)
+    proj = load_folder(tmp_path)
+    assert migrate_camera_split(proj) == 0
+    film = json.loads((frames / "frame001.tif.json")
+                      .read_text(encoding="utf-8"))["film"]
+    assert film["camera_model"] == "Leica R4s MOD.2"   # ruční zápis přežil
+
+
+def test_migrate_camera_split_syncs_project_json(tmp_path: Path) -> None:
+    frames = _camera_session(tmp_path, "Nikon FM2")
+    (tmp_path / "project.json").write_text(json.dumps(
+        {"film": {"film_id": "K16_X", "camera": "Nikon FM2"}}),
+        encoding="utf-8")
+    proj = load_folder(tmp_path)
+    assert migrate_camera_split(proj) == 2
+    film = json.loads((tmp_path / "project.json")
+                      .read_text(encoding="utf-8"))["film"]
+    assert (film["camera_make"], film["camera_model"]) == ("Nikon", "FM2")
 
 
 # ------------------------------------------------------------ merge-save safety
@@ -525,14 +582,21 @@ def test_gui_bulk_and_panels_offscreen(tmp_path, qtbot, monkeypatch) -> None:
     acq = json.loads((frames / "frame001.tif.json").read_text())["acquisition"]
     assert acq["camera_serial"] == "SN-42"
 
-    # shot box (2026-09-22: camera/lens/ISO pulled out of the film block):
-    # edit once -> every sidecar, through the same save_film path.
-    assert "camera" not in win.ed_film and "camera" in win.ed_shot
+    # shot box (2026-09-22: camera/lens/ISO pulled out of the film block;
+    # výrok 22:30: make+model místo volného „camera"): edit once -> every
+    # sidecar, through the same save_film path.
+    assert "camera" not in win.ed_film and "camera" not in win.ed_shot
+    assert "camera_make" in win.ed_shot and "camera_model" in win.ed_shot
+    win.ed_shot["camera_make"].setText("Nikon")
+    win.ed_shot["camera_model"].setText("FM2")
     win.ed_shot["shooting_lens"].setText("Nikkor 50/2")
     win.ed_shot["film_iso"].setText("100")
     win._save_shot()
     for num in (1, 2):
         film = json.loads((frames / f"frame{num:03d}.tif.json").read_text())["film"]
+        assert film["camera_make"] == "Nikon"
+        assert film["camera_model"] == "FM2"
+        assert film["camera"] == "Nikon FM2"   # lidsky souhrn stays in sync
         assert film["shooting_lens"] == "Nikkor 50/2"
         assert film["film_iso"] == "100"
 

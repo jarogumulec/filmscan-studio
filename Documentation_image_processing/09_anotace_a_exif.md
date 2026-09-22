@@ -1,13 +1,17 @@
 # 09 — Anotace snímků a EXIF kontrakt (filmscan-annotate)
 
-Stav: **DODÁNO 2026-09-21, EXIF export DODĚLÁN 2026-09-22** — anotátor běží
+Stav: **DODÁNO 2026-09-21, EXIF export DODĚLÁN 2026-09-22, přepracován
+týž den dle provozních připomínek** — anotátor běží
 (`filmscan-annotate`), zápis do sidecarů additivní, otestováno na reálném
 projektu K16O04 (41 snímků, diff proti originálu: změněny jen bloky
 `annotation` / `acquisition` / `film`, ostatní soubory byte shodné).
 Developer při exportu JPEG/HEIC vkládá EXIF+XMP (`core/exportmeta.py`,
 rozkaz uživatele 2026-09-22: „aby filmscan-develop-gui ta metadata vložil do
-exifu… chci tam ta data všechna mít") — kontrakt dole je implementovaný,
-včetně odpovědí na otevřené otázky na jeho konci.
+exifu… chci tam ta data všechna mít"). Druhý rozkaz tentýž den
+(„do ImageDescription dej to, cos dal do usercomment; název patří do Title;
+foťák neděl dle mezery — do anotátoru dej make a model; orientation je ok,
+jen implementuj a ť exportovaný soubor je takto otočen developerem") je
+promítnutý níže — konečné přiřazení tagů je tabulka „Finální kontrakt".
 
 ## Proč mezi studiem a developerem
 
@@ -31,7 +35,7 @@ staré projekty mají `annotation = None`.
 | pole | význam |
 |---|---|
 | `title` | název snímku |
-| `note` | popis / komentář (do EXIFu jde jako JPEG comment, viz kontrakt) |
+| `note` | popis / komentář (first kus popisu v EXIF `ImageDescription` + XMP `dc:description`, viz kontrakt) |
 | `tags[]` | štítky |
 | `rating` | 0–5, `None` = nehodnoceno |
 | `capture_datetime` | **EXIF přísně `YYYY:MM:DD HH:MM:SS`** — důvod, kvůli kterému to celé je |
@@ -64,12 +68,15 @@ se nedostane.
 Pořadí panelů (povel 2026-09-22): **Snímek → Záběr (EXIF) → Digitalizace →
 Film.**
 
-- **Záběr** (`camera`, `shooting_lens`, `film_iso` z filmového bloku) sedí
-  nad akvizicí, protože k datu a geu snímku myslně patří: foťák co exponoval
-  film („Nikon FM2" — vkládá se RUČNĚ, není to digitalizační kamera),
-  objektiv a ISO filmu (nové textové pole `film_iso`, např. „100"). Ukládá se
-  přes `save_film` do všech sidecarů. Popisky UI jsou česky, **data do EXIFu
-  a metadata zůstávají anglická/machine-neutral** (rozhodnutí uživatele).
+- **Záběr** (`camera_make` + `camera_model`, `shooting_lens`, `film_iso` z
+  filmového bloku) sedí nad akvizicí, protože k datu a geu snímku myslně
+  patří: foťák co exponoval film — od rozkazu 2026-09-22 **dvě pole Výrobce
+  / Model** („ERNST LEITZ WETZLAR GMBH" | „Leica R4s MOD.2"; vkládá se
+  RUČNĚ, není to digitalizační kamera), objektiv a ISO filmu (textové pole
+  `film_iso`, např. „100"). Ukládá se přes `save_film` do všech sidecarů;
+  volné `camera` se synchronizuje na souhrn „make model". Popisky UI jsou
+  česky, **data do EXIFu a metadata zůstávají anglická/machine-neutral**
+  (rozhodnutí uživatele).
 - **Digitalizace** (`ACQUISITION_FIELDS`: camera, camera_serial, exposure_time,
   gain, capture_date, copy_number) se v anotátoru předvyplní z sidecaru a jde
   **editovat i hromadně kopírovat**. „Čas pořízení (ISO)" byl přejmenován na
@@ -145,6 +152,38 @@ Pravidla:
 Otevřená otázka pro implementaci: jestli vyvést i `rating` do XMP
 (`xmp:Rating`) kromě EXIF `Rating` — některé prohlížeče čtou jen jedno.
 
+### Finální kontrakt (po rozkazu 2026-09-22 odpoledne — TOHLE platí)
+
+Návrh výše byl první řeka; provoz ukázal tři opravy, implementace je
+následující. Odchylky od tabulky výše:
+
+| místo | zdroj | pozn. |
+|---|---|---|
+| EXIF `ImageDescription` | **celý popis** (komentář + „ ; " kusy) | ne titulek; ASCII-fold (viz níže) |
+| XMP `dc:title` | `annotation.title` | „Title" — první kolonka v Bridge |
+| XMP `dc:description` | celý popis, plné UTF-8 | diakritika bez ztráty |
+| EXIF `Make` / `Model` | `film.camera_make` / `film.camera_model` | přímá pole; fallback heuristika `split_camera` z volného `film.camera` |
+| EXIF `Orientation` | **NEZAPISUJE SE** | rotace se zapéká do pixelů |
+| (bývalý UserComment) | **vyřazen** | čtečky ho stejně nečetly |
+
+- **Rotace**: `annotation.rotation_degrees` + filmové příznaky
+  (`mirrored_*`, `rotated_180`) aplikuje developer do pixelů před exportem
+  (`project.orientation_apply` + `project.rotate_frame`, np.rot90). EXIF
+  Orientation tag by se s otočenými pixely u čtečky sečetl a otočil
+  podruhé — proto se nepíše. Archivní density TIFF zůstává neotočené.
+- **Make/Model systematicky**: anotátor má v Záběru dvě pole (Výrobce /
+  Model), `save_film` píše `camera_make`+`camera_model` a drží volné
+  `camera` jako lidský souhrn („Nikon FM2"). Staré JSONy s jen volným
+  textem migrace `migrate_camera_split` (volá se při otevření složky)
+  rozdělí jednou přes `split_camera` — úvodní run ≥2 all-caps tokenů je
+  Make („ERNST LEITZ WETZLAR GMBH" | „Leica R4s MOD.2"), jinak první
+  token/zbytek („Nikon" | „FM2"). Sidecar s už rozdělenými poli se
+  nikdy nepřepíše (operátor mohl fixnout ručně). Developer čte přímá
+  pole, heuristika je jen fallback pro data bez nich.
+- **Diakritika v EXIF**: ASCII tagy Pillow sráží na „?" (změřeno) —
+  do EXIFu jde `_ascii_fold` (NFKD + zahodit diakritiku, „–" → „-"),
+  plné UTF-8 žije v XMP `dc:description`/`dc:title`.
+
 ### Jak je to implementováno (2026-09-22, `core/exportmeta.py`)
 
 - `build_exif_bytes(record)` / `build_xmp_bytes(record)` berou celý sidecar
@@ -160,12 +199,12 @@ Otevřená otázka pro implementaci: jestli vyvést i `rating` do XMP
   → nic — číslo nalepené na písmeno není ISO).
 - GPS: DMS rationals s vteřinami na desetinu (0,1" ≈ 3 m), ref z
   `gps_*_ref`, jinak suffix, jinak znaménko; carry 59,9″→60″→60′→1° ošetřen.
-- `Software: Filmscan Studio` a EXIF `Orientation` (rotace 90/180/270 ° →
-  6/3/8) přibily nad rámec tabulky: Software říká odkud data jsou, Orientation
-  hlásí, že `annotation.rotation_degrees` je v exportu už aplikovaná.
-- UserComment kóduje se RAW: ASCII prefix pro pure-ASCII, jinak
-  `UNICODE\0` + UTF-16BE (Pillow `str` by selhal na `abs(tuple)`; ověřeno
-  exiftool, čeština čitelná).
+- `Software: Filmscan Studio` přibyl nad rámec tabulky: říká odkud data
+  jsou. Orientation se na rozdíl od prvního návrhu **nepíše** — viz
+  „Finální kontrakt“.
+- UserComment (dřív `UNICODE\0` + UTF-16BE) byl prvním návrhem; po rozkazu
+  „do ImageDescription dej to, cos dal do usercomment" je nahrazen
+  ImageDescription s ASCII-fold popisem a XMP dc:description.
 - Chyba při stavbě EXIF **nikdy nezahodí export** — `except` v
   `_export_metadata` logne a exportuje bez metadat. Prázdný record →
   `None` → bajtově shodný export jako dřív.

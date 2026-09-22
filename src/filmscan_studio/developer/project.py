@@ -108,6 +108,18 @@ class DevelopProject:
     mirrored_horizontal: bool = False
     mirrored_vertical: bool = False
     rotated_180: bool = False
+    #: ``film.film_id`` of the opened roll ("K16O04_2026-07-22"); empty for
+    #: sessions that carry none. Exports are named by :attr:`export_prefix`.
+    film_id: str = ""
+
+    @property
+    def export_prefix(self) -> str:
+        """Roll identifier for export names (order 2026-09-22: „z
+        'K16O04_2026-07-22' udělej název 'K16O04_frame001.mono10.heic'").
+        The part of ``film_id`` before the first underscore — the date tail
+        would only bloat the name; the folder already carries it. Empty
+        film_id → no prefix, old naming stays."""
+        return self.film_id.split("_", 1)[0].strip()
 
     # ------------------------------------------------------------------ open
 
@@ -155,37 +167,21 @@ class DevelopProject:
                                               rect=rect))
         proj._load_base_sample(root)
         proj._build_calibration()
-        proj._load_orientation(root)
+        film = _film_block(root, proj.frames)
+        proj._load_orientation(film)
+        proj.film_id = str(film.get("film_id") or "")
         proj.load_settings()
         return proj
 
-    def _load_orientation(self, root: Path) -> None:
-        """Film orientation flags from the capture app's ``project.json``.
+    def _load_orientation(self, film: dict) -> None:
+        """Film orientation flags from the capture app's ``film`` block.
 
         The capture UI records how the strip sits in the holder
         (``mirrored_horizontal`` / ``mirrored_vertical`` / ``rotated_180``);
         the developer shows the *viewer* orientation, so these drive flips in
         preview and exports only — never the density archive, which stays in
         raw sensor orientation.
-
-        Older sessions predate ``project.json`` on disk (the capture app wrote
-        it only to the catalog) — the same ``film`` block travels in every
-        frame sidecar, so fall back to the first sidecar that carries it.
-        Without the fallback the flag was silently ignored and the picture
-        never flipped (K16_O02, 2026-09-21).
         """
-        film: dict = {}
-        try:
-            data = json.loads((root / "project.json").read_text(
-                encoding="utf-8"))
-            film = data.get("film") or {}
-        except (OSError, json.JSONDecodeError):
-            pass            # no capture project.json: try the sidecars
-        if not film:
-            for entry in self.frames:
-                film = entry.record.get("film") or {}
-                if film:
-                    break
         self.mirrored_horizontal = bool(film.get("mirrored_horizontal"))
         self.mirrored_vertical = bool(film.get("mirrored_vertical"))
         self.rotated_180 = bool(film.get("rotated_180"))
@@ -208,6 +204,29 @@ class DevelopProject:
             mirrored_vertical=self.mirrored_vertical,
             rotated_180=self.rotated_180,
         )
+
+    def frame_rotation(self, name: str) -> int:
+        """Per-frame viewer rotation (annotator "otáčet 90°"), CW degrees.
+
+        The film flags are whole-strip; this rides in the frame's own
+        ``annotation`` block. The developer bakes it into renders and exports
+        (operator order 2026-09-22: „implementuj ať exportovaný soubor je
+        takto otočen developerem") — the density archive stays raw, and the
+        rotation is applied AFTER ``orientation_apply`` and AFTER the rect
+        crop so the drawn rect keeps addressing sensor pixels.
+        """
+        try:
+            entry = self.entry(name)
+        except KeyError:
+            return 0
+        ann = entry.record.get("annotation") or {}
+        return int(ann.get("rotation_degrees") or 0) % 360
+
+    def rotate_frame(self, image: np.ndarray, name: str) -> np.ndarray:
+        """Apply :meth:`frame_rotation` to a pixel/map array (rot90 otáčí
+    counter-clockwise, proto záporné k)."""
+        rot = self.frame_rotation(name)
+        return np.rot90(image, -(rot // 90)) if rot % 360 else image
 
     def rect_apply(self, rect: tuple[int, int, int, int] | None,
                    frame_wh: tuple[int, int]) -> tuple[int, int, int, int] | None:
@@ -467,6 +486,29 @@ class DevelopProject:
         the GUI default until roll-wide data exists)."""
         d, _ = self.build_density(name)
         return dens.estimate_dmax(d)
+
+
+def _film_block(root: Path, frames: "list[FrameEntry]") -> dict:
+    """The roll's ``film`` block: ``project.json`` first, sidecars fallback.
+
+    Older sessions predate ``project.json`` on disk (the capture app wrote
+    it only to the catalog) — the same ``film`` block travels in every
+    frame sidecar, so fall back to the first sidecar that carries it.
+    Without the fallback the orientation flag was silently ignored and the
+    picture never flipped (K16_O02, 2026-09-21).
+    """
+    try:
+        data = json.loads((root / "project.json").read_text(encoding="utf-8"))
+        film = data.get("film") or {}
+        if film:
+            return film
+    except (OSError, json.JSONDecodeError):
+        pass                        # no capture project.json: try sidecars
+    for entry in frames:
+        film = entry.record.get("film") or {}
+        if film:
+            return film
+    return {}
 
 
 def _kind_from_name(filename: str) -> str:
