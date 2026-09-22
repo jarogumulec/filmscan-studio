@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
 )
 
 from filmscan_studio.core import density as dens
+from filmscan_studio.core import exportmeta
 from filmscan_studio.core import icc
 from filmscan_studio.core import render as rnd
 from filmscan_studio.core.filmic import FilmicProfile
@@ -1262,6 +1263,27 @@ class MainWindow(QMainWindow):
         display = rnd.render_for_display(d, params)
         return display, params, Path(prov.source).stem
 
+    def _export_metadata(self, stem: str) -> tuple[bytes | None,
+                                                   bytes | None]:
+        """EXIF + XMP byty ze sidecaru snímku (kontrakt dok. 09).
+
+        `stem` je ze `_display_render()` — FrameEntry se jmenuje i s příponou,
+        proto shoda podle `Path(name).stem`. Žádný record → (None, None) a
+        export proběhne beze změny; vlastní chyba nikdy nezahodí export —
+        metadata jsou bonus, ne podmínka."""
+        if self.project is None:
+            return None, None
+        entry = next((f for f in self.project.frames
+                      if Path(f.name).stem == stem), None)
+        if entry is None:
+            return None, None
+        try:
+            return (exportmeta.build_exif_bytes(entry.record),
+                    exportmeta.build_xmp_bytes(entry.record))
+        except Exception:                       # nepolevit z exportu kvůli EXIFu
+            log.exception("EXIF metadata selhala, exportuji bez nich")
+            return None, None
+
     def save_jpeg(self) -> None:
         """8b gray JPEG = totéž co náhled (vč. gammy 2,2) + ICC profil.
 
@@ -1278,10 +1300,12 @@ class MainWindow(QMainWindow):
                        * 255.0).astype(np.uint8)
         out = self._derived_dir() / f"{stem}.jpg"
         profile = icc.profile_for(params.gamma_display)
-        icc.write_gray_jpeg(out, data, profile)
+        exif, xmp = self._export_metadata(stem)
+        icc.write_gray_jpeg(out, data, profile, exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
-            f" · {icc.PROFILE_NAME}")
+            f" · {icc.PROFILE_NAME}"
+            + (" · EXIF+XMP vloženo" if exif or xmp else " · bez anotací"))
 
     def save_jpeg_srgb(self) -> None:
         """8b RGB JPEG — gray pixely jako R=G=B, kompatibilní sRGB profil.
@@ -1300,10 +1324,12 @@ class MainWindow(QMainWindow):
         rgb = np.dstack([g, g, g])
         out = self._derived_dir() / f"{stem}.srgb.jpg"
         profile = icc.build_srgb_profile()
-        icc.write_srgb_jpeg(out, rgb, profile)
+        exif, xmp = self._export_metadata(stem)
+        icc.write_srgb_jpeg(out, rgb, profile, exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
-            f" · {icc.SRGB_PROFILE_NAME}")
+            f" · {icc.SRGB_PROFILE_NAME}"
+            + (" · EXIF+XMP vloženo" if exif or xmp else " · bez anotací"))
 
     def save_heic(self) -> None:
         """10b RGB HEIC — hlubší bitová hloubka, Apple/ProApps kompatibilní.
@@ -1326,10 +1352,12 @@ class MainWindow(QMainWindow):
         rgb = np.dstack([q16, q16, q16]).astype(">u2")  # pillow_heif sám škáluje
         out = self._derived_dir() / f"{stem}.srgb10.heic"
         profile = icc.build_srgb_profile()
-        icc.write_srgb_heic(out, rgb, profile)
+        exif, xmp = self._export_metadata(stem)
+        icc.write_srgb_heic(out, rgb, profile, exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
-            f" · {icc.SRGB_PROFILE_NAME} 10b")
+            f" · {icc.SRGB_PROFILE_NAME} 10b"
+            + (" · EXIF+XMP vloženo" if exif or xmp else " · bez anotací"))
 
     def save_heic_mono(self) -> None:
         """10b monochromatické HEIF — skutečný single-channel, ne R=G=B.
@@ -1346,10 +1374,12 @@ class MainWindow(QMainWindow):
         q16 = rnd.quantise16(display)                 # 0..65535, NaN -> černá
         out = self._derived_dir() / f"{stem}.mono10.heic"
         profile = icc.profile_for(params.gamma_display)
-        icc.write_mono_heic(out, q16, profile)
+        exif, xmp = self._export_metadata(stem)
+        icc.write_mono_heic(out, q16, profile, exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
-            f" · {icc.PROFILE_NAME} 10b")
+            f" · {icc.PROFILE_NAME} 10b"
+            + (" · EXIF+XMP vloženo" if exif or xmp else " · bez anotací"))
 
     def _export_render(self, flat: bool) -> None:
         cropped = self._cropped_density()

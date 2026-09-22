@@ -1500,8 +1500,15 @@ class CaptureWindow(QMainWindow):
         sensor = self._sensor_size()
         lv_size = (sensor.width, sensor.height)
         settings = result.settings
-        # Snapshot for the JPEG: the same look the live preview is showing.
-        params = self.positive
+        # Snapshot for the JPEG: the live look — but the archived preview is
+        # ALWAYS positive. self.positive.invert follows the RAW View | Negativ
+        # toggle, so capturing while in RAW View used to write a negative JPG
+        # next to the frame (operator finding 2026-09-22: „všechny jpgy
+        # zůstaly náhledy negativní — měly být už při uložení invertovány“).
+        # The film's type, not the live-mode switch, decides inversion.
+        params = replace(
+            self.positive,
+            invert=self.session.film.film_type_class.is_negative)
         jpg = result.path.with_suffix(".jpg")
 
         def job():

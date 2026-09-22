@@ -26,11 +26,13 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from filmscan_studio.core.models import (
+    AcquisitionMetadata,
     CaptureRecord,
+    FilmMetadata,
     FrameAnnotation,
     FrameKind,
 )
@@ -64,23 +66,103 @@ def parse_capture_datetime(value: str) -> str:
     place in a timeline, which free text never would. Returns "" for empty
     input (annotation deliberately unset); raises ValueError on garbage.
     """
+    return _parse_datetime(value)[0]
+
+
+def _parse_datetime(value: str) -> tuple[str, bool]:
+    """(EXIF string, did the input carry a real time?)
+
+    The time flag drives the sequential-minute numbering in
+    :func:`apply_common`: a bare day (``1.1.2026``) means "I do not know the
+    time", and frames then get minute offsets so they keep a sortable order;
+    an explicit time (``14:30``) means "this exact time" and stays.
+    """
     text = value.strip()
     if not text:
-        return ""
+        return "", True
     if _YEAR_ONLY.match(text):
-        return f"{text}:01:01 00:00:00"
+        return f"{text}:01:01 00:00:00", False
     for fmt in DATE_FORMATS:
         try:
             dt = datetime.strptime(text, fmt)
         except ValueError:
             continue
-        if fmt in _DATE_ONLY_FORMATS:
-            dt = dt.replace(hour=0, minute=0, second=0)
-        return dt.strftime("%Y:%m:%d %H:%M:%S")
+        has_time = fmt not in _DATE_ONLY_FORMATS
+        return dt.strftime("%Y:%m:%d %H:%M:%S"), has_time
     raise ValueError(
         f"Nerozumím datu '{text}' — zkuste např. 12.8.1968, 1968-08-12 14:30 "
         f"nebo jen rok 1968"
     )
+
+
+#: A real calendar date (day required) at the START of the Film-start free
+#: text, optionally followed by a note: "8.11.2015 Vacation 2026" qualifies,
+#: "cca 2/2017" or "?2025" does not — an approximate date written as one
+#: must stay approximate (operator's rule 2026-09-22).
+_FILM_START_DATE = re.compile(
+    r"^\s*(\d{4}-\d{1,2}-\d{1,2}"
+    r"|\d{1,2}\.\s*\d{1,2}\.\s*\d{2,4})(?=[^\d]|$)"
+)
+
+
+def parse_film_start_date(text: str) -> str:
+    """Film-start free text -> EXIF ``YYYY:MM:DD 00:00:00``, or "".
+
+    The film block keeps free text on purpose ('asi 12/25' must survive), so
+    a date is only mined out when one is *readable*: a day-carrying date at
+    the beginning of the string, with or without a trailing note. Anything
+    vaguer (a bare year, "cca 2015", "?2025") returns "" and the annotator
+    leaves the frames' dates alone — the operator fills those by hand.
+    """
+    m = _FILM_START_DATE.match(text or "")
+    if not m:
+        return ""
+    raw = m.group(1).replace(" ", "")
+    fmts = ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y")
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+        if dt.year < 100:            # two-digit year, as darkroom logs write
+            dt = dt.replace(year=2000 + dt.year)
+        return dt.strftime("%Y:%m:%d 00:00:00")
+    return ""
+
+
+def auto_date_frames(project: "AnnotatedProject") -> tuple[int, str]:
+    """Stamp frames that have no date yet from a readable Film start.
+
+    Operator's rule 2026-09-22: „když film start je čitelné datum, aplikuj
+    na všechny fotky jako datum záběru, já si kdyžtak upravím ručně. pokud
+    tam je něco jako 'cca 2015' tak to nejde.“ Only frames whose annotation
+    carries no ``capture_datetime`` are touched — a date the operator already
+    set (or an earlier auto-run they edited) is never overwritten. The
+    sequential-minute numbering of :func:`apply_common` gives the roll a
+    sortable order; the counter starts at the first auto-stamped frame.
+
+    Returns (frames stamped, the EXIF date used) — (0, "") when the film
+    start holds no readable date.
+    """
+    film = {}
+    for item in project.items:
+        film = item.record.get("film") or {}
+        if film:
+            break
+    if not film:
+        film = _film_from_project_json(project.root)
+    date = parse_film_start_date(str(film.get("development_start") or ""))
+    if not date:
+        return 0, ""
+    todo = [i for i in project.items
+            if not (i.annotation or {}).get("capture_datetime")]
+    if not todo:
+        return 0, date
+    # The flag is what makes apply_common number the roll a minute apart —
+    # the identical-midnight stamp is exactly what photo managers shuffle.
+    count = apply_common(todo, {"capture_datetime": date,
+                                "_sequential_time": True})
+    return count, date
 
 
 def _parse_one_coord(text: str, is_lat: bool) -> tuple[float, str]:
@@ -327,16 +409,12 @@ def save_annotation(item: AnnotationItem, annotation: dict) -> None:
     if not item.record:
         payload.setdefault("kind", FrameKind.SCAN.value)
         payload.setdefault("filename", item.image_path.name)
-    tmp = item.sidecar_path.with_name(item.sidecar_path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
-                   encoding="utf-8")
-    tmp.replace(item.sidecar_path)
-    item.record = payload
+    _write_sidecar(item, payload)
 
 
-#: Fields the bulk action may touch. Title and note deliberately absent:
-#: "same date+place for the whole roll" is the use case, "same title for
-#: every frame" is not a thing anyone wants overwritten.
+#: Fields the bulk action carries by default: the per-roll facts. Title and
+#: note travel only when the operator explicitly checks them (per-frame
+#: labels exist and an accidental bulk overwrite would erase them silently).
 COMMON_FIELDS: tuple[str, ...] = (
     "capture_datetime",
     "gps_input", "gps_lat", "gps_lon",
@@ -344,26 +422,40 @@ COMMON_FIELDS: tuple[str, ...] = (
     "gps_lat_exif_dms", "gps_lon_exif_dms",
     "tags", "rating",
 )
+#: Bulk-transferable only by explicit opt-in.
+OPT_IN_FIELDS: tuple[str, ...] = ("title", "note")
 
 
-def build_common_patch(form: dict) -> dict:
-    """Non-empty common fields from form values -> patch dict.
+def build_common_patch(form: dict, transfer: dict | None = None) -> dict:
+    """Form values -> patch of what the bulk action may write.
 
-    The bulk action overwrites exactly what the operator filled in; empty
-    fields are skipped so "apply date" never erases a frame's GPS. The GPS
-    group travels as a unit: with any GPS text on the form, all gps_* keys
-    (including the cleared ones) move together — half-parsed location data
-    is worse than none.
+    Empty fields are skipped so "apply date" never erases a frame's GPS.
+    The GPS group travels as a unit: with GPS text on the form, all gps_*
+    keys (including cleared ones) move together — half-parsed location data
+    is worse than none. ``transfer`` opts title/note in (GUI checkboxes);
+    without it they are never part of the patch.
+
+    A date input without a time (``1.1.2026``, bare year) also marks the
+    patch ``_sequential_time``: :func:`apply_common` will number the frames
+    a minute apart instead of stamping them all to the same instant.
     """
+    transfer = transfer or {}
     patch: dict = {}
-    for key in COMMON_FIELDS:
+    for key in (*COMMON_FIELDS, *OPT_IN_FIELDS):
         if key.startswith("gps_"):
+            continue
+        if key in OPT_IN_FIELDS and not transfer.get(key):
             continue
         value = form.get(key)
         if value not in (None, "", []):
             patch[key] = value
     if (form.get("gps_input") or "").strip():
         patch.update(gps_fields(form["gps_input"]))
+    if "capture_datetime" in patch:
+        raw, has_time = _parse_datetime(form["capture_datetime"])
+        patch["capture_datetime"] = raw
+        if not has_time:
+            patch["_sequential_time"] = True
     return patch
 
 
@@ -373,12 +465,29 @@ def apply_common(items: list[AnnotationItem], patch: dict) -> int:
     Existing annotation keys not covered by the patch are kept — this is an
     update, not a replacement. An item without an annotation gets a fresh
     block built from the patch alone.
+
+    **Sequential time.** When the patch came from a time-less date input
+    (``_sequential_time``), frame *i* of *this call* gets base + (i+1)
+    minutes: every frame a unique, sortable timestamp, in film order
+    (00:01, 00:02 …) rather than the identical 00:00 that made photo
+    managers shuffle the roll. A date applied with an explicit time starts
+    the numbering *at* that time. The counter lives inside one call, so
+    applying a second date to a later stretch of the roll resets it —
+    exactly what the operator ordered for a film carrying two dates.
     """
     if not patch:
         return 0
+    patch = dict(patch)
+    sequential = patch.pop("_sequential_time", False)
+    base: datetime | None = None
+    if sequential and patch.get("capture_datetime"):
+        base = datetime.strptime(patch["capture_datetime"], "%Y:%m:%d %H:%M:%S")
     count = 0
-    for item in items:
+    for i, item in enumerate(items):
         merged = {**(item.annotation or {}), **patch}
+        if base is not None:
+            merged["capture_datetime"] = (
+                base + timedelta(minutes=i + 1)).strftime("%Y:%m:%d %H:%M:%S")
         # Validate through the model: a rating "7" or an unparsable date must
         # fail here, not after half the roll was written to.
         annotation = FrameAnnotation.model_validate(merged).model_dump(
@@ -386,3 +495,140 @@ def apply_common(items: list[AnnotationItem], patch: dict) -> int:
         save_annotation(item, annotation)
         count += 1
     return count
+
+
+#: Operator-editable acquisition fields shown in the annotator (2026-09-21
+#: evening: "ukaž mi tam i kolonky co vyčteš foťák… ať je editovatelné").
+#: Only descriptive facts a human can correct — never black/white levels or
+#: the averaging internals, which belong to the capture layer.
+ACQUISITION_FIELDS: tuple[str, ...] = (
+    "camera", "camera_serial", "exposure_time", "gain", "capture_date",
+    "copy_number",
+)
+
+#: Film-level fields the annotator exposes; ``film_id`` and the orientation
+#: flags are NOT here — id is the folder's identity and orientation belongs
+#: to how the strip sat in the holder (developer's business).
+FILM_FIELDS: tuple[str, ...] = (
+    "film_name", "camera", "shooting_lens", "film_iso", "format",
+    "film_type_class",
+    "development", "development_start", "development_end", "content",
+    "digitising_lens", "digitising_light", "digitising_holder",
+    "digitisation_date", "operator", "box_number", "expiry",
+    "pushed_stops", "notes",
+)
+
+#: Fields whose model type is not ``str``. An empty text box on a *required*
+#: numeric (pushed_stops, copy_number) means "leave the stored value alone"
+#: (None would fail validation); on an *optional* numeric (exposure_time,
+#: gain) empty means "unset" -> None. Garbage digits are always an error,
+#: never a silent 0.
+_NUMERIC_KEEP_ON_EMPTY = {"pushed_stops": float, "copy_number": int}
+_NUMERIC_NULL_ON_EMPTY = {"exposure_time": float, "gain": float}
+
+
+def _typed_patch_value(key: str, text: str) -> object:
+    """Text-box string -> typed value (``None`` = unset; ``_KEEP`` = leave
+    the stored value); raises ValueError on garbage numerics."""
+    text = text.strip()
+    for table in (_NUMERIC_KEEP_ON_EMPTY, _NUMERIC_NULL_ON_EMPTY):
+        numeric = table.get(key)
+        if numeric is not None:
+            if not text:
+                return _KEEP if table is _NUMERIC_KEEP_ON_EMPTY else None
+            try:
+                return numeric(text.replace(",", "."))
+            except ValueError as exc:
+                raise ValueError(f"{key}: nerozumím číslu '{text}'") from exc
+    return text or None
+
+
+_KEEP = object()   # sentinel: an empty numeric box keeps the stored value
+
+
+def _merge_typed(base: dict, patch: dict, allowed: tuple[str, ...]) -> dict:
+    """Typed merge of string patches into a stored block, dropping _KEEP."""
+    merged = dict(base)
+    for key, value in patch.items():
+        if key not in allowed:
+            continue
+        val = _typed_patch_value(key, str(value)) if isinstance(value, str) \
+            else value
+        if val is not _KEEP:
+            merged[key] = val
+    return merged
+
+
+def save_acquisition(item: AnnotationItem, patch: dict) -> None:
+    """Merge operator-corrected acquisition facts into one sidecar.
+
+    Typed merge: the patch lands on the existing ``acquisition`` dict and
+    the whole block validates through :class:`AcquisitionMetadata` before
+    anything is written, so "0,011" cannot become a string the developer
+    chokes on and a blank copy-number box cannot erase the stored 1.
+    """
+    current = _merge_typed(item.record.get("acquisition") or {}, patch,
+                           ACQUISITION_FIELDS)
+    AcquisitionMetadata.model_validate(current)  # raises -> disk untouched
+    payload = dict(item.record)
+    payload["acquisition"] = current
+    _write_sidecar(item, payload)
+
+
+def save_film(project: AnnotatedProject, patch: dict) -> int:
+    """Merge a film-level edit into every scan sidecar (+ project.json).
+
+    The film block is duplicated into every sidecar by the capture app, so
+    an edit to "what film is this" is an edit to all of them — otherwise
+    the developer (which reads the film block from sidecars as a fallback)
+    would see a different film per frame. Validated through
+    :class:`FilmMetadata` before writing; the orientation flags ride along
+    untouched because the patch never contains them.
+
+    Returns the number of sidecars updated. Missing project.json is not
+    created — it belongs to the capture app; where it exists, its ``film``
+    block is kept in sync (the developer reads it first).
+    """
+    # Two passes: validate every sidecar's merged film block *before* the
+    # first write — a rejected edit must leave the whole roll untouched,
+    # not half-updated. _merge_typed runs per-item so a _KEEP numeric
+    # (empty box) preserves each sidecar's own stored value.
+    payloads: list[tuple[AnnotationItem, dict]] = []
+    film_dump: dict | None = None
+    for item in project.items:
+        current = _merge_typed(item.record.get("film") or {}, patch,
+                               FILM_FIELDS)
+        current.setdefault("film_id", item.record.get("film_id")
+                           or project.film_id or "")
+        film_dump = FilmMetadata.model_validate(
+            current).model_dump(mode="json")
+        payloads.append((item, film_dump))
+    for item, film in payloads:
+        payload = dict(item.record)
+        payload["film"] = film
+        _write_sidecar(item, payload)
+    if film_dump is not None:
+        _sync_project_json(project.root, film_dump)
+        _take_orientation(project, film_dump)
+    return len(payloads)
+
+
+def _sync_project_json(root: Path, film: dict) -> None:
+    path = root / "project.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return                      # no capture project.json: nothing to sync
+    data["film"] = film
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _write_sidecar(item: AnnotationItem, payload: dict) -> None:
+    tmp = item.sidecar_path.with_name(item.sidecar_path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    tmp.replace(item.sidecar_path)
+    item.record = payload

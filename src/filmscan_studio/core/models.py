@@ -143,6 +143,21 @@ class FilmMetadata(BaseModel):
     #: Body the scan was made on, typed rather than taken from EXIF: the operator
     #: records what they believe they used, and may be digitising on a spare body.
     camera: str | None = None
+    #: Lens the *photographs were taken with* (e.g. "Nikkor 50/2") — added by
+    #: the annotator's film panel 2026-09-21 evening at the operator's order
+    #: ("dej tam i políčko objektiv"). Deliberately NOT called ``lens``: that
+    #: name is retired from the acquisition block (see RETIRED_ACQUISITION_
+    #: FIELDS) and must not resurface; this is a different fact — the camera
+    #: that exposed the film, not the digitising rig. Per-film like
+    #: ``camera``: a roll is shot through one lens.
+    shooting_lens: str | None = None
+    #: Film speed as the operator records it (e.g. "100", "400/27°") — the
+    #: scene's ISO, the photographic EXIF fact, free text so "100/21°" sur-
+    #: vives. Distinct from the acquisition block's ``iso``/``gain`` (the
+    #: digitising sensor's sensitivity, a machine reading). Added 2026-09-22
+    #: at the operator's request for an EXIF group in the annotator
+    #: ("pod blok název/geo budou exifové — foťák, ISO…").
+    film_iso: str | None = None
     format: str | None = Field(default=None, description="e.g. '35mm', '120', '4x5'.")
     film_type_class: FilmType = FilmType.BW_NEGATIVE
     #: Whole development line as one string, e.g. 'R 09 1:50 8 min @22C'.
@@ -279,6 +294,18 @@ class FrameAnnotation(BaseModel):
     #: EXIF-style DMS helper strings, ready for a later GPS IFD write.
     gps_lat_exif_dms: str = ""
     gps_lon_exif_dms: str = ""
+    #: Viewer rotation applied on top of the film's orientation flags
+    #: (2026-09-21 evening: per-frame "rotate 90° left/right" in the
+    #: annotator). CW degrees, multiples of 90; the density archive stays
+    #: untouched — previews and exports rotate, like the film flips do.
+    rotation_degrees: int = 0
+
+    @field_validator("rotation_degrees")
+    @classmethod
+    def _rotation_multiple(cls, v: int) -> int:
+        if v % 90 != 0:
+            raise ValueError("rotation_degrees musí být násobek 90°")
+        return v % 360
 
     @field_validator("capture_datetime")
     @classmethod

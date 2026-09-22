@@ -24,7 +24,7 @@ from PySide6.QtGui import QMouseEvent  # noqa: E402
 
 from filmscan_studio.capture.camera import LiveFrame  # noqa: E402
 from filmscan_studio.capture.mock import MockCamera  # noqa: E402
-from filmscan_studio.core.models import FilmMetadata  # noqa: E402
+from filmscan_studio.core.models import FilmMetadata, FilmType  # noqa: E402
 from filmscan_studio.core.zoom import FIT, NO_BINNING, OVERVIEW_BINNING  # noqa: E402
 from filmscan_studio.gui.capture_window import CaptureWindow  # noqa: E402
 from filmscan_studio.gui.imageutil import to_qimage  # noqa: E402
@@ -205,6 +205,58 @@ class TestCaptureWorkflow:
             encoding="utf-8"))
         assert data["film"]["mirrored_horizontal"] is True
         assert data["counts"]["scans"] == 1
+
+    def test_preview_jpeg_inverts_even_in_raw_view(self, window, tmp_path,
+                                                   qtbot,
+                                                   monkeypatch) -> None:
+        """Náhledový JPEG se ukládá VŽDY pozitivní (povel 2026-09-22:
+        „všechny jpgy zůstaly negativní — měly být už při uložení
+        invertovány“). self.positive.invert follows the RAW View | Negativ
+        toggle; that switch is a live-view convenience and must never reach
+        the archived preview next to the frame — the film's type decides."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="HP5_INV")          # bw_negative default
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film,
+                                        paths=paths)
+        window._set_mode(raw_view=True)
+        assert window.positive.invert is False          # the old leak source
+
+        seen: list = []
+        monkeypatch.setattr(
+            "filmscan_studio.gui.capture_window.render_preview_jpeg",
+            lambda raw, jpg, params, **kw: seen.append(params) or jpg)
+        window._capture(scan=True)
+        qtbot.waitUntil(lambda: bool(seen), timeout=10000)
+        # the capture worker still refreshes settings after the preview job;
+        # let it finish before the camera fixture disconnects (teardown race)
+        qtbot.waitUntil(lambda: window.session.state.scan_count == 1,
+                        timeout=10000)
+        assert seen[0].invert is True                   # film is a negative
+        window._set_mode(raw_view=False)
+
+    def test_preview_jpeg_stays_plain_for_slide(self, window, tmp_path,
+                                                qtbot,
+                                                monkeypatch) -> None:
+        """Diapozitiv už pozitivní je — náhled se neinvertuje ani v Negativ
+        módu živého náhledu."""
+        from filmscan_studio.capture.session import CaptureSession, SessionPaths
+
+        film = FilmMetadata(film_id="PROVIA", film_type_class=FilmType.SLIDE)
+        paths = SessionPaths.create(tmp_path, film.film_id)
+        window.session = CaptureSession(camera=window.camera, film=film,
+                                        paths=paths)
+        window._set_mode(raw_view=False)                # invert ON in the live
+        seen: list = []
+        monkeypatch.setattr(
+            "filmscan_studio.gui.capture_window.render_preview_jpeg",
+            lambda raw, jpg, params, **kw: seen.append(params) or jpg)
+        window._capture(scan=True)
+        qtbot.waitUntil(lambda: bool(seen), timeout=10000)
+        qtbot.waitUntil(lambda: window.session.state.scan_count == 1,
+                        timeout=10000)
+        assert seen[0].invert is False
 
     def test_autosave_never_warns_by_dialog(self, window, tmp_path,
                                             monkeypatch) -> None:

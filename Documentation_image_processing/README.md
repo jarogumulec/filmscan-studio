@@ -14,6 +14,9 @@ digitální pozitiv.
 | [04_plan_implementace.md](04_plan_implementace.md) | Plan pro developer: fáze, moduly, formáty, sidecary, testy, otevřené otázky |
 | [05_darktable_source_kopy.md](05_darktable_source_kopy.md) | Kopie klíčových zdrojových souborů darktable + rozbor (fixace zdroje pravdy) |
 | [06_roi_metadata.md](06_roi_metadata.md) | **Požadavek na akvizici:** `image_rect` v metadatech; záchrana Shift+kreslením v GUI |
+| [07_rendering_profile_a_histogramy.md](07_rendering_profile_a_histogramy.md) | Rendering profil a histogramy |
+| [08_ui_ladeni_dmin_dmax_a_krivky.md](08_ui_ladeni_dmin_dmax_a_krivky.md) | UI ladění Dmin/Dmax a křivek |
+| [09_anotace_a_exif.md](09_anotace_a_exif.md) | **Anotátor `filmscan-annotate`:** blok `annotation` v sidecaru, sekvenční minuty, editovatelná akvizice + film, EXIF kontrakt pro export v developeru |
 
 ## Implementace (stav 2026-09-18)
 

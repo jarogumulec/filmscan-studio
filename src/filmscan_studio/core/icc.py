@@ -300,11 +300,15 @@ def write_gray_tiff(path, data, icc_profile: bytes | None,
 
 
 def write_gray_jpeg(path, data, icc_profile: bytes | None,
-                    quality: int = 95) -> Path:
+                    quality: int = 95,
+                    exif: bytes | None = None,
+                    xmp: bytes | None = None) -> Path:
     """8b single-channel gray JPEG s ICC profilem.
 
     Dřívější zápis přes cv2 psal BGR se třemi identickými kanály — tady
     jde opravdový gray (režim L) a k němu APP2 profil. Pixely se nemění.
+    `exif`/`xmp` jsou hotové byty z core.exportmeta (dok. 09); Pillow je
+    vlepe do APP1 resp. APP2 bez zásahu do pixelů.
     """
     import numpy as np
     from PIL import Image
@@ -316,18 +320,25 @@ def write_gray_jpeg(path, data, icc_profile: bytes | None,
     kwargs: dict[str, object] = {"quality": quality}
     if icc_profile:
         kwargs["icc_profile"] = icc_profile
+    if exif:
+        kwargs["exif"] = exif
+    if xmp:
+        kwargs["xmp"] = xmp
     im.save(path, format="JPEG", **kwargs)
     return Path(path)
 
 
 def write_srgb_jpeg(path, rgb_data, icc_profile: bytes,
-                    quality: int = 95) -> Path:
+                    quality: int = 95,
+                    exif: bytes | None = None,
+                    xmp: bytes | None = None) -> Path:
     """8b RGB JPEG (kompatibilní cesta) — gray pixely jako R=G=B + sRGB.
 
     Pixely se nemění ani nepřevádějí: gamma 2,2 z apply_display() v nich už
     je, sRGB profil je kompatibilní obal (uživatel 2026-09-21). Na rozdíl
     od gray cesty tudy jdou tři stejné kanály záměrně — kde black-and-white
     JPEG může vyžadovat explicitní gray konverzi, RGB JPEG umí každá čtečka.
+    exif/xmp — viz write_gray_jpeg.
     """
     import numpy as np
     from PIL import Image
@@ -335,8 +346,14 @@ def write_srgb_jpeg(path, rgb_data, icc_profile: bytes,
     arr = np.asarray(rgb_data)
     if arr.dtype != "uint8" or arr.ndim != 3 or arr.shape[2] != 3:
         raise ValueError(f"expected HxWx3 uint8, got {arr.shape} {arr.dtype}")
+    kwargs: dict[str, object] = {}
+    if exif:
+        kwargs["exif"] = exif
+    if xmp:
+        kwargs["xmp"] = xmp
     Image.fromarray(arr, mode="RGB").save(
-        path, format="JPEG", quality=quality, icc_profile=icc_profile)
+        path, format="JPEG", quality=quality, icc_profile=icc_profile,
+        **kwargs)
     return Path(path)
 
 
@@ -348,7 +365,9 @@ HEIC_QUALITY = 72
 
 
 def write_srgb_heic(path, rgb16, icc_profile: bytes,
-                    quality: int = HEIC_QUALITY, bit_depth: int = 10) -> Path:
+                    quality: int = HEIC_QUALITY, bit_depth: int = 10,
+                    exif: bytes | None = None,
+                    xmp: bytes | None = None) -> Path:
     """10b RGB HEIC (HEVC) — hlubší bitová hloubka pro Apple/ProApps čtečky.
 
     16b vstup (``>u2`` nebo ``<u2``, hodnoty 0..65535 = plná škála) se koduje
@@ -368,14 +387,21 @@ def write_srgb_heic(path, rgb16, icc_profile: bytes,
             or arr.ndim != 3 or arr.shape[2] != 3:
         raise ValueError(f"expected HxWx3 uint16, got {arr.shape} {arr.dtype}")
     h, w, _ = arr.shape
+    kwargs: dict[str, object] = {}
+    if exif:
+        kwargs["exif"] = exif
+    if xmp:
+        kwargs["xmp"] = xmp
     pillow_heif.encode("RGB;16", (w, h), arr.astype("<u2").tobytes(), str(path),
                        quality=quality, bit_depth=bit_depth,
-                       icc_profile=icc_profile)
+                       icc_profile=icc_profile, **kwargs)
     return Path(path)
 
 
 def write_mono_heic(path, gray16, icc_profile: bytes,
-                    quality: int = HEIC_QUALITY, bit_depth: int = 10) -> Path:
+                    quality: int = HEIC_QUALITY, bit_depth: int = 10,
+                    exif: bytes | None = None,
+                    xmp: bytes | None = None) -> Path:
     """10b monochromatické HEIF (HEVC) — skutečný single-channel mono.
 
     Uživatel 2026-09-21: „přidej 10bit heif mono“ — Apple monochrom zvládá
@@ -391,9 +417,14 @@ def write_mono_heic(path, gray16, icc_profile: bytes,
             or arr.ndim != 2:
         raise ValueError(f"expected HxW uint16, got {arr.shape} {arr.dtype}")
     h, w = arr.shape
+    kwargs: dict[str, object] = {}
+    if exif:
+        kwargs["exif"] = exif
+    if xmp:
+        kwargs["xmp"] = xmp
     pillow_heif.encode("L;16", (w, h), arr.astype("<u2").tobytes(), str(path),
                        quality=quality, bit_depth=bit_depth,
-                       icc_profile=icc_profile)
+                       icc_profile=icc_profile, **kwargs)
     return Path(path)
 
 

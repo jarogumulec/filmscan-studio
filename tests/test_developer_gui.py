@@ -816,3 +816,83 @@ class TestDoc08Layout:
         assert window.sl_toe.value() == window.sl_toe.maximum()
         assert window.sl_gamma.value() == window.sl_gamma.maximum()
         assert window.sl_sb.value() == window.sl_sb.maximum()
+
+
+class TestExportMetadata:
+    """Dok. 09: export JPEG/HEIC nese EXIF+XMP ze sidecaru (anotace + film)."""
+
+    ANNOTATION = {
+        "title": "Vacation 2026", "note": "uvodni komentar",
+        "tags": ["vacation"], "rating": 3,
+        "capture_datetime": "2015:11:08 00:01:00",
+        "gps_lat": "50.08747000", "gps_lon": "14.42756000",
+        "gps_lat_ref": "N", "gps_lon_ref": "E",
+        "rotation_degrees": 90,
+    }
+    FILM = {
+        "film_id": "HP5_001", "film_name": "Ilford HP5 Plus",
+        "camera": "Nikon FM2", "shooting_lens": "Nikkor 50/2",
+        "film_iso": "400", "format": "35mm",
+    }
+
+    def _annotate(self, session) -> None:
+        """Anotace do sidecaru jako anotátor — merge, ne přepis."""
+        sidecar = session / "frames" / "frame001.tif.json"
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        data["annotation"] = dict(self.ANNOTATION)
+        data["film"] = dict(self.FILM)
+        sidecar.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_jpeg_export_embeds_exif_and_xmp(self, window, session,
+                                             tmp_path) -> None:
+        Image = pytest.importorskip("PIL.Image")
+        from tests.test_exportmeta import _comment
+        self._annotate(session)
+        window.project = DevelopProject.open(session)
+        window.project.root = tmp_path
+        window.save_jpeg()
+        with Image.open(tmp_path / "derived" / "frame001.jpg") as im:
+            top = im.getexif()
+            assert top[0x010E] == "Vacation 2026"
+            assert top[0x0110] == "FM2"
+            ifd = top.get_ifd(0x8769)
+            assert ifd[0x8827] == 400
+            assert ifd[0x9003] == "2015:11:08 00:01:00"
+            assert _comment(ifd[0x9286]).startswith("uvodni")
+            assert float(top.get_ifd(0x8825)[2][0]) == 50.0
+            assert "vacation".encode() in im.info["xmp"]
+            assert b"<xmp:Rating>3" in im.info["xmp"]
+
+    def test_record_without_data_has_no_exif(self, window, tmp_path) -> None:
+        """Prázdný record = žádné APP1/XMP — export byte shodný s minulostí."""
+        Image = pytest.importorskip("PIL.Image")
+        window.project.root = tmp_path
+        # i bez anotací nese sidecar akvizici (DateTimeDigitized) — proto
+        # explicitně vypnout všechno: tohle je faktický stav starého archivu
+        window.project.frames[0].record = {}
+        window.save_jpeg()
+        with Image.open(tmp_path / "derived" / "frame001.jpg") as im:
+            assert dict(im.getexif()) == {}
+            assert "xmp" not in im.info
+
+    def test_heic_export_embeds_exif(self, window, session, tmp_path) -> None:
+        Image = pytest.importorskip("PIL.Image")
+        pillow_heif = pytest.importorskip("pillow_heif")
+        self._annotate(session)
+        window.project = DevelopProject.open(session)
+        window.project.root = tmp_path
+        window.save_heic_mono()
+        heif = pillow_heif.read_heif(tmp_path / "derived"
+                                     / "frame001.mono10.heic")
+        top = Image.Exif()
+        top.load(heif.info["exif"])
+        assert top[0x010F] == "Nikon"
+        assert top.get_ifd(0x8769)[0x4746] == 3
+
+    def test_broken_sidecar_never_kills_export(self, window, session,
+                                               tmp_path) -> None:
+        """Vlastní chyba EXIFu musí přežet export — metadata jsou bonus."""
+        window.project.root = tmp_path
+        window.project.frames[0].record = {"annotation": {"rating": "blbost"}}
+        window.save_jpeg()                        # nesmí vyhodit
+        assert (tmp_path / "derived" / "frame001.jpg").exists()
