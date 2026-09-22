@@ -172,6 +172,13 @@ CHANGELOG.md               what changed, by date
 - [uv](https://docs.astral.sh/uv/) and Python ≥ 3.12 (uv fetches it), then
   `uv sync` — installs PySide6, numpy, OpenCV, Pillow, pillow-heif, tifffile,
   pydantic. No downloads for either camera SDK: both are vendored in the repo.
+- **Touptek SDK dependency:** the capture backend is the official
+  [Touptek/ToupCam SDK](https://www.touptek-astro.com/downloads/?atfWidgetNav=box_sdk)
+  (ctypes wrapper + native library). The exact copy in use — SDK
+  **20260908** (`toupcam.py` v60.32549, universal `libtoupcam.dylib`) — is
+  vendored, unmodified, under
+  [`src/filmscan_studio/capture/_toupcam/`](src/filmscan_studio/capture/_toupcam/);
+  updates come from the vendor download page above.
 - Camera: a USB3 port and **11–14 V DC power** for the Touptek. Without power
   the camera may not enumerate on USB at all.
 - macOS is the development platform (the vendored dylib is universal

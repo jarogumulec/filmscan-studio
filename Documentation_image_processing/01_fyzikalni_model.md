@@ -144,7 +144,7 @@ Nový typ souboru vedle raw TIFFu (raw archivy se nemění):
 - Nový `FrameKind`? **Ne** — archiv není capture frame; jde o odvozený soubor
   (jako dnešní exporty). Katalog ho eviduje jako artefak develop fáze.
 
-## 5. Validace na datech B1 (změřeno 2026-09-18, `~/scans/B1`)
+## 5. Validace na datech B1 (změřeno 2026-09-18, `local scan archive/B1`)
 
 Postup: dark stack (5), flat stack σ64, per-pixel jmenovatel z flatu, D = −log10 T.
 

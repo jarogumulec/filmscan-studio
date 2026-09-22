@@ -1,6 +1,6 @@
 # 05 — Kopie relevantních zdrojových souborů z darktable
 
-Překopírováno z lokálního checkoutu `~/work/darktable`
+Překopírováno z lokálního checkoutu `local darktable checkout (github.com/darktable-org/darktable)`
 (verze `nightly-4-g2c42f30809`, naposledy změněno v commitu `06e85df4` z 2026-08-06)
 dne 2026-09-18. Účel: fixovat zdrojovou pravdu, ze které vychází
 [02_rozbor_negadoctor.md](02_rozbor_negadoctor.md) a tento dokument, proti budoucímu

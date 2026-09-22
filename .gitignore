@@ -40,3 +40,6 @@ coverage.xml
 Nikon_SDK
 Touptek_SDK
 _temp_screens
+
+# Local scan project folders (catalog.sqlite, frames/) — never commit capture data
+12/

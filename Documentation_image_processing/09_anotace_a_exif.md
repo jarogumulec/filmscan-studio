@@ -98,7 +98,7 @@ Film.**
 
 Při otevření složky `auto_date_frames` změří `film.development_start`: je-li
 to **čitelné datum** (den povinný, na začátku řetězce, i s dodatkem
-„8.11.2015 Vacation 2026"), zapíše se jako `capture_datetime` do všech snímků,
+„8.11.2026 Vacation 2026"), zapíše se jako `capture_datetime` do všech snímků,
 které datum ještě **nemají** — sekvenčně po minutách (00:01, 00:02…), jako u
 hromadného apply. Říkal uživatel: *„když film start je čitelné datum, aplikuj
 na všechny fotky jako datum záběru, já si kdyžtak upravím ručně. pokud tam je

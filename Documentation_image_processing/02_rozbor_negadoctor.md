@@ -1,6 +1,6 @@
 # 02 — Rozbor matematiky darktable negadoctoru
 
-Zdroj: `~/work/darktable/src/iop/negadoctor.c` (1078 ř., verze master
+Zdroj: `local darktable checkout (github.com/darktable-org/darktable)/src/iop/negadoctor.c` (1078 ř., verze master
 z lokálního checkoutu) + oficiální manuál (`darktable user manual - negadoctor.html`).
 Zajímá nás matematika a tok dat, ne GUI.
 

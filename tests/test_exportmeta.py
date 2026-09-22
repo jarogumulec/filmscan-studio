@@ -38,7 +38,7 @@ def _record(**overrides) -> dict:
         "annotation": {
             "title": "Vacation 2026", "note": "vacation 2026; kyvadlo",
             "tags": ["vacation", "trip"], "rating": 4,
-            "capture_datetime": "2015:11:08 00:01:00",
+            "capture_datetime": "2026:11:08 00:01:00",
             "gps_lat": "50.08747000", "gps_lon": "14.42756000",
             "gps_lat_ref": "N", "gps_lon_ref": "E",
             "rotation_degrees": 90,
@@ -52,12 +52,12 @@ def _record(**overrides) -> dict:
 
 class TestHelpers:
     def test_exif_str_variants(self) -> None:
-        assert em._exif_str("2015:11:08 00:01:00") == "2015:11:08 00:01:00"
+        assert em._exif_str("2026:11:08 00:01:00") == "2026:11:08 00:01:00"
         # ISO s pásmem z riggu → EXIF bez pásma (místní čas zůstal v textu)
         assert em._exif_str("2026-09-20T16:53:17.956137+02:00") \
             == "2026:09:20 16:53:17"
         # anotátor ukládá už EXIF tvar; tady stačí rok-den přepis + bez času
-        assert em._exif_str("2015-11-08") == "2015:11:08 00:00:00"
+        assert em._exif_str("2026-11-08") == "2026:11:08 00:00:00"
         assert em._exif_str("cca 2015") == ""     # nečitelné → nic
         assert em._exif_str("1968") == ""         # holý rok → nic
         assert em._exif_str("") == ""
@@ -100,7 +100,7 @@ class TestHelpers:
         assert em._ascii_fold("vyvolávka s ěščřžý") == "vyvolavka s escrzy"
         # náhrada středníku (pomlčka) musí přežít, ne zmizet
         assert em._ascii_fold("vacation 2026- kyvadlo") \
-            == "vacation 2015- kyvadlo"
+            == "vacation 2026- kyvadlo"
 
 
 class TestDescription:
@@ -148,7 +148,7 @@ class TestExifBuilder:
         assert exif and exif.startswith(b"Exif\x00\x00")
         top = Image.Exif(); top.load(exif)
         # ImageDescription ← celý popis (komentář první), ASCII-fold
-        assert top[0x010E].startswith("vacation 2015- kyvadlo")
+        assert top[0x010E].startswith("vacation 2026- kyvadlo")
         assert "Film: Ilford HP5 Plus (35mm)" in top[0x010E]
         assert top[0x010F] == "Nikon"               # Make ← camera_make
         assert top[0x0110] == "FM2"                 # Model ← camera_model
@@ -159,7 +159,7 @@ class TestExifBuilder:
         assert 0x9286 not in ifd                    # UserComment pryč
         assert ifd[0x8827] == 400                   # ISO ← film_iso "400/27°"
         assert ifd[0xA434] == "Nikkor 50mm f/2"     # LensModel
-        assert ifd[0x9003] == "2015:11:08 00:01:00" # DateTimeOriginal ← záběr
+        assert ifd[0x9003] == "2026:11:08 00:01:00" # DateTimeOriginal ← záběr
         assert ifd[0x9004] == "2026:09:20 16:53:17" # DateTimeDigitized ← rigg
         assert ifd[0x4746] == 4 and ifd[0x4747] == 80
 
@@ -248,11 +248,11 @@ class TestRoundTripThroughFiles:
                             exif=exif, xmp=xmp)
         with Image.open(out) as im:
             top = im.getexif()
-            assert top[0x010E].startswith("vacation 2015-")
+            assert top[0x010E].startswith("vacation 2026-")
             assert top[0x010F] == "Nikon"
             ifd = top.get_ifd(0x8769)
             assert ifd[0x8827] == 400
-            assert ifd[0x9003] == "2015:11:08 00:01:00"
+            assert ifd[0x9003] == "2026:11:08 00:01:00"
             assert float(top.get_ifd(0x8825)[2][0]) == 50.0
             xmp_bytes = im.info["xmp"]
             assert "trip".encode() in xmp_bytes

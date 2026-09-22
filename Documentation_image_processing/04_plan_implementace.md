@@ -64,7 +64,7 @@ NaN masky (tma, saturace, tmavý okraj), exposure invariance (stejný signál p�
 ## Vrstvy testování kvality (chybová analýza 01 §3)
 
 1. **Regression proti B1:** fixní expectace D_base/D_med/D_p99 s tolerancemi; data
-   nejsou v repu — test skipuje bez `~/scans/B1` (nebo fixtury generovat).
+   nejsou v repu — test skipuje bez `local scan archive/B1` (nebo fixtury generovat).
 2. **Detektor anomálií** (B1 nálezy): „žádný film" (median D < Dmin−0,05),
    hluboké stíny pod dark residualem (>x % NaN), záporné čisté hustoty nad šum —
    hlásí, neořezává tiše.

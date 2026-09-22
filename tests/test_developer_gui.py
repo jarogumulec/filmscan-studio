@@ -824,7 +824,7 @@ class TestExportMetadata:
     ANNOTATION = {
         "title": "Vacation 2026", "note": "uvodni komentar",
         "tags": ["vacation"], "rating": 3,
-        "capture_datetime": "2015:11:08 00:01:00",
+        "capture_datetime": "2026:11:08 00:01:00",
         "gps_lat": "50.08747000", "gps_lon": "14.42756000",
         "gps_lat_ref": "N", "gps_lon_ref": "E",
         "rotation_degrees": 90,
@@ -860,7 +860,7 @@ class TestExportMetadata:
             assert 0x0112 not in top
             ifd = top.get_ifd(0x8769)
             assert ifd[0x8827] == 400
-            assert ifd[0x9003] == "2015:11:08 00:01:00"
+            assert ifd[0x9003] == "2026:11:08 00:01:00"
             assert 0x9286 not in ifd               # UserComment už se nepíše
             assert float(top.get_ifd(0x8825)[2][0]) == 50.0
             assert b"<dc:title>" in im.info["xmp"]

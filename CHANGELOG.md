@@ -62,7 +62,7 @@ i když otevřená byla. Nyní:
   už nikdy nelže otevřené složce (při reálné chybě měření píše co selhalo);
   Proposal bez měření base nespadne, když relativní dmax ≤ výchozí dmin
   (dmax i tak musí škálu přesáhnout).
-* **Ověřeno** na reálné složce `~/scans/test4` (flat chybí,
+* **Ověřeno** na reálné složce `local scan archive/test4` (flat chybí,
   4 snímky): náhled 1245×834 vyjde, status radí, exporty se odblokují.
   Syntetické testy: `TestFlatFallback` (project) +
   `TestFlatlessProject` (GUI). 424 testů zelených.

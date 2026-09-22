@@ -33,8 +33,8 @@ Zdrojové podklady:
 
 - `darktable_source/` — fixované kopie relevantních souborů (upstream `nightly-4-g2c42f30809`, GPL v3)
 - `darktable user manual - negadoctor.html` — manuál modulu (oficiální docs)
-- `~/work/darktable` — kompletní zdrojáky darktable
-- `~/scans/B1` — reálná ukázková data (6 scanů, 5 dark, 9 flat, 2 base, 2026-09-18)
+- upstream [darktable-org/darktable](https://github.com/darktable-org/darktable) — kompletní zdrojáky darktable (lokální checkout)
+- lokální archív skenů `B1` — reálná ukázková data (6 scanů, 5 dark, 9 flat, 2 base, 2026-09-18; nejsou v repu)
 - Uživatelský nástin: `2026 Monochrom digitizér software part.md` (poznámkový blok)
 
 ## Rozhodnutí (2026-09-18)

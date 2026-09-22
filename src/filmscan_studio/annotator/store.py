@@ -97,7 +97,7 @@ def _parse_datetime(value: str) -> tuple[str, bool]:
 
 
 #: A real calendar date (day required) at the START of the Film-start free
-#: text, optionally followed by a note: "8.11.2015 Vacation 2026" qualifies,
+#: text, optionally followed by a note: "8.11.2026 Vacation 2026" qualifies,
 #: "cca 2/2017" or "?2025" does not — an approximate date written as one
 #: must stay approximate (operator's rule 2026-09-22).
 _FILM_START_DATE = re.compile(

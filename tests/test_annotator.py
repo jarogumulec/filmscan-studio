@@ -666,7 +666,7 @@ def test_gui_thumbnail_grid_and_space_fullscreen(tmp_path, qtbot) -> None:
 # ------------------------------------------- Film start -> automatické datum
 
 @pytest.mark.parametrize("raw,expected", [
-    ("8.11.2015 Vacation 2026", "2015:11:08 00:00:00"),   # date + note (K16O01)
+    ("8.11.2026 Vacation 2026", "2026:11:08 00:00:00"),   # date + note (K16O01)
     ("15.7.2026", "2026:07:15 00:00:00"),              # plain (K16O04)
     ("2026-07-12", "2026:07:12 00:00:00"),             # ISO spelling
     ("1. 2. 1968 poznámka", "1968:02:01 00:00:00"),    # spaced
@@ -705,13 +705,13 @@ def _project_with_film_start(tmp_path, start):
 def test_auto_date_stamps_undated_frames(tmp_path) -> None:
     from filmscan_studio.annotator.store import auto_date_frames
 
-    proj = _project_with_film_start(tmp_path, "8.11.2015 Vacation 2026")
+    proj = _project_with_film_start(tmp_path, "8.11.2026 Vacation 2026")
     count, date = auto_date_frames(proj)
-    assert (count, date) == (3, "2015:11:08 00:00:00")
+    assert (count, date) == (3, "2026:11:08 00:00:00")
     stamps = [json.loads(i.sidecar_path.read_text())["annotation"]
               ["capture_datetime"] for i in proj.items]
-    assert stamps == ["2015:11:08 00:01:00", "2015:11:08 00:02:00",
-                      "2015:11:08 00:03:00"]     # sequential, sortable order
+    assert stamps == ["2026:11:08 00:01:00", "2026:11:08 00:02:00",
+                      "2026:11:08 00:03:00"]     # sequential, sortable order
 
 
 def test_auto_date_skips_unreadable_film_start(tmp_path) -> None:
