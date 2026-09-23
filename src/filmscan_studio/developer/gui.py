@@ -58,6 +58,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -906,7 +907,8 @@ class MainWindow(QMainWindow):
         self.chk_fullres = QCheckBox("1:1 plné rozlišení")
         self.chk_fullres.setToolTip(
             "Náhled se nepočítá z podvzorku — každý pixel je ze senzoru. "
-            "Ostření i pixelový skok jsou konečně vidět; pomalejší tah.")
+            "OSTŘENÍ SE V NÁHLEDU UKAZUJE JEN S TÍMTO ZAPNUTÝM (na "
+            "podvzorku nemá smysl ho zobrazovat); pomalejší tah.")
         self.chk_fullres.toggled.connect(self._fullres_toggled)
         self.lbl_zoom = QLabel("—")
         self.lbl_pixel = QLabel("D: —  out: —")
@@ -947,6 +949,14 @@ class MainWindow(QMainWindow):
         sv.addWidget(self._build_curve_box())
         sv.addWidget(self._build_display_box())
         sv.addWidget(self._build_export_box())
+        # „Default" (bývalý Proposal) na úplný konec panelu, pod export
+        # (rozkaz 2026-09-22 noc III).
+        self.btn_defaults = QPushButton("Default")
+        self.btn_defaults.setToolTip(
+            "Auto body (Dmin z měření, Dmax z p99,9) + přirozená křivka — "
+            "stejný návrh jako při prvním otevření snímku.")
+        self.btn_defaults.clicked.connect(self.apply_defaults)
+        sv.addWidget(self.btn_defaults)
         sv.addStretch(1)
         side_scroll = QScrollArea()
         side_scroll.setWidget(side)
@@ -957,16 +967,17 @@ class MainWindow(QMainWindow):
         # jen maskoval ořez histogramu, který operátor nesmí vidět.
         side_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        # Poloviční šířka (rozkaz 2026-09-22): histogramy i boxy se vejdou do
-        # 260 px; 360 byla rezignace na plochu náhledu. Natahuje se JEN střed
-        # (stretch 0/1/0) — panel už nikdy neztloustne na úkor náhledu.
+        # Panel zůstal úzký, jen o kousek wider (rozkaz 2026-09-22 noc III:
+        # „rozšiř jej přeci jen o kousek a popisky a slider na 1 řádek") —
+        # single-line rows need ~300 px. Natahuje se JEN střed (stretch
+        # 0/1/0) — panel už nikdy neztloustne na úkor náhledu.
         self.side_scroll = side_scroll
-        side_scroll.setMinimumWidth(200)
+        side_scroll.setMinimumWidth(220)
         splitter.addWidget(side_scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([220, 960, 260])
+        splitter.setSizes([220, 940, 300])
 
         if project is not None:
             self.set_project(project)
@@ -1040,19 +1051,30 @@ class MainWindow(QMainWindow):
         form.addRow(name, row)
 
     @staticmethod
+    def _field_row(spin: QDoubleSpinBox, check: QCheckBox) -> QHBoxLayout:
+        """Řádek «spin + auto» vedle labelu (rozkaz 2026-09-22 noc III:
+        „na jednom řádku s text polem i auto")."""
+        row = QHBoxLayout()
+        row.addWidget(spin)
+        row.addWidget(check)
+        row.addStretch(1)
+        return row
+
+    @staticmethod
     def _narrow_form(box: QGroupBox) -> QFormLayout:
         """Formulář pro úzký panel (rozkaz 2026-09-22).
 
-        macOS default drží pole na velikosti sizeHintu — ve 260 px panelu by
-        jezdce zůstaly do půlky a dlouhé labely by kolomolkly ubíraly. Label
-        proto sedí NAD řádkem a pole roste do plné šířky; na výšku to přidá
-        pár pixelů, ale panel se scrolluje a kolmý prostor je kudy.
+        Noc III: labely zkráceny na jediná slova (Dmin/Toe/Gamma/…), takže se
+        vejdou NA JEDEN ŘÁDEK vedle jezdce (rozkaz „popisky a slider na 1
+        řádek") — WrapAllRows už není potřeba. macOS default drží pole na
+        sizeHintu, proto AllNonFixedFieldsGrow: jezdce rostou do zbylé šířky.
         """
         form = QFormLayout(box)
-        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
         form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(8)
         return form
 
     def _build_scale_box(self) -> QGroupBox:
@@ -1064,7 +1086,9 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Meritko filmu")
         form = self._narrow_form(box)
         self.spin_dmin = self._spin(0.0, 2.0, 0.2, 0.01, decimals=3)
-        self.chk_dmin_auto = QCheckBox("auto z film base")
+        # „auto" jen tak (rozkaz 2026-09-22 noc III) — význam nese tooltip;
+        # checkboxy jsou vedle spinu na témž řádku, ne pod ním.
+        self.chk_dmin_auto = QCheckBox("auto")
         self.chk_dmin_auto.setToolTip("Dmin se přebírá z posledního měření "
                                       "film base; odškrtnutím převezmeš "
                                       "hodnotu v poli ručně (08 §5).")
@@ -1072,7 +1096,7 @@ class MainWindow(QMainWindow):
         self.spin_dmax = self._spin(0.2, 5.0, 2.6, 0.05, decimals=3)
         # Stav i přepínač v jedné masce (08 §5): auto je PRACOVNÍ návrh
         # p99,9 + 0,05 D, ne vlastnost emulze; odškrtnutím ho převezmeš ručně.
-        self.chk_dmax_auto = QCheckBox("auto p99,9")
+        self.chk_dmax_auto = QCheckBox("auto")
         self.chk_dmax_auto.setToolTip("Pracovní návrh Dmax = p99,9 + 0,05 D; "
                                       "odškrtnutím ho převezmeš ručně "
                                       "(08 §5).")
@@ -1091,18 +1115,16 @@ class MainWindow(QMainWindow):
         self.sl_ev.setSingleStep(5)                 # 0,05 EV
         self.sl_ev.setPageStep(20)                  # 0,2 EV (kolečko/klik do dráhy)
         self.spin_ev = self._spin(-6.0, 6.0, 0.0, 0.05, suffix=" EV")
-        self.btn_defaults = QPushButton("Proposal")
-        self.btn_defaults.setToolTip(
-            "Auto body (Dmin z měření, Dmax z p99,9) + přirozená křivka — "
-            "stejný návrh jako při prvním otevření snímku.")
-        self.btn_defaults.clicked.connect(self.apply_defaults)
-        form.addRow("Dmin [D]", self.spin_dmin)
-        form.addRow("", self.chk_dmin_auto)
-        form.addRow("Dmax [D]", self.spin_dmax)
-        form.addRow("", self.chk_dmax_auto)
-        self._bind_row(form, "Tolerance pod Dmin [D]", self.sl_sb, self.spin_sb)
-        self._bind_row(form, "Expozice", self.sl_ev, self.spin_ev)
-        form.addRow("", self.btn_defaults)
+        # „Default" (bývalý Proposal) už tu není — rozkaz 2026-09-22 noc III:
+        # „čudl proposal na úplný konec pod export a přejmenuj na default".
+        # Dmin/Dmax: spin + auto na JEDNOM řádku, label bez „[D]" (jednotka
+        # je v tooltipu a je všem jasná).
+        form.addRow("Dmin", self._field_row(self.spin_dmin,
+                                            self.chk_dmin_auto))
+        form.addRow("Dmax", self._field_row(self.spin_dmax,
+                                            self.chk_dmax_auto))
+        self._bind_row(form, "Dmin offset", self.sl_sb, self.spin_sb)
+        self._bind_row(form, "Exposure", self.sl_ev, self.spin_ev)
 
         self.spin_dmin.setToolTip("Čiré podloží = nejčernější pozitiv. "
                                   "Bez měření film base je ruční hodnota jen "
@@ -1133,7 +1155,7 @@ class MainWindow(QMainWindow):
         hodnota ze starých uložených nastavení nenačetla tiše oříznutá.
         Nad rozsah jezdce je jen speciální komprese konců, ne fotografie.
         """
-        box = QGroupBox("Tónová křivka")
+        box = QGroupBox("Tone curve")   # anglicky — rozkaz 2026-09-22 noc III
         form = self._narrow_form(box)
         self.sl_toe = self._slider(0, 80, 20)
         self.spin_toe = self._spin(0.0, 1.66, 0.20, 0.01)
@@ -1141,14 +1163,13 @@ class MainWindow(QMainWindow):
         self.spin_gamma = self._spin(0.10, 4.0, 1.35, 0.01)
         self.sl_shoulder = self._slider(0, 80, 20)
         self.spin_shoulder = self._spin(0.0, 1.66, 0.20, 0.01)
-        self._bind_row(form, "Patka (toe)", self.sl_toe, self.spin_toe)
-        # „Kontrast středu (gamma)", ne „sklon křivky": kombinovaná křivka má
-        # kvůli spline před gamma krokem vlastní sklon (dok 07 §7); název
-        # podle dok 08 §5 nahrazuje dřívější „Středový kontrast".
-        self._bind_row(form, "Kontrast středu (gamma)", self.sl_gamma,
-                       self.spin_gamma)
-        self._bind_row(form, "Rameno (shoulder)", self.sl_shoulder,
-                       self.spin_shoulder)
+        # Popsiky jen anglicky (rozkaz 2026-09-22 noc III): „a pak jen ty
+        # anglické toe gamma shoulder". Česky zůstávají tooltipy.
+        self._bind_row(form, "Toe", self.sl_toe, self.spin_toe)
+        # „gamma", ne „sklon křivky": kombinovaná křivka má kvůli spline před
+        # gamma krokem vlastní sklon (dok 07 §7); význam hlídá tooltip.
+        self._bind_row(form, "Gamma", self.sl_gamma, self.spin_gamma)
+        self._bind_row(form, "Shoulder", self.sl_shoulder, self.spin_shoulder)
         self.spin_toe.setToolTip("Komprese spodního konce — vyšší hodnota "
                                  "stlačí stíny, NENÍ záchrana ztracených "
                                  "pixelů (08 §3 krok 4).")
@@ -1170,7 +1191,7 @@ class MainWindow(QMainWindow):
         (08 §2). Náhled i export použijí totéž — WYSIWYG, export navíc ponese
         ICC profil se stejnou TRC.
         """
-        box = QGroupBox("Zobrazení")
+        box = QGroupBox("Post-curve")   # bývalé „Zobrazení" — rozkaz noc III
         form = self._narrow_form(box)
         # Jas a kontrast v display prostoru (za gammou) — Photoshop zvyk.
         # kontrast kolem zobrazené střední šedi 0,5; jas posun. Nejsou
@@ -1179,9 +1200,11 @@ class MainWindow(QMainWindow):
         self.spin_br = self._spin(-0.5, 0.5, 0.0, 0.01)
         self.sl_ct = self._slider(10, 400, 100)       # 0,10 … 4,00
         self.spin_ct = self._spin(0.1, 4.0, 1.0, 0.01)
-        form.addRow("Display gamma", QLabel("2,2 — dáno profilem"))
-        self._bind_row(form, "Jas (display)", self.sl_br, self.spin_br)
-        self._bind_row(form, "Kontrast (display)", self.sl_ct, self.spin_ct)
+        # (Řádek „Display gamma 2,2 — dáno profilem" odstraněn —
+        #  rozkaz 2026-09-22 noc III: „display gamma 2,2 dáno profilem
+        #  odstraň". Gamma v datech zůstává, jen se neukazuje.)
+        self._bind_row(form, "Brightness", self.sl_br, self.spin_br)
+        self._bind_row(form, "Contrast", self.sl_ct, self.spin_ct)
         # (Ostření tu bývalo — rozkaz 2026-09-22: „přesuň do menu Export
         # a ať funguje v režimu stejné nastavení pro všechny fotky"; je to
         # vlastnost výstupu celého projektu, ne snímku. Viz _build_export_box.)
@@ -1260,11 +1283,24 @@ class MainWindow(QMainWindow):
         # v per-frame dictu; Photoshop konvence 0–200 % / px, předvolba 20 %.
         # (stejná pravidla jako _narrow_form — box už ale vlastní QVBoxLayout,
         # form se musí vložit do něj, ne na něj)
+        # Oddělená rubrika „Sharpening" (rozkaz 2026-09-22 noc III: „ostření
+        # odděl jako Sharpening v rubrice export, dej tam fajfku ano/ne a pod
+        # tím slidery pojmenované strength a radius"). Fajfka = zap/vyp pro
+        # celý projekt; odpovídá project.global_sharpen_on.
+        h.addWidget(QLabel("<b>Sharpening</b>"))
+        self.chk_sharpen = QCheckBox("Zapnuto")
+        self.chk_sharpen.setToolTip(
+            "Ostření (unsharp mask) jako poslední krok exportu — stejné "
+            "pro všechny snímky projektu. V náhledu se ukazuje jen při "
+            "1:1 plném rozlišení.")
+        self.chk_sharpen.toggled.connect(self._sharpen_toggled)
+        h.addWidget(self.chk_sharpen)
         form = QFormLayout()
-        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
         form.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(8)
         h.addLayout(form)
         self.sl_sh = self._slider(0, 200, 20)          # 0 … 200 %
         self.spin_sh = self._spin(0.0, 200.0, 20.0, 1.0, decimals=0,
@@ -1272,9 +1308,9 @@ class MainWindow(QMainWindow):
         self.sl_shr = self._slider(0, 20, 10)          # 0,0 … 2,0 px (po 0,1)
         self.spin_shr = self._spin(0.0, 50.0, 1.0, 0.1, decimals=1,
                                    suffix=" px")
-        self._bind_row(form, "Ostření (unsharp)", self.sl_sh, self.spin_sh,
+        self._bind_row(form, "Strength", self.sl_sh, self.spin_sh,
                        scale=1.0, remember=False)
-        self._bind_row(form, "Poloměr ostření [px]", self.sl_shr,
+        self._bind_row(form, "Radius", self.sl_shr,
                        self.spin_shr, scale=10.0, remember=False)
         self.spin_sh.setToolTip("Množství ostření (unsharp mask) v procentech "
                                 "jako ve Photoshopu — PRO VŠECHNY SNÍMKY "
@@ -1351,10 +1387,12 @@ class MainWindow(QMainWindow):
         # per-snímkové přepínání do něj nesahá (rozkaz 2026-09-22).
         self._loading = True
         try:
+            self.chk_sharpen.setChecked(project.global_sharpen_on)
             self.spin_sh.setValue(project.global_sharpen)
             self.spin_shr.setValue(project.global_sharpen_radius)
         finally:
             self._loading = False
+        self._sync_sharpen_enabled()
         self.lbl_orient.setText("Orientace: " + self._orientation_text())
         if self.frame_list.count():
             self.frame_list.setCurrentRow(0)
@@ -1557,7 +1595,10 @@ class MainWindow(QMainWindow):
             shadow_band=self.spin_sb.value(),
             brightness=self.spin_br.value(),
             contrast=self.spin_ct.value(),
-            sharpen=self.spin_sh.value(),
+            # Fajfka „Zapnuto" (rozkaz noc III) — vypnuto == sharpen 0,
+            # hence i export the hodnoty nepoužije.
+            sharpen=self.spin_sh.value()
+            if self.chk_sharpen.isChecked() else 0.0,
             sharpen_radius=self.spin_shr.value(),
         )
 
@@ -1594,6 +1635,22 @@ class MainWindow(QMainWindow):
         self.project.save_settings()
         self.rerender()
 
+    def _sharpen_toggled(self, *_a) -> None:
+        """Fajfka ano/ne pro ostření (rozkaz 2026-09-22 noc III): vypnutím
+        se hodnota zachová, jen se nepoužije (render vidí sharpen 0)."""
+        if self._loading:
+            return
+        if self.project is not None:
+            self.project.global_sharpen_on = self.chk_sharpen.isChecked()
+            self.project.save_settings()
+        self._sync_sharpen_enabled()
+        self.rerender()
+
+    def _sync_sharpen_enabled(self) -> None:
+        on = self.chk_sharpen.isChecked()
+        for w in (self.sl_sh, self.spin_sh, self.sl_shr, self.spin_shr):
+            w.setEnabled(on)
+
     def apply_defaults(self) -> None:
         """Vehne snímku Proposal (auto body, přirozená křivka) -- i později."""
         if self.project is None or self._current is None:
@@ -1618,9 +1675,13 @@ class MainWindow(QMainWindow):
         # Režim 1:1 (záhlaví): bez podvzorku — sharpen je v podvzorku
         # neviditelný (náhled kreslí každý N-tý senzorový pixel, ostření
         # sousedů zahodí). Plný snímek je pomalejší, ale vidí skutečný pixel.
-        sub = (view_d if self.chk_fullres.isChecked()
-               else _subsample(view_d, PREVIEW_MAX_DIM))
-        display = rnd.render_for_display(sub, params)
+        fullres = self.chk_fullres.isChecked()
+        sub = view_d if fullres else _subsample(view_d, PREVIEW_MAX_DIM)
+        # Sharpening se v NÁHLEDU uplatní jen při 1:1 (řád 2026-09-22):
+        # na podvzorku je neviditelný (sousedé pro masku jsou ta tam) a jeho
+        # aplikace by jen lhala. Export ostří vždy — tady jde o poctivý dohled.
+        preview_params = params if fullres else replace(params, sharpen=0.0)
+        display = rnd.render_for_display(sub, preview_params)
         # Exposure warning: co render ořízl na konce stupnice. Měří se na
         # čisté ose x před ořezem -- NaN (bez světla) do neither koše.
         x = rnd.positive_x(sub, params)

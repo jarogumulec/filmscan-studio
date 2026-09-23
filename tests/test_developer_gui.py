@@ -806,7 +806,9 @@ class TestDoc08Layout:
         assert box_of(window.sl_toe) is box_of(window.spin_gamma)
         titles = {box_of(w).title() for w in
                   (window.spin_dmin, window.sl_toe, window.sl_br)}
-        assert titles == {"Meritko filmu", "Tónová křivka", "Zobrazení"}
+        # Titulky po rozkazu 2026-09-22 noc III: Tónová křivka → Tone curve,
+        # Zobrazení → Post-curve (anglicky).
+        assert titles == {"Meritko filmu", "Tone curve", "Post-curve"}
 
     def test_curve_defaults_are_doc08_working_start(self, window) -> None:
         p = window.current_params()
@@ -922,6 +924,75 @@ class TestOutputSharpeningUi:
         window.save_render()
         on = tifffile.imread(tmp_path / "derived" / "frame001.positive.tif")
         assert not np.array_equal(off, on)
+
+    def test_preview_sharpen_gated_on_fullres(self, window, qtbot,
+                                              monkeypatch) -> None:
+        """Řád 2026-09-22: „sharpening se bude ukazovat jen pokud zaškrtnu
+        1:1 plné rozlišení (na binovém zmenšeném nemá smysl)". Náhled se musí
+        přepočítat se sharpen=0, dokud není 1:1 zapnuto; export tohind nesmí
+        být dotčen (to hlídá test výš)."""
+        import filmscan_studio.developer.gui as gui
+        seen: list[float] = []
+        orig = gui.rnd.render_for_display
+
+        def spy(d, params):
+            seen.append(float(params.sharpen))
+            return orig(d, params)
+
+        monkeypatch.setattr(gui.rnd, "render_for_display", spy)
+        window.chk_fullres.setChecked(False)
+        window.spin_sh.setValue(100.0)
+        qtbot.wait(20)
+        assert seen and all(s == 0.0 for s in seen)
+        # exportní hodnota zůstává nedotčena:
+        assert window.current_params().sharpen == pytest.approx(100.0)
+        seen.clear()
+        window.chk_fullres.setChecked(True)
+        qtbot.wait(20)
+        assert seen and all(s == pytest.approx(100.0) for s in seen)
+
+    def test_sharpen_master_checkbox_gates_everything(self, window,
+                                                      tmp_path) -> None:
+        """Fajfka ano/ne (rozkaz 2026-09-22 noc III): vypnutím se ostření
+        nepoužije ani na export, ale hodnoty strength/radius přežijí."""
+        window.chk_sharpen.setChecked(False)
+        assert not window.sl_sh.isEnabled()
+        assert window.current_params().sharpen == 0.0
+        assert window.project.global_sharpen_on is False
+        window.chk_sharpen.setChecked(True)
+        assert window.sl_sh.isEnabled()
+        assert window.current_params().sharpen == pytest.approx(20.0)
+        # perzistence přes reopen:
+        window.chk_sharpen.setChecked(False)
+        import json
+        payload = json.loads(
+            (window.project.root / "develop_settings.json")
+            .read_text(encoding="utf-8"))
+        assert payload["sharpen"]["on"] is False
+
+    def test_strength_radius_labels(self, window) -> None:
+        """Slidery se jmenují Strength a Radius (rozkaz noc III)."""
+        assert window.spin_sh.suffix() == " %"
+        assert window.spin_shr.suffix() == " px"
+        # checkboxy Dmin/Dmax se zkráceny na „auto" (noc III):
+        assert window.chk_dmin_auto.text() == "auto"
+        assert window.chk_dmax_auto.text() == "auto"
+
+    def test_default_button_is_last_widget(self, window) -> None:
+        """„Default" (bývalý Proposal) sedí na úplném konci panelu, pod
+        export boxem (rozkaz 2026-09-22 noc III)."""
+        assert window.btn_defaults.text() == "Default"
+        from PySide6.QtWidgets import QGroupBox
+        side = window.btn_defaults.parent()
+        boxes = [c for c in side.children() if isinstance(c, QGroupBox)]
+        export_box = window.cmb_export
+        while export_box is not None and not isinstance(export_box, QGroupBox):
+            export_box = export_box.parent()
+        assert export_box in boxes
+        # btn_defaults je v layoutu side až za export boxem:
+        lay = side.layout()
+        items = [lay.itemAt(i).widget() for i in range(lay.count())]
+        assert items.index(window.btn_defaults) > items.index(export_box)
 
 
 class TestExportAllAndBorder:
@@ -1244,8 +1315,9 @@ class TestZoomModel:
 
 class TestPanelWidthAndThumbs:
     def test_side_panel_is_narrow(self, window) -> None:
-        # Polovina z původních 360 px (rozkaz 2026-09-22).
-        assert window.side_scroll.minimumWidth() <= 200
+        # Polovina z původních 360 px (rozkaz 2026-09-22), po noc III o kousek
+        # více (300 px default) kvůli single-line řádkům — stále ale < 1/3 okna.
+        assert window.side_scroll.minimumWidth() <= 220
 
     def test_frame_list_gets_thumbnails(self, window, qtbot) -> None:
         qtbot.waitUntil(
@@ -1292,13 +1364,24 @@ class TestNarrowPanelFits:
         assert inner.minimumSizeHint().width() <= vp + 1
 
     def test_sliders_use_most_of_panel_width(self, window) -> None:
+        """Řádky jsou single-line (noc III): label + [jezdec | pole]. Jezdec
+        proto nemůže sám zabírat polovinu celého panelu — hlídá se, že JEZDEC
+        S POLEM obsadí většinu šířky (label column je jen kapinka) a jezdec
+        je větší částí páru. Původní nešvar „jezdec do půlky, kolem prázdno"
+        byl právě totéž měřeno: pole tehdy nerostla vůbec."""
         window.resize(1440, 900)
         window.show()
         vp = window.side_scroll.viewport().width()
-        for name in ("sl_ev", "sl_gamma", "sl_toe", "sl_sh"):
-            slider = getattr(window, name)
-            # Jezdec do půlky = nešvar z labelů vlevo; teď zabírá většinu řádku.
-            assert slider.width() > vp * 0.45, (name, slider.width(), vp)
+        pairs = {"sl_ev": "spin_ev", "sl_gamma": "spin_gamma",
+                 "sl_toe": "spin_toe", "sl_sh": "spin_sh"}
+        for sname, spin_name in pairs.items():
+            slider = getattr(window, sname)
+            spin = getattr(window, spin_name)
+            row = slider.width() + spin.width()
+            assert row > vp * 0.45, (sname, row, vp)
+            # Jezdec nesmí zaskočit na sizeHint (původní nešvar);tlusté spin
+            # (±6,00 EV) mu ubere, ale ~¼ panelu musí zůstat.
+            assert slider.width() > vp * 0.22, (sname, slider.width(), vp)
 
     def test_histograms_not_clipped(self, window) -> None:
         window.resize(1440, 900)
@@ -1307,3 +1390,4 @@ class TestNarrowPanelFits:
         for widget in (window.histogram, window.out_histogram):
             assert widget.width() <= vp + 1    # nic nejede za kraj
             assert widget.width() >= vp * 0.8  # a nerosí v proužku
+

@@ -102,6 +102,9 @@ class DevelopProject:
     #: Per-frame render settings (dicts of :class:`RenderParams.to_dict`) by
     #: frame name; loaded from / saved to ``develop_settings.json``.
     frame_settings: dict[str, dict] = field(default_factory=dict)
+    #: Master on/off for the project-wide sharpening (fajfka „Zapnuto",
+    #: order 2026-09-22 night III). Amount/radius survive toggling off.
+    global_sharpen_on: bool = True
     #: Output sharpening for the WHOLE project (unsharp % and radius px).
     #: Operator order 2026-09-22: „přesuň ostření do Exportu a ať funguje
     #: v režimu stejné nastavení pro všechny fotky — tohle se nebude
@@ -343,7 +346,10 @@ class DevelopProject:
         g = data.get("sharpen")
         if isinstance(g, dict):
             # Globální ostření mělo před přestavbou (2026-09-22) per-frame
-            # život; tady je jediná platná kopie.
+            # život; tady je jediná platná kopie. `on` přišlo až s fajfkou
+            # (noc III) — starší soubor bez něj zůstává zapnutý.
+            self.global_sharpen_on = bool(g.get("on",
+                                                self.global_sharpen_on))
             self.global_sharpen = float(g.get("amount",
                                               self.global_sharpen))
             self.global_sharpen_radius = float(
@@ -368,7 +374,8 @@ class DevelopProject:
             "rects": {k: list(v) for k, v in self.manual_rects.items()
                       if v is not None},
             "settings": self.frame_settings,
-            "sharpen": {"amount": self.global_sharpen,
+            "sharpen": {"on": self.global_sharpen_on,
+                        "amount": self.global_sharpen,
                         "radius": self.global_sharpen_radius},
         }
         tmp = self.settings_path().with_suffix(".json.tmp")
