@@ -258,8 +258,29 @@ class DensityView(QWidget):
         if self._image is None:
             return
         self._zoom = self._fit_zoom()
-        self._origin = QPoint(0, 0)
+        self._clamp_origin()      # fit = vycentrovaný, ne vlevo nahoře
         self.zoom_changed.emit(self._zoom)
+
+    def _clamp_origin(self) -> None:
+        """Fotka nesmí zmizet z dohledu (rozkaz 2026-09-22).
+
+        Menší než widget: sedí na střed (při fit tudíž nejde posouvat —
+        tah je mrtvý). Větší: origin ve mezích [widget − obraz, 0], tj.
+        posun končí na okraji fotky, žádná černá za ní."""
+        if self._image is None:
+            self._origin = QPoint(0, 0)
+            return
+        ow = self._image.width() * self._zoom
+        oh = self._image.height() * self._zoom
+        if ow <= self.width():
+            x = (self.width() - ow) / 2.0
+        else:
+            x = min(0.0, max(self.width() - ow, float(self._origin.x())))
+        if oh <= self.height():
+            y = (self.height() - oh) / 2.0
+        else:
+            y = min(0.0, max(self.height() - oh, float(self._origin.y())))
+        self._origin = QPoint(int(round(x)), int(round(y)))
 
     def _apply_zoom(self, new_zoom: float, anchor: QPoint) -> None:
         """Zoom s kotvou pod bodem; pod fit floor se nejdou (rozkaz 2026-09-22)."""
@@ -272,6 +293,7 @@ class DensityView(QWidget):
         map_pt = (anchor - self._origin) / max(self._zoom, 1e-6)
         self._zoom = new_zoom
         self._origin = anchor - map_pt * new_zoom
+        self._clamp_origin()
         self._user_zoomed = new_zoom > floor + 1e-9
         self.zoom_changed.emit(self._zoom)
         self.update()
@@ -329,9 +351,10 @@ class DensityView(QWidget):
     # ------------------------------------------------------------- eventos
 
     def wheelEvent(self, event) -> None:  # noqa: N802
-        # Rozkaz 2026-09-22: scrollování touchpadem POSUNUJE; zoom dělá pinch
-        # (native gesture níže) — kolečko samo o sobě už nezvětšuje.
-        # Ctrl/Cmd+kolečko zůstává záchrana pro myš bez touchpadu.
+        # Rozkazy 2026-09-22: zoom dělá JEN pinch (native gesture níže) a
+        # Ctrl/Cmd+kolečko jako záchrana pro myš; posun dělá JEN tažení
+        # myší. Dvouscroll touchpadu tudíž nebývá nic — dřív posouval a
+        # operátor si stěžoval, že mu fotka ujíždí sama.
         if self._image is None:
             return
         mods = event.modifiers()
@@ -340,11 +363,7 @@ class DensityView(QWidget):
             factor = 1.25 if event.angleDelta().y() > 0 else 0.8
             self._apply_zoom(self._zoom * factor,
                              event.position().toPoint())
-            return
-        dx = event.pixelDelta().x() or event.angleDelta().x() // 8
-        dy = event.pixelDelta().y() or event.angleDelta().y() // 8
-        self._origin += QPoint(dx, dy)
-        self.update()
+        event.accept()
 
     def event(self, ev) -> bool:
         # macOS pinch (trackpad, Magic Mouse) posílá QNativeGestureEvent —
@@ -375,6 +394,7 @@ class DensityView(QWidget):
             self.update()
         elif self._drag_pan_from is not None:
             self._origin = self._pan_origin + (pos - self._drag_pan_from)
+            self._clamp_origin()   # na konci dráhy fotka stojí, žádná černá
             self.update()
         self._emit_hover(pos)
 
@@ -421,6 +441,9 @@ class DensityView(QWidget):
         if self._zoom < floor - 1e-9:
             cx = QPoint(self.width() // 2, self.height() // 2)
             self._apply_zoom(floor, cx)
+        else:
+            self._clamp_origin()  # po změně rozměru musí fotka znova do mezí
+            self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -474,8 +497,12 @@ class DensityHistogramWidget(QWidget):
 
     * histogram -- kde v obraze *jsou* data (odpověď na „v jakém rozsahu
       fotka je"); logaritmická výška, ať i slabá mása není neviditelná,
-    * svislé čáry Dmin (šedá) a Dmax (oranžová) -- kde jsem *řekl*, že rozsah
-      je; mimosvět mezi nimi je na tisku mrtvá zóna,
+    * svislé čáry Dmin (azurová) a Dmax (žlutá) -- kde jsem *řekl*, že rozsah
+      je; pod každou čárou je její hodnota a podíl pixelů, které za ni
+      přeteknou (pod Dmin = černý řez, nad Dmax = bílý řez). Text pod
+      histogramem byl nečitelný a duplicitní (rozkaz 2026-09-22: vše
+      dovnitř); statistika se počítá jen z ROI -- kovový rámec držáku do
+      ní nepatří,
     * bílá křivka -- diagnostika tónové mapy: kam který D dopadá v lineárním
       pozitivu (0 = černá, 1 = bílá), včetně expozice a stínového pásu.
       BEZ zobrazovací gammy (dokument 07): zobrazovací transfer patří do
@@ -483,13 +510,15 @@ class DensityHistogramWidget(QWidget):
       jinak v ní uživatel vidí hrb monitorové charakteristiky.
 
     ±inf hustoty se kreslí jako plné sloupce na kolejnicích (vlevo −inf =
-    přepal, vpravo +inf = neprostupno) a NaN („bez světla") jen jako číslo --
-    ani jedno nemá vlastní hustotu, ale operátor o něm musí vědět.
+    přepal, vpravo +inf = neprostupno); NaN („bez světla") se vypíše vpravo
+    nahoře jen když nenulový -- ani jedno nemá vlastní hustotu, ale operátor
+    o něm musí vědět.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._hist: np.ndarray | None = None
+        self._d_arr: np.ndarray | None = None   # reference pro řezové podíly
         self._xmin = 0.0
         self._xmax = 3.2
         self._params: rnd.RenderParams | None = None
@@ -505,8 +534,11 @@ class DensityHistogramWidget(QWidget):
     def set_density(self, d: np.ndarray | None) -> None:
         if d is None:
             self._hist = None
+            self._d_arr = None
             self.update()
             return
+        self._d_arr = d      # reference (ne kopie) -- percentila i řezové
+        # podíly se počítají až při kresbě, kdy už známe dmin/dmax z params.
         # Osa se oběma směry přizpůsobí datům (i záporná D pod film base --
         # dřív se ořezala na nulu a data vlevo se "řízla"), ale nikdy se
         # ztenčí pod D_HIST_MIN_SPAN, aby škála neukazovala data jako proužek.
@@ -537,6 +569,67 @@ class DensityHistogramWidget(QWidget):
         w = self.width()
         span = max(self._xmax - self._xmin, 1e-9)
         return int(np.clip((d_val - self._xmin) / span, 0.0, 1.0) * (w - 1))
+
+    def _cut_fraction(self, d_val: float, below: bool) -> float | None:
+        """Podíl pixelů ROI pod Dmin / nad Dmax (řezové kolik vyříznu).
+
+        ±inf i NaN do jmenovatele nepatří (řez je otázka pro měřenou część);
+        NaN hlásí vlastní číslici vpravo nahoře."""
+        if self._d_arr is None:
+            return None
+        fin = self._d_arr[np.isfinite(self._d_arr)]
+        if fin.size == 0:
+            return None
+        frac = (fin < d_val) if below else (fin > d_val)
+        return float(frac.mean())
+
+    def _draw_scale_label(self, p: QPainter, x: int, name: str,
+                          d_val: float, below: bool) -> None:
+        """Tři řádky pod čárou: Dmin / 0,432 / <18,9 % — u samotné čáry.
+
+        Dmax label zrcadlí dovnitř (vpravo od čáry by přetekl přes kraj);
+        Dmin zrcadlí doprostřed, když sedí na levé kolejnici."""
+        cut = self._cut_fraction(d_val, below)
+        lines = (name, f"{d_val:.3f}".replace(".", ","),
+                 ("<" if below else ">")
+                 + (f"{cut * 100:.1f} %" if cut is not None else "?"))
+        p.setPen(QColor(200, 200, 200))
+        # Pod čárou, začíná až pod hlavičkou (p50/NaN řádek má horních 12 px).
+        y = 30
+        for t in lines:
+            if x > self.width() // 2:
+                p.drawText(QRect(x - 46, y, 43, 12),
+                           Qt.AlignmentFlag.AlignRight, t)
+            else:
+                p.drawText(QRect(x + 3, y, 46, 12),
+                           Qt.AlignmentFlag.AlignLeft, t)
+            y += 12
+
+    def _draw_summary(self, p: QPainter, w: int) -> None:
+        """Střední hodnota (p50) uprostřed nahoře + NaN vpravo (rozkaz:
+        text pod histogramem je spotřebovaný — percentily jedou dovnitř).
+
+        p50 se kreslí jako tečkovaná svislá linka — u filmového histogramu
+        'prostřed' nic neznamená bez vizuálního kotviště; linka ukáže, jestli
+        je mediál vlevo (podexpozice) nebo uprostřed. Číselná hodnota je
+        vedle ní v hlavičce, nikdy ne přes Data."""
+        s = self._stats
+        p50 = s.get("d_p50", float("nan"))
+        if np.isfinite(p50):
+            x = self._d_to_x(p50)
+            p.setPen(QPen(QColor(255, 140, 0, 160), 1,
+                          Qt.PenStyle.DotLine))
+            p.drawLine(x, 13, x, self.height())
+            p.setPen(QColor(255, 180, 100))
+            mid = w // 2
+            p.drawText(QRect(mid - 60, 0, 120, 12),
+                       Qt.AlignmentFlag.AlignCenter,
+                       f"p50 {self._fmt1(p50)}")
+        if self._nan_fraction > 0:
+            p.setPen(QColor(180, 180, 180))
+            p.drawText(QRect(w - 96, 0, 94, 12),
+                       Qt.AlignmentFlag.AlignRight,
+                       f"bez světla {self._nan_fraction * 100:.1f} %")
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -570,15 +663,21 @@ class DensityHistogramWidget(QWidget):
         p.drawPolyline(QPolygon(pts[1:-1]))
 
         if self._params is not None:
-            # Body stupně.
-            for d_val, color, label in (
-                    (self._params.dmin, QColor(0, 220, 255), "Dmin"),
-                    (self._params.dmax, QColor(255, 170, 0), "Dmax")):
+            # Body stupně: azurová Dmin, žlutá Dmax (barvy ROI rámečku i
+            # výstražných overlayů). Pod čárou název, hodnota a podíl pixelů
+            # za ní (< dmin = černý řez, > dmax = bílý řez) -- veškerý text,
+            # který dřív stál pod grafem (nečitelný), žije tady uvnitř.
+            pens = (QPen(QColor(0, 220, 255), 1, Qt.PenStyle.DashLine),
+                    QPen(QColor(255, 210, 0), 1, Qt.PenStyle.DashLine))
+            for (d_val, color, name, below), pen in zip(
+                    ((self._params.dmin, QColor(0, 220, 255), "Dmin", True),
+                     (self._params.dmax, QColor(255, 210, 0), "Dmax", False)),
+                    pens):
                 x = self._d_to_x(d_val)
-                pen = QPen(color, 1, Qt.PenStyle.DashLine)
                 p.setPen(pen)
                 p.drawLine(x, 0, x, h)
-                p.drawText(x + 3, 12, label)
+                self._draw_scale_label(p, x, name, d_val, below)
+            self._draw_summary(p, w)
             # Promítnutá křivka: jaký D -> jaký tisk (vč. expozice i stínového
             # pásu; positive_x je jedný zdroj pravdy pro obě osy). Jen DO
             # lineárního pozitivu -- bez display gammy (dokument 07): bílá
@@ -605,23 +704,6 @@ class DensityHistogramWidget(QWidget):
         if self._pos_inf_fraction > 0:
             bw = max(3, int(np.sqrt(self._pos_inf_fraction) * w * 0.5))
             p.fillRect(w - bw, 0, bw, h, QColor(0, 120, 255, 150))
-
-    def stats_text(self) -> str:
-        """Číselné konto pod histogramem: percentily + koš na kolejnicích.
-
-        Vytaženo z překreslení do samostatného labelu — histogram je v pravém
-        panelu malý a text přes data by byl nečitelný.
-        "přepal" = D -inf (senz. na maximu) -> v pozitivu černá;
-        "hustší než škála" = D +inf -> v pozitivu bílá.
-        """
-        s = self._stats
-        if not s or not np.isfinite(s.get("d_p50", float("nan"))):
-            return "—"
-        return (f"D min/p50/p99 {self._fmt1(s['d_min'])}/"
-                f"{self._fmt1(s['d_p50'])}/{self._fmt1(s['d_p99'])}"
-                f" · přepal(→černá) {self._neg_inf_fraction * 100:.2f} %"
-                f" · nad škálu(→bílá) {self._pos_inf_fraction * 100:.2f} %"
-                f" · bez světla {self._nan_fraction * 100:.1f} %")
 
     @staticmethod
     def _fmt1(v: float) -> str:
@@ -744,9 +826,17 @@ class OutputHistogramWidget(QWidget):
             p.setPen(QPen(QColor(255, 140, 0), 2))
             p.drawLine(cx, 0, cx, h)
 
-        p.setPen(QColor(200, 200, 200))
-        p.drawText(6, 12, f"výstup (výřez) · podčerně {self._lo_pct:.1f} %"
-                          f" · saturace {self._hi_pct:.1f} %")
+        # Rolová procenta místo titulkového textu (rozkaz 2026-09-22):
+        # "výstup (výřez)" je zbytečný (z výřezu jsou teď oba grafy),
+        # pojmenovávat se nemá -- jen čísla, barvou podle exposure
+        # warning overlaye: stíny modře vlevo, světla červeně vpravo.
+        if self._lo_pct > 0:
+            p.setPen(QColor(90, 160, 255))
+            p.drawText(6, 12, f"{self._lo_pct:.1f} %")
+        if self._hi_pct > 0:
+            p.setPen(QColor(255, 90, 90))
+            p.drawText(QRect(w - 66, 0, 60, 12),
+                       Qt.AlignmentFlag.AlignRight, f"{self._hi_pct:.1f} %")
 
 
 class MainWindow(QMainWindow):
@@ -772,10 +862,22 @@ class MainWindow(QMainWindow):
         self.btn_open.clicked.connect(self.choose_folder)
         lv.addWidget(self.btn_open)
         self.frame_list = QListWidget()
+        self.frame_list.setViewMode(QListWidget.ViewMode.IconMode)
+        # Název POD náhledem (rozkaz 2026-09-22): vedle ikony by panel musel
+        # být široký jako náhled+popisek. Static = žádné ruční přeskupování,
+        # Adjust = layout se přizpůsobí resize panelu.
+        self.frame_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.frame_list.setMovement(QListWidget.Movement.Static)
+        self.frame_list.setWordWrap(True)
+        # Mřížka = ikona + dva řádky popisku pod ni; panel stačí široký jako
+        # náhled, ne náhled+popisek (88 px ikona + pár px dech).
+        self.frame_list.setGridSize(QSize(THUMB_ICON.width() + 20,
+                                          THUMB_ICON.height() + 36))
+        self.frame_list.setSpacing(4)
         self.frame_list.currentItemChanged.connect(self._frame_selected)
         lv.addWidget(self.frame_list, 1)
-        self.lbl_dmin = QLabel("Dmin: —")
-        lv.addWidget(self.lbl_dmin)
+        # (lbl_dmin pry — rozkaz 2026-09-22: hodnota je vidět na azurové
+        # čáře uvnitř histogramu i v Dmin spinu, tady jen zabírala místo.)
         self.lbl_orient = QLabel("Orientace: 1:1")
         lv.addWidget(self.lbl_orient)
         splitter.addWidget(left)
@@ -827,9 +929,8 @@ class MainWindow(QMainWindow):
         sv = QVBoxLayout(side)
         self.histogram = DensityHistogramWidget()
         sv.addWidget(self.histogram)
-        self.lbl_hist_stats = QLabel("—")
-        self.lbl_hist_stats.setWordWrap(True)
-        sv.addWidget(self.lbl_hist_stats)
+        # (stats řádek pod histogramem pry — rozkaz 2026-09-22: veškeré
+        # číslo přesunuto dovnitř grafu, ke čárám Dmin/Dmax a nad peak.)
         self.out_histogram = OutputHistogramWidget()
         sv.addWidget(self.out_histogram)
         # (status řádek tu byl — uživatel 2026-09-21 večer „celé to dej pryč":
@@ -892,7 +993,8 @@ class MainWindow(QMainWindow):
         return sp
 
     def _bind_row(self, form: QFormLayout, name: str, slider: QSlider,
-                  spin: QDoubleSpinBox, scale: float = 100.0) -> None:
+                  spin: QDoubleSpinBox, scale: float = 100.0,
+                  remember: bool = True) -> None:
         """Řádek «jezdec | editovatelné pole» — hodnota je napravo, ne pod.
 
         Obousměrné spojení v celých číslech: obě páčky mají rozlišení 1/scale,
@@ -921,7 +1023,11 @@ class MainWindow(QMainWindow):
 
         slider.valueChanged.connect(s2p)
         spin.valueChanged.connect(p2s)
-        spin.valueChanged.connect(self._setting_changed)
+        if remember:
+            spin.valueChanged.connect(self._setting_changed)
+        else:
+            # Ostření: project-level, ne per-frame (rozkaz 2026-09-22).
+            spin.valueChanged.connect(self._global_sharpen_changed)
         # V úzkém panelu (WrapAllRows) má řádek patřit jezdci: spin ataka
         # AllNonFixedFieldsGrow neroste sám od sebe, jezdec bez explicitní
         # Expanding politiky zůstal na sizeHintu — "slidery jen do půlky"
@@ -1073,33 +1179,12 @@ class MainWindow(QMainWindow):
         self.spin_br = self._spin(-0.5, 0.5, 0.0, 0.01)
         self.sl_ct = self._slider(10, 400, 100)       # 0,10 … 4,00
         self.spin_ct = self._spin(0.1, 4.0, 1.0, 0.01)
-        # Ostření = poslední krok řetězce (unsharp mask na display pixelech).
-        # Photoshop konvence (rozkaz 2026-09-22): Množství v PROCENTECH
-        # 0…200 %, Poloměr v PIXELS — absolutní, co sedí na 100 % zoomu,
-        # to jede do exportu. Konzervativní předvolba 20 % / 1,0 px;
-        # nastavení uložená před ostřením berou totéž (fallbacky from_dict
-        # = defaulty polí), operátorovo vypnutí je explicitní nula a ta drží.
-        self.sl_sh = self._slider(0, 200, 20)          # 0 … 200 %
-        self.spin_sh = self._spin(0.0, 200.0, 20.0, 1.0, decimals=0,
-                                  suffix=" %")
-        self.sl_shr = self._slider(0, 20, 10)          # 0,0 … 2,0 px (po 0,1)
-        self.spin_shr = self._spin(0.0, 50.0, 1.0, 0.1, decimals=1,
-                                   suffix=" px")
         form.addRow("Display gamma", QLabel("2,2 — dáno profilem"))
         self._bind_row(form, "Jas (display)", self.sl_br, self.spin_br)
         self._bind_row(form, "Kontrast (display)", self.sl_ct, self.spin_ct)
-        self._bind_row(form, "Ostření (unsharp)", self.sl_sh, self.spin_sh,
-                       scale=1.0)
-        self._bind_row(form, "Poloměr ostření [px]", self.sl_shr,
-                       self.spin_shr, scale=10.0)
-        self.spin_sh.setToolTip("Množství ostření (unsharp mask) v procentech "
-                                "jako ve Photoshopu. Konzervativních 10–30 % "
-                                "prokreslí hrany bez bílých lemov; 0 vypíná. "
-                                "Předvolba Proposalu je 20 %.")
-        self.spin_shr.setToolTip("Poloměr Gaussovy masky v pixelech — jako "
-                                 "ve Photoshopu. Malý poloměr (0,5–1,5 px) "
-                                 "opatrně zvedne detail; nad ~3 px rostou "
-                                 "bílá lemování kolem hran.")
+        # (Ostření tu bývalo — rozkaz 2026-09-22: „přesuň do menu Export
+        # a ať funguje v režimu stejné nastavení pro všechny fotky"; je to
+        # vlastnost výstupu celého projektu, ne snímku. Viz _build_export_box.)
         return box
 
     #: Formáty exportu: (popisek combo, metoda). Popisky říkají bitovou hloubku
@@ -1168,6 +1253,37 @@ class MainWindow(QMainWindow):
         border_row.addWidget(self.spin_border)
         border_row.addStretch(1)
         h.addLayout(border_row)
+        # Ostření = poslední krok řetězce (unsharp mask na display pixelech),
+        # od 2026-09-22 tady a GLOBÁLNÍ: „přesuň do menu Export a ať funguje
+        # v režimu stejné nastavení pro všechny fotky — tohle se nebude
+        # upravovat per fotka". Hodnoty žijí v project.global_sharpen*, ne
+        # v per-frame dictu; Photoshop konvence 0–200 % / px, předvolba 20 %.
+        # (stejná pravidla jako _narrow_form — box už ale vlastní QVBoxLayout,
+        # form se musí vložit do něj, ne na něj)
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        h.addLayout(form)
+        self.sl_sh = self._slider(0, 200, 20)          # 0 … 200 %
+        self.spin_sh = self._spin(0.0, 200.0, 20.0, 1.0, decimals=0,
+                                  suffix=" %")
+        self.sl_shr = self._slider(0, 20, 10)          # 0,0 … 2,0 px (po 0,1)
+        self.spin_shr = self._spin(0.0, 50.0, 1.0, 0.1, decimals=1,
+                                   suffix=" px")
+        self._bind_row(form, "Ostření (unsharp)", self.sl_sh, self.spin_sh,
+                       scale=1.0, remember=False)
+        self._bind_row(form, "Poloměr ostření [px]", self.sl_shr,
+                       self.spin_shr, scale=10.0, remember=False)
+        self.spin_sh.setToolTip("Množství ostření (unsharp mask) v procentech "
+                                "jako ve Photoshopu — PRO VŠECHNY SNÍMKY "
+                                "stejně. 10–30 % prokreslí hrany bez bílých "
+                                "lemov; 0 vypíná.")
+        self.spin_shr.setToolTip("Poloměr Gaussovy masky v pixelech — jako "
+                                 "ve Photoshopu. Malý poloměr (0,5–1,5 px) "
+                                 "opatrně zvedne detail; nad ~3 px rostou "
+                                 "bílá lemování kolem hran.")
         return box
 
     def _border_px(self) -> int:
@@ -1229,10 +1345,16 @@ class MainWindow(QMainWindow):
         self._dmin_auto = project.dmin_auto()
         if self._dmin_auto is not None:
             self.spin_dmin.setValue(round(self._dmin_auto, 3))
-            self.lbl_dmin.setText(f"Dmin z měření: {self._dmin_auto:.3f} D")
         else:
-            self.lbl_dmin.setText("Dmin: bez měření — zadej ručně")
             self.chk_dmin_auto.setChecked(False)
+        # Globální ostření (Export box) se načítá jednou ze projektu —
+        # per-snímkové přepínání do něj nesahá (rozkaz 2026-09-22).
+        self._loading = True
+        try:
+            self.spin_sh.setValue(project.global_sharpen)
+            self.spin_shr.setValue(project.global_sharpen_radius)
+        finally:
+            self._loading = False
         self.lbl_orient.setText("Orientace: " + self._orientation_text())
         if self.frame_list.count():
             self.frame_list.setCurrentRow(0)
@@ -1325,11 +1447,32 @@ class MainWindow(QMainWindow):
                                   dmin_manual=self._dmin_auto is None)
         finally:
             self._loading = False
-        self.histogram.set_density(d)
-        self.lbl_hist_stats.setText(self.histogram.stats_text())
+        self._update_density_histogram()
         self.btn_export.setEnabled(True)
         self.btn_export_all.setEnabled(True)
         self.rerender()
+
+    def _update_density_histogram(self) -> None:
+        """Horní histogram jen z výřezu (rozkaz 2026-09-22).
+
+        „Nezajímá mě histogram kovového rámečku" — statistika i řezové podíly
+        se počítají z ROI, ne z celého senzoru. Uložený ROI je v souřadnicích
+        senzoru a `self._density` taky, žádné převody. Bez ROI zbývá celý
+        snímek — tam se ořezat nedá."""
+        if self._density is None or self.project is None:
+            self.histogram.set_density(None)
+            return
+        d = self._density[0]
+        rect = None
+        if self._current is not None:
+            rect = self.project.rect_for(self.project.entry(self._current))
+        if rect is not None:
+            x0, y0, x1, y1 = rect
+            h, w = d.shape
+            x0, y0 = max(0, min(x0, w - 1)), max(0, min(y0, h - 1))
+            x1, y1 = max(x0 + 1, min(x1, w)), max(y0 + 1, min(y1, h))
+            d = d[y0:y1, x0:x1]
+        self.histogram.set_density(d)
 
     # ----------------------------------------------------------- parametry
 
@@ -1390,11 +1533,10 @@ class MainWindow(QMainWindow):
         self.spin_br.setValue(params.brightness)
         self.sl_ct.setValue(int(round(params.contrast * 100)))
         self.spin_ct.setValue(params.contrast)
-        # sharpen je uz primo v procentech, radius v px (scale 10 = 0,1 krok)
-        self.sl_sh.setValue(int(round(params.sharpen)))
-        self.spin_sh.setValue(params.sharpen)
-        self.sl_shr.setValue(int(round(params.sharpen_radius * 10)))
-        self.spin_shr.setValue(params.sharpen_radius)
+        # (Ostření se tu nenačítá — je globální pro celý projekt, sedí v
+        # Export boxu a jego hodnoty drží project.global_sharpen*; při
+        # přepnutí snímku se mají zachovat, ne přepisovat per-frame dictem.
+        # Nastavuje se jednou v set_project. Rozkaz 2026-09-22.)
         self.spin_dmin.setEnabled(not self.chk_dmin_auto.isChecked())
         self.spin_dmax.setEnabled(not self.chk_dmax_auto.isChecked())
 
@@ -1420,8 +1562,13 @@ class MainWindow(QMainWindow):
         )
 
     def _settings_payload(self) -> dict:
-        """Uložená podoba parametrů: RenderParams + jestli byl Dmin ruční."""
+        """Uložená podoba parametrů: RenderParams + jestli byl Dmin ruční.
+
+        Ostření se vyhazuje — žije JAKO projektová hodnota `sharpen`
+        (řád 2026-09-22); per-frame kopie by byla mátlící duplicita."""
         d = self.current_params().to_dict()
+        d.pop("sharpen", None)
+        d.pop("sharpen_radius", None)
         d["dmin_manual"] = not self.chk_dmin_auto.isChecked()
         return d
 
@@ -1436,6 +1583,16 @@ class MainWindow(QMainWindow):
         if self.project is not None and self._current is not None:
             self.project.frame_settings[self._current] = self._settings_payload()
             self.project.save_settings()
+
+    def _global_sharpen_changed(self, *_a) -> None:
+        """Ostření je vlastnost celého exportu, ne snímku (rozkaz 2026-09-22):
+        uloží se do project-level klíče a přerekne jen náhled."""
+        if self._loading or self.project is None:
+            return
+        self.project.global_sharpen = self.spin_sh.value()
+        self.project.global_sharpen_radius = self.spin_shr.value()
+        self.project.save_settings()
+        self.rerender()
 
     def apply_defaults(self) -> None:
         """Vehne snímku Proposal (auto body, přirozená křivka) -- i později."""
@@ -1540,8 +1697,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             self.statusBar().showMessage(f"Chyba měření: {exc}")
             return
-        self.histogram.set_density(self._density[0])
-        self.lbl_hist_stats.setText(self.histogram.stats_text())
+        self._update_density_histogram()
         self.rerender()
 
     # -------------------------------------------------------------- status

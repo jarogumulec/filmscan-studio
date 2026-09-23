@@ -30,6 +30,8 @@ The capture GUI (PySide6, Czech UI) drives the camera and builds **one project
 folder per film strip**. Inside the app, work through the boxes in this
 sequence — each step produces calibration that the develop step needs:
 
+![filmscan-studio - capture app](studio.jpg)
+
 1. **Nový film** — film metadata (stock, ID, developer, dates, orientation…).
 2. **Dark Frame** — sensor dark current with the light path capped.
 3. **Flat Field** — illumination without film (divides out vignetting/dust).
@@ -62,6 +64,8 @@ push/pull, expiry, per-frame 90° rotation. Everything is written into the JSON
 sidecars — the develop step reads it back and burns it into the exported
 files' EXIF/XMP.
 
+![filmscan-annotate - annotation app](annotate.jpg)
+
 ### 3. Develop — `uv run filmscan-develop-gui [folder]`
 
 The "developer" opens the density archive and renders the **positive**
@@ -78,6 +82,8 @@ The tone-curve model is a Fritsch–Carlson spline filmic curve, designed with
 [darktable's **negadoctor**](https://github.com/darktable-org/darktable) module
 as the inspiration/checked counterpart (our own density-based take on it —
 see `Documentation_image_processing/02_rozbor_negadoctor.md`).
+
+![filmscan-develop-gui](develop.jpg)
 
 **Tuning order** (full walkthrough in
 [`Documentation_image_processing/08_ui_ladeni_dmin_dmax_a_krivky.md`](Documentation_image_processing/08_ui_ladeni_dmin_dmax_a_krivky.md)):

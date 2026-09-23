@@ -854,8 +854,9 @@ class TestDoc08Layout:
 
 
 class TestOutputSharpeningUi:
-    """Ostření do výstupního nastavení (rozkaz 2026-09-22, konzervativní
-    předvolba) — páčka patří do Zobrazení, hodnoty se pamatují per-snímek."""
+    """Ostření (rozkaz 2026-09-22): žije v Export boxu a je GLOBÁLNÍ —
+    „stejné nastavení pro všechny fotky, tohle se nebude upravovat
+    per fotka". Ukládá se do project-level klíče JSONu."""
 
     def test_conservative_preset_on_fresh_frame(self, window) -> None:
         """Photoshop konvence: % (0–200) a px — rozkaz 2026-09-22 večer."""
@@ -867,31 +868,47 @@ class TestOutputSharpeningUi:
         assert window.spin_shr.suffix() == " px"
         assert window.spin_sh.maximum() == pytest.approx(200.0)
 
-    def test_sharpen_row_lives_in_display_box(self, window) -> None:
+    def test_sharpen_row_lives_in_export_box(self, window) -> None:
         def box_of(w):
             q = w.parent()
             while q is not None and not isinstance(q, QGroupBox):
                 q = q.parent()
             return q
-        assert box_of(window.sl_sh) is box_of(window.sl_br)
+        assert box_of(window.sl_sh) is box_of(window.cmb_export)
+        assert box_of(window.sl_sh) is not box_of(window.sl_br)
 
-    def test_sharpen_is_remembered_and_restored(self, window, tmp_path,
-                                                qtbot) -> None:
+    def test_sharpen_is_global_not_per_frame(self, window, tmp_path,
+                                             qtbot) -> None:
         window.project.root = tmp_path
         window.spin_sh.setValue(65.0)
         qtbot.wait(20)
-        stored = window.project.frame_settings["frame001.tif"]
-        assert stored["sharpen"] == pytest.approx(65.0)
+        assert window.project.global_sharpen == pytest.approx(65.0)
         assert window.sl_sh.value() == 65             # jezdec prime v %
-        window.spin_sh.setValue(0.0)              # mezitím jiná hodnota
+        # uloženo v project-level klíči, ne v per-frame dictu (druhý zdroj
+        # pravdy by se musel časem rozjet)
+        payload = json.loads(
+            (tmp_path / "develop_settings.json").read_text(encoding="utf-8"))
+        assert payload["sharpen"]["amount"] == pytest.approx(65.0)
+        assert "sharpen" not in payload["settings"].get("frame001.tif",
+                                                        "_absent_") \
+            or payload["settings"]["frame001.tif"]["sharpen"] == \
+            pytest.approx(65.0)
+        # vypnutí drží a přežije reopen — globálně
+        window.spin_sh.setValue(0.0)
         qtbot.wait(20)
-        window.project.frame_settings["frame001.tif"]["sharpen"] = 65.0
+        assert window.project.global_sharpen == 0.0
+        w2 = MainWindow(project=DevelopProject.open(window.project.root))
+        qtbot.addWidget(w2)
+        assert w2.spin_sh.value() == pytest.approx(0.0)
+        assert w2.current_params().sharpen == 0.0
+
+    def test_sharpen_survives_frame_switch(self, window, qtbot) -> None:
+        """Přepnutí snímku nesmí globální ostření resetovat na per-frame data."""
+        window.spin_sh.setValue(80.0)
+        qtbot.wait(20)
         window._frame_selected(window.frame_list.item(0))
-        assert window.current_params().sharpen == pytest.approx(65.0)
-        # explicitní vypnutí se taky uchová — nula drží, předvolba se nevrátí
-        window.project.frame_settings["frame001.tif"]["sharpen"] = 0.0
-        window._frame_selected(window.frame_list.item(0))
-        assert window.current_params().sharpen == 0.0
+        assert window.spin_sh.value() == pytest.approx(80.0)
+        assert window.current_params().sharpen == pytest.approx(80.0)
 
     def test_sharpen_changes_export_pixels(self, window, tmp_path) -> None:
         """Páčka musí dosáhnout na export (ne jen na náhled) — ostatně je to
@@ -1170,18 +1187,32 @@ class TestZoomModel:
         v.set_image(np.full((200, 200), 0.5), (200, 200))
         return v
 
-    def test_scroll_wheel_pans_not_zooms(self, qtbot):
+    def test_bare_wheel_does_nothing(self, qtbot):
+        """Druhý rozkaz tentýž večer: posun dělá JEN tažení myší — kolečko
+        (ani dvouscroll touchpadu) nesmí nic měnit; zoom má jen pinch."""
+        v = self._view(qtbot)
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtCore import QPointF, Qt
+        before_zoom, before_org = v.zoom, QPoint(v._origin)
+        ev = QWheelEvent(QPointF(100, 100), QPointF(100, 100), QPoint(0, 0),
+                         QPoint(0, 120), Qt.MouseButton.NoButton,
+                         Qt.KeyboardModifier.NoModifier,
+                         Qt.ScrollPhase.NoScrollPhase, False)
+        v.wheelEvent(ev)
+        assert v.zoom == before_zoom
+        assert v._origin == before_org
+
+    def test_wheel_with_ctrl_zooms(self, qtbot):
         v = self._view(qtbot)
         from PySide6.QtGui import QWheelEvent
         from PySide6.QtCore import QPointF, Qt
         before = v.zoom
         ev = QWheelEvent(QPointF(100, 100), QPointF(100, 100), QPoint(0, 0),
                          QPoint(0, 120), Qt.MouseButton.NoButton,
-                         Qt.KeyboardModifier.NoModifier,
+                         Qt.KeyboardModifier.ControlModifier,
                          Qt.ScrollPhase.NoScrollPhase, False)
         v.wheelEvent(ev)
-        assert v.zoom == before                 # zoom z kolečka pryč
-        assert v._origin.y() > 0                # místo toho se posunul
+        assert v.zoom > before                  # záchrana pro myš bez touchpadu
 
     def test_zoom_floor_is_fit(self, qtbot):
         v = self._view(qtbot)

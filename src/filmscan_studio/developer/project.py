@@ -102,6 +102,13 @@ class DevelopProject:
     #: Per-frame render settings (dicts of :class:`RenderParams.to_dict`) by
     #: frame name; loaded from / saved to ``develop_settings.json``.
     frame_settings: dict[str, dict] = field(default_factory=dict)
+    #: Output sharpening for the WHOLE project (unsharp % and radius px).
+    #: Operator order 2026-09-22: „přesuň ostření do Exportu a ať funguje
+    #: v režimu stejné nastavení pro všechny fotky — tohle se nebude
+    #: upravovat per fotka". Žije vedle rects/settings ve stejném JSONu a
+    #: jde do každého renderu, bez ohledu na per-frame dict.
+    global_sharpen: float = 20.0
+    global_sharpen_radius: float = 1.0
     #: Film orientation as recorded by the capture app (``project.json`` ->
     #: ``film``). The density archive stays raw sensor orientation; only
     #: renders (preview + exports) flip by these flags.
@@ -333,6 +340,26 @@ class DevelopProject:
         self.frame_settings.update(
             {k: dict(v) for k, v in (data.get("settings") or {}).items()
              if isinstance(v, dict)})
+        g = data.get("sharpen")
+        if isinstance(g, dict):
+            # Globální ostření mělo před přestavbou (2026-09-22) per-frame
+            # život; tady je jediná platná kopie.
+            self.global_sharpen = float(g.get("amount",
+                                              self.global_sharpen))
+            self.global_sharpen_radius = float(
+                g.get("radius", self.global_sharpen_radius))
+        else:
+            # Starý formát: ostření žilo per-frame. Přebírá se první
+            # per-frame hodnota lišící se od předvolby — explicitní vypnutí
+            # (nula) tak migrací nepřijde o zvyk; bez odlišení zůstává 20 %.
+            for fs in self.frame_settings.values():
+                v = fs.get("sharpen")
+                if v is not None and float(v) != 20.0:
+                    self.global_sharpen = float(v)
+                    r = fs.get("sharpen_radius")
+                    if r is not None:
+                        self.global_sharpen_radius = float(r)
+                    break
 
     def save_settings(self) -> None:
         """Write rects + all known per-frame settings (atomic-ish replace)."""
@@ -341,6 +368,8 @@ class DevelopProject:
             "rects": {k: list(v) for k, v in self.manual_rects.items()
                       if v is not None},
             "settings": self.frame_settings,
+            "sharpen": {"amount": self.global_sharpen,
+                        "radius": self.global_sharpen_radius},
         }
         tmp = self.settings_path().with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
