@@ -538,7 +538,7 @@ class TestExposureSpin:
     def test_spin_accepts_off_step_value(self, window) -> None:
         window.spin_ev.setValue(0.15)
         assert window.current_params().exposure_ev == pytest.approx(0.15)
-        # jezdec se prisune na nejbлиžnich 5 ticku (0,05)
+        # jezdec se prisune na nejblizsic 5 ticku (0,05)
         assert window.sl_ev.value() == 15
 
     def test_slider_drives_spin(self, window) -> None:
@@ -1157,3 +1157,122 @@ class TestExportMetadata:
         window.project.frames[0].record = {"annotation": {"rating": "blbost"}}
         window.save_jpeg()                        # nesmí vyhodit
         assert (tmp_path / "derived" / "frame001.jpg").exists()
+
+
+class TestZoomModel:
+    """Rozkaz 2026-09-22 noc: fit je podlaha, 100 % na dosah, scroll posunuje."""
+
+    def _view(self, qtbot):
+        from filmscan_studio.developer.gui import DensityView
+        v = DensityView()
+        qtbot.addWidget(v)
+        v.resize(400, 300)
+        v.set_image(np.full((200, 200), 0.5), (200, 200))
+        return v
+
+    def test_scroll_wheel_pans_not_zooms(self, qtbot):
+        v = self._view(qtbot)
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtCore import QPointF, Qt
+        before = v.zoom
+        ev = QWheelEvent(QPointF(100, 100), QPointF(100, 100), QPoint(0, 0),
+                         QPoint(0, 120), Qt.MouseButton.NoButton,
+                         Qt.KeyboardModifier.NoModifier,
+                         Qt.ScrollPhase.NoScrollPhase, False)
+        v.wheelEvent(ev)
+        assert v.zoom == before                 # zoom z kolečka pryč
+        assert v._origin.y() > 0                # místo toho se posunul
+
+    def test_zoom_floor_is_fit(self, qtbot):
+        v = self._view(qtbot)
+        v._apply_zoom(0.001, QPoint(50, 50))    # marná snaha o zmenšení
+        assert v.zoom == v._fit_zoom()
+        assert v.zoom > 0.05                    # MIN_ZOOM pod fit neplatí
+
+    def test_show_100_and_header(self, window):
+        window.view.resize(400, 300)
+        window.view.show_100()
+        assert window.view.zoom == pytest.approx(1.0)
+        assert "100" in window.lbl_zoom.text()
+        window.view.show_fit()
+        assert window.view.zoom == pytest.approx(window.view._fit_zoom())
+        assert window.view.at_fit is True
+
+    def test_user_zoom_survives_rerender(self, window):
+        window.view.show_100()
+        window.sl_ev.setValue(20)               # rerender téhož snímku
+        assert window.view.zoom == pytest.approx(1.0)
+
+    def test_pixel_hover_reported_in_header(self, window):
+        window.view.hovered.emit((0.421, 0.77))
+        assert "0.421" in window.lbl_pixel.text()
+        assert "0.770" in window.lbl_pixel.text()
+        window.view.hovered.emit(None)
+        assert window.lbl_pixel.text() == "D: —  out: —"
+
+
+class TestPanelWidthAndThumbs:
+    def test_side_panel_is_narrow(self, window) -> None:
+        # Polovina z původních 360 px (rozkaz 2026-09-22).
+        assert window.side_scroll.minimumWidth() <= 200
+
+    def test_frame_list_gets_thumbnails(self, window, qtbot) -> None:
+        qtbot.waitUntil(
+            lambda: not window.frame_list.item(0).icon().isNull(),
+            timeout=5000)
+
+    def test_fullres_toggle_shows_bigger_preview(self, window, qtbot,
+                                                 monkeypatch) -> None:
+        """Režim 1:1 musí ukazovat plný snímek (64 px), ne podvzorek.
+
+        Fixture snímek je 64×48 — vůči produkčnímu PREVIEW_MAX_DIM=1200 je
+        podvzorek i plný snímek totéž, proto test stáhne konstantu pod
+        rozměr kadru (step by pak byl 2 → náhled 32 px)."""
+        import filmscan_studio.developer.gui as gui
+        monkeypatch.setattr(gui, "PREVIEW_MAX_DIM", 24)
+        window.rerender()
+        small = window.view._image.width()
+        assert small == 32
+        window.chk_fullres.setChecked(True)
+        qtbot.waitUntil(lambda: window.view._image.width() > small,
+                        timeout=5000)
+        assert window.view._image.width() == 64   # whole 64×48 frame
+        assert "plné rozlišení" in window.lbl_zoom.text()
+
+
+class TestNarrowPanelFits:
+    """Úzký panel musí OBSÁH Observation vejít, ne se ořezávat (2026-09-22).
+
+    Operátor: „když je pravý panel oříznut, slidery jsou jen do půlky a
+    histogramu chybí kus — musím rozšířit okno". Fixuje to trojice opatření:
+    label nad řádkem (WrapAllRows) → jezdce rostou do plné šířky; vodorovný
+    scroll vypnutý → obsah je povinnen se vejít; combo se neřídí nejdelší
+    položkou. Test měří po layout-passu, ne na slepo."""
+
+    def test_content_fits_without_horizontal_scroll(self, window) -> None:
+        window.resize(1440, 900)
+        window.show()
+        assert window.side_scroll.horizontalScrollBar().minimum() == 0
+        assert not window.side_scroll.horizontalScrollBar().isVisible()
+        vp = window.side_scroll.viewport().width()
+        assert vp >= 180                       # panel jako takový existuje
+        # Vnitřní widget se musí vejít do viewportu (ořez = width > viewport).
+        inner = window.side_scroll.widget()
+        assert inner.minimumSizeHint().width() <= vp + 1
+
+    def test_sliders_use_most_of_panel_width(self, window) -> None:
+        window.resize(1440, 900)
+        window.show()
+        vp = window.side_scroll.viewport().width()
+        for name in ("sl_ev", "sl_gamma", "sl_toe", "sl_sh"):
+            slider = getattr(window, name)
+            # Jezdec do půlky = nešvar z labelů vlevo; teď zabírá většinu řádku.
+            assert slider.width() > vp * 0.45, (name, slider.width(), vp)
+
+    def test_histograms_not_clipped(self, window) -> None:
+        window.resize(1440, 900)
+        window.show()
+        vp = window.side_scroll.viewport().width()
+        for widget in (window.histogram, window.out_histogram):
+            assert widget.width() <= vp + 1    # nic nejede za kraj
+            assert widget.width() >= vp * 0.8  # a nerosí v proužku

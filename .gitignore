@@ -43,3 +43,4 @@ _temp_screens
 
 # Local scan project folders (catalog.sqlite, frames/) — never commit capture data
 12/
+*.html

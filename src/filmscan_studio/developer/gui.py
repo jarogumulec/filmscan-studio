@@ -21,8 +21,12 @@ archiv zůstává v surové orientaci senzoru. **ROI se ukládá v souřadnicíc
 senzoru** a pro kreslení do otočeného náhledu (i naopak) převádí
 ``DevelopProject.rect_apply`` — jinak by rámeček při zrcadlení krájel jinde.
 
-Obsluha náhledu: kolečko = přiblížení, tažení = posun, **Shift+tažení =
-nakreslení rámčku snímku (ROI)**. Rámček je nutný tam, kde akvizice
+Obsluha náhledu (rozkaz 2026-09-22 noc): **pinch dvěma prsty = zoom,
+kolečko i dvouscroll = posun**, tažení myší = posun, **Shift+tažení =
+nakreslení rámčku snímku (ROI)**. Zoom nikdy neklesne pod fit-to-screen;
+záhlaví nad náhledem hlásí zoom a hodnotu pixelu pod kurzorem a nabízí
+tlačítka Fit / 100 % (a přepínač plného rozlišení pro posuzování sharpenu).
+Rámček je nutný tam, kde akvizice
 nezaznamenala ``image_rect`` do sidecaru (dokument 06): bez něj by se do
 archivu počítaly i okraje držáku. Hustotní archiv se ukládá *ořezaný* na
 rámček a render pak logicky vychází z něj.
@@ -57,8 +61,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygon
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QIcon, QImage, QPainter, QPen, QPixmap, QPolygon)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
@@ -76,8 +81,15 @@ from filmscan_studio.developer.project import DevelopProject
 log = logging.getLogger(__name__)
 
 #: Náhled se počítá z podvzorkované hustoty, aby reakce na slidery byla
-#: okamžitá. Plné rozlišení vidí jen export.
+#: okamžitá. Přepínačem 1:1 v záhlaví se podvzorek vypne (rozkaz 2026-09-22:
+#: sharpening byl v podvzorku neviditelný); plné rozlišení viděl dřív jen export.
 PREVIEW_MAX_DIM = 1200
+
+#: Velikost miniatur v levém seznamu (rozkaz 2026-09-22: „nejen textově,
+#: ale malé náhledy pod sebou"). Generují se lenivě ze surových dat v RAM —
+#: bez hustoty, bez křivky — jsou to orientační náhledy, ne výstupy.
+THUMB_ICON = QSize(88, 60)
+THUMB_MAX_DIM = 160
 
 #: Barvy overlaye exposure warning: světla (x >= 1, nad dmax) červeně,
 #: stíny (x <= 0, pod base) modře. Magentová NaN maska byla pry --
@@ -122,8 +134,13 @@ class DensityView(QWidget):
     #: Kurzor nad pixel: (D, out) -- hustota a render 0..1 (už po úpravách);
     #: None když je kurzor mimo snímek.
     hovered = Signal(object)
+    #: Zoom se změnil (kolečkem, pinchem, tlačítkem, resize) -- pro záhlaví.
+    zoom_changed = Signal(float)
 
-    MIN_ZOOM, MAX_ZOOM = 0.05, 16.0
+    #: Spodní mez je fit-to-screen (počítá se za chodu, nikdy pod něj);
+    #: strop 16x -- rozumná mez pro pixelovou kontrolu sharpenu
+    #: (uživatel 2026-09-22: „nenech zmenšovat se pod fit to screen").
+    MAX_ZOOM = 16.0
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -131,6 +148,9 @@ class DensityView(QWidget):
         #: Rozměry *celého* (příp. oříznutého) snímku, pro převod ROI.
         self._map_wh: tuple[int, int] | None = None
         self._zoom = 1.0
+        #: User ručně přiblížil nad fit; resize pak zoom nenechá zaniknout
+        #: (jen ořízne na nový fit). Nový snímek / jiný rozměr obrazu ho maže.
+        self._user_zoomed = False
         self._origin = QPoint(0, 0)
         self._drag_from: QPoint | None = None
         self._drag_pan_from: QPoint | None = None
@@ -164,6 +184,8 @@ class DensityView(QWidget):
         ``warn`` je (světla, stíny) bool maska exposure warningu -- masky se
         drží spolu s obrazem, aby překlop přepínače nepřepočítal render.
         """
+        old_size = (self._image.width(), self._image.height()) \
+            if self._image is not None else None
         self._map_wh = map_wh
         self._out = None if image is None else np.asarray(image, np.float64)
         self._dens = (None if densities is None
@@ -172,7 +194,20 @@ class DensityView(QWidget):
         self._warn_on = bool(warn_on)
         self._image = None if image is None else self._compose()
         self._recompute_rect_px()
-        self._fit()
+        same_size = (self._image is not None and old_size is not None
+                     and (self._image.width(), self._image.height())
+                     == old_size)
+        if same_size and self._user_zoomed:
+            # Rerender téhož snímku (tah sliderem): ruční zoom nesmí skočit na
+            # fit — operátor přece přibližuje sharpened pixel, aby na něj
+            # sahal. Jen oříznout na případný nový floor (resize mezi tím).
+            self._zoom = max(self._fit_zoom(), self._zoom)
+            self.zoom_changed.emit(self._zoom)
+        else:
+            # Jiný obraz (snímek, nebo přepnutí plného rozlišení) — ruční zoom
+            # se vztahoval k pixelům tenkratného podvzorku.
+            self._user_zoomed = False
+            self._fit()
         self.update()
 
     def _compose(self) -> QImage:
@@ -203,13 +238,69 @@ class DensityView(QWidget):
 
     # ------------------------------------------------------------- geometry
 
+    @property
+    def zoom(self) -> float:
+        return self._zoom
+
+    @property
+    def at_fit(self) -> bool:
+        return not self._user_zoomed
+
+    def _fit_zoom(self) -> float:
+        """Fit-to-screen: celý snímek do widgetu, nikdy nezvětšovat nad 1:1."""
+        if self._image is None:
+            return 1.0
+        zx = self.width() / max(self._image.width(), 1)
+        zy = self.height() / max(self._image.height(), 1)
+        return min(1.0, zx, zy)
+
     def _fit(self) -> None:
         if self._image is None:
             return
-        zx = self.width() / max(self._image.width(), 1)
-        zy = self.height() / max(self._image.height(), 1)
-        self._zoom = min(1.0, zx, zy)
+        self._zoom = self._fit_zoom()
         self._origin = QPoint(0, 0)
+        self.zoom_changed.emit(self._zoom)
+
+    def _apply_zoom(self, new_zoom: float, anchor: QPoint) -> None:
+        """Zoom s kotvou pod bodem; pod fit floor se nejdou (rozkaz 2026-09-22)."""
+        if self._image is None:
+            return
+        floor = self._fit_zoom()
+        new_zoom = min(self.MAX_ZOOM, max(floor, new_zoom))
+        if abs(new_zoom - self._zoom) < 1e-9:
+            return
+        map_pt = (anchor - self._origin) / max(self._zoom, 1e-6)
+        self._zoom = new_zoom
+        self._origin = anchor - map_pt * new_zoom
+        self._user_zoomed = new_zoom > floor + 1e-9
+        self.zoom_changed.emit(self._zoom)
+        self.update()
+
+    def show_fit(self) -> None:
+        """Výhled whole-frame: zoom = fit, vlevo nahoře (původní chování)."""
+        self._user_zoomed = False
+        self._fit()
+        self.update()
+
+    def show_100(self) -> None:
+        """100 %: jeden pixel náhledové mapy = jeden pixel obrazovky.
+
+        Pri zapnutem podvzorkovani je to 100 % *nahledu* (1 px = ``step``
+        senzory) -- skutecny pixel posoudi jen rezim plneho rozliseni nebo
+        export. Stejně je to ale úhel pohledu, kvůli kterému uživatel 100 %
+        chtěl: sharpening v náhledu je jinak neviditelný."""
+        if self._image is None:
+            return
+        self._apply_zoom(1.0, QPoint(self.width() // 2,
+                                     self.height() // 2))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (Qt.Key.Key_1, Qt.Key.Key_Percent):
+            self.show_100()
+        elif event.key() in (Qt.Key.Key_0, Qt.Key.Key_F):
+            self.show_fit()
+        else:
+            super().keyPressEvent(event)
 
     def _map_rect_to_src(self, r: QRect) -> tuple[int, int, int, int] | None:
         """Rámček v pixelech náhledové mapy -> whole-frame souřadnice."""
@@ -238,15 +329,35 @@ class DensityView(QWidget):
     # ------------------------------------------------------------- eventos
 
     def wheelEvent(self, event) -> None:  # noqa: N802
+        # Rozkaz 2026-09-22: scrollování touchpadem POSUNUJE; zoom dělá pinch
+        # (native gesture níže) — kolečko samo o sobě už nezvětšuje.
+        # Ctrl/Cmd+kolečko zůstává záchrana pro myš bez touchpadu.
         if self._image is None:
             return
-        old = self._zoom
-        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
-        self._zoom = min(self.MAX_ZOOM, max(self.MIN_ZOOM, self._zoom * factor))
-        pos = event.position().toPoint()
-        map_pt = (pos - self._origin) / old   # bod pod kurzorem se drží
-        self._origin = pos - map_pt * self._zoom
+        mods = event.modifiers()
+        if mods & (Qt.KeyboardModifier.ControlModifier
+                   | Qt.KeyboardModifier.MetaModifier):
+            factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+            self._apply_zoom(self._zoom * factor,
+                             event.position().toPoint())
+            return
+        dx = event.pixelDelta().x() or event.angleDelta().x() // 8
+        dy = event.pixelDelta().y() or event.angleDelta().y() // 8
+        self._origin += QPoint(dx, dy)
         self.update()
+
+    def event(self, ev) -> bool:
+        # macOS pinch (trackpad, Magic Mouse) posílá QNativeGestureEvent —
+        # wheelEvent na něj nikdy nedorazí, musí se přes event().
+        if (ev.type() == QEvent.Type.NativeGesture
+                and ev.gestureType()
+                == Qt.NativeGestureType.ZoomNativeGesture
+                and self._image is not None):
+            self._apply_zoom(self._zoom * (1.0 + ev.value()),
+                             ev.position().toPoint())
+            ev.accept()
+            return True
+        return super().event(ev)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
@@ -299,9 +410,17 @@ class DensityView(QWidget):
         self._drag_pan_from = None
 
     def resizeEvent(self, event) -> None:  # noqa: N802
-        # Zoomoval-li uživatel ručně (zoom > fit), respektuj ho; jinak přizpůsob.
-        if self._image is not None and self._zoom <= 1.0:
-            self._fit()
+        if self._image is None:
+            return
+        if not self._user_zoomed:
+            self._fit()          # výhled: velikost obrazu vždy přesně na míru
+            return
+        # Ruční zoom přežívá resize okna; pod nový fit-padě jen tehdy, když
+        # se okno zmenší tolik, že ani fit už nedosáhne na dosavadní zoom.
+        floor = self._fit_zoom()
+        if self._zoom < floor - 1e-9:
+            cx = QPoint(self.width() // 2, self.height() // 2)
+            self._apply_zoom(floor, cx)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -661,13 +780,44 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.lbl_orient)
         splitter.addWidget(left)
 
-        # -- střed: náhled ---------------------------------------------------
+        # -- střed: záhlaví + náhled ------------------------------------------
+        # Záhlaví (rozkaz 2026-09-22): zoom a hodnota pixelu pod kurzorem —
+        # numerický report se prý „ztratil" právě proto, že sedel v pravém
+        # panelu a odtud byl odstěhován do spodní lišty. Patří nad obraz.
         centre = QWidget()
         cv = QVBoxLayout(centre)
         cv.setContentsMargins(0, 0, 0, 0)
         self.view = DensityView()
         self.view.rect_chosen.connect(self.rect_selected)
         self.view.hovered.connect(self._pixel_hovered)
+        self.view.zoom_changed.connect(self._zoom_shown)
+        header = QHBoxLayout()
+        self.btn_fit = QPushButton("Fit")
+        self.btn_fit.setToolTip("Celý snímek v okně (klávesa 0)")
+        self.btn_fit.clicked.connect(self.view.show_fit)
+        self.btn_100 = QPushButton("100 %")
+        self.btn_100.setToolTip(
+            "1 pixel náhledu = 1 pixel obrazovky (klávesa 1) — pro posouzení "
+            "sharpenu zapni „1:1 plné rozlišení“, jinak je náhled "
+            "podvzorkovaný")
+        self.btn_100.clicked.connect(self.view.show_100)
+        self.chk_fullres = QCheckBox("1:1 plné rozlišení")
+        self.chk_fullres.setToolTip(
+            "Náhled se nepočítá z podvzorku — každý pixel je ze senzoru. "
+            "Ostření i pixelový skok jsou konečně vidět; pomalejší tah.")
+        self.chk_fullres.toggled.connect(self._fullres_toggled)
+        self.lbl_zoom = QLabel("—")
+        self.lbl_pixel = QLabel("D: —  out: —")
+        self.lbl_zoom.setMinimumWidth(90)
+        self.lbl_pixel.setMinimumWidth(170)
+        header.addWidget(self.btn_fit)
+        header.addWidget(self.btn_100)
+        header.addWidget(self.chk_fullres)
+        header.addStretch(1)
+        header.addWidget(self.lbl_zoom)
+        header.addSpacing(16)
+        header.addWidget(self.lbl_pixel)
+        cv.addLayout(header)
         cv.addWidget(self.view, 1)
         splitter.addWidget(centre)
 
@@ -686,7 +836,10 @@ class MainWindow(QMainWindow):
         # duplikoval stats pod horním histogramem a při hoveru přeskakoval
         # nastavovátka pod sebou. Zpráwy chodí do spodní lišty okna, ta se
         # nikdy nepřeskupuje.)
-        self.chk_warn = QCheckBox("Exposure warning (světla červeně, stíny modře)")
+        # Stručný text (QCheckBox se neumí zabalit): dlouhý label táhl
+        # minimumSizeHint celého úzkého panelu do šířky jednoho řádku.
+        self.chk_warn = QCheckBox("Exposure warning")
+        self.chk_warn.setToolTip("Přepaly červeně, podexpozice modře.")
         self.chk_warn.toggled.connect(self.view.set_warning)
         sv.addWidget(self.chk_warn)
         sv.addWidget(self._build_scale_box())
@@ -698,9 +851,21 @@ class MainWindow(QMainWindow):
         side_scroll.setWidget(side)
         side_scroll.setWidgetResizable(True)
         side_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        side_scroll.setMinimumWidth(360)
+        # Svisle ano, vodorovně ne (rozkaz 2026-09-22): obsah se musí vejít —
+        # formuláře se balí (WrapAllRows), texty zabalují. Vodorovný scroll by
+        # jen maskoval ořez histogramu, který operátor nesmí vidět.
+        side_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Poloviční šířka (rozkaz 2026-09-22): histogramy i boxy se vejdou do
+        # 260 px; 360 byla rezignace na plochu náhledu. Natahuje se JEN střed
+        # (stretch 0/1/0) — panel už nikdy neztloustne na úkor náhledu.
+        self.side_scroll = side_scroll
+        side_scroll.setMinimumWidth(200)
         splitter.addWidget(side_scroll)
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([220, 960, 260])
 
         if project is not None:
             self.set_project(project)
@@ -757,10 +922,32 @@ class MainWindow(QMainWindow):
         slider.valueChanged.connect(s2p)
         spin.valueChanged.connect(p2s)
         spin.valueChanged.connect(self._setting_changed)
+        # V úzkém panelu (WrapAllRows) má řádek patřit jezdci: spin ataka
+        # AllNonFixedFieldsGrow neroste sám od sebe, jezdec bez explicitní
+        # Expanding politiky zůstal na sizeHintu — "slidery jen do půlky"
+        # (stížnost 2026-09-22).
+        slider.setSizePolicy(QSizePolicy.Policy.Expanding,
+                             QSizePolicy.Policy.Fixed)
         row = QHBoxLayout()
         row.addWidget(slider, 1)
         row.addWidget(spin)
         form.addRow(name, row)
+
+    @staticmethod
+    def _narrow_form(box: QGroupBox) -> QFormLayout:
+        """Formulář pro úzký panel (rozkaz 2026-09-22).
+
+        macOS default drží pole na velikosti sizeHintu — ve 260 px panelu by
+        jezdce zůstaly do půlky a dlouhé labely by kolomolkly ubíraly. Label
+        proto sedí NAD řádkem a pole roste do plné šířky; na výšku to přidá
+        pár pixelů, ale panel se scrolluje a kolmý prostor je kudy.
+        """
+        form = QFormLayout(box)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        return form
 
     def _build_scale_box(self) -> QGroupBox:
         """Meritko filmu (dok 08 §5): Dmin, Dmax, tolerance pod Dmin.
@@ -769,14 +956,20 @@ class MainWindow(QMainWindow):
         osy filmu se mapuje do výstupu (08 §1). Kontrast je až křivka níž.
         """
         box = QGroupBox("Meritko filmu")
-        form = QFormLayout(box)
+        form = self._narrow_form(box)
         self.spin_dmin = self._spin(0.0, 2.0, 0.2, 0.01, decimals=3)
-        self.chk_dmin_auto = QCheckBox("auto: z měření film base")
+        self.chk_dmin_auto = QCheckBox("auto z film base")
+        self.chk_dmin_auto.setToolTip("Dmin se přebírá z posledního měření "
+                                      "film base; odškrtnutím převezmeš "
+                                      "hodnotu v poli ručně (08 §5).")
         self.chk_dmin_auto.setChecked(True)
         self.spin_dmax = self._spin(0.2, 5.0, 2.6, 0.05, decimals=3)
         # Stav i přepínač v jedné masce (08 §5): auto je PRACOVNÍ návrh
         # p99,9 + 0,05 D, ne vlastnost emulze; odškrtnutím ho převezmeš ručně.
-        self.chk_dmax_auto = QCheckBox("auto: návrh p99,9 + 0,05 D")
+        self.chk_dmax_auto = QCheckBox("auto p99,9")
+        self.chk_dmax_auto.setToolTip("Pracovní návrh Dmax = p99,9 + 0,05 D; "
+                                      "odškrtnutím ho převezmeš ručně "
+                                      "(08 §5).")
         self.chk_dmax_auto.setChecked(True)
         # Tolerance pod Dmin (shadow band) rozšiřuje definiční obor křivky POD
         # Dmin — co se slilo do černé už nevytáhne, ale gradient mléka mezi
@@ -792,7 +985,10 @@ class MainWindow(QMainWindow):
         self.sl_ev.setSingleStep(5)                 # 0,05 EV
         self.sl_ev.setPageStep(20)                  # 0,2 EV (kolečko/klik do dráhy)
         self.spin_ev = self._spin(-6.0, 6.0, 0.0, 0.05, suffix=" EV")
-        self.btn_defaults = QPushButton("Proposal (auto body, přirozená křivka)")
+        self.btn_defaults = QPushButton("Proposal")
+        self.btn_defaults.setToolTip(
+            "Auto body (Dmin z měření, Dmax z p99,9) + přirozená křivka — "
+            "stejný návrh jako při prvním otevření snímku.")
         self.btn_defaults.clicked.connect(self.apply_defaults)
         form.addRow("Dmin [D]", self.spin_dmin)
         form.addRow("", self.chk_dmin_auto)
@@ -832,7 +1028,7 @@ class MainWindow(QMainWindow):
         Nad rozsah jezdce je jen speciální komprese konců, ne fotografie.
         """
         box = QGroupBox("Tónová křivka")
-        form = QFormLayout(box)
+        form = self._narrow_form(box)
         self.sl_toe = self._slider(0, 80, 20)
         self.spin_toe = self._spin(0.0, 1.66, 0.20, 0.01)
         self.sl_gamma = self._slider(80, 250, 135)
@@ -869,7 +1065,7 @@ class MainWindow(QMainWindow):
         ICC profil se stejnou TRC.
         """
         box = QGroupBox("Zobrazení")
-        form = QFormLayout(box)
+        form = self._narrow_form(box)
         # Jas a kontrast v display prostoru (za gammou) — Photoshop zvyk.
         # kontrast kolem zobrazené střední šedi 0,5; jas posun. Nejsou
         # expozice: ta sahá na hustotní osu (co film viděl).
@@ -930,6 +1126,11 @@ class MainWindow(QMainWindow):
         # snímek po snímku a spustí vždy týž vybraný formát.
         self.cmb_export = QComboBox()
         self.cmb_export.addItems([label for label, _ in self.EXPORT_FORMATS])
+        # Bez tohoto se combo táhne na nejdelší položku ("Pozitiv — TIFF 16b
+        # gray (Gray Gamma 2,2)") a v úzkém panelu roztlačí vše kolem sebe.
+        self.cmb_export.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_export.setMinimumContentsLength(14)
         self.btn_export = QPushButton("Export")
         self.btn_export.clicked.connect(self.export_current)
         self.btn_export.setEnabled(False)
@@ -939,24 +1140,27 @@ class MainWindow(QMainWindow):
             "každý se svými uloženými parametry.")
         self.btn_export_all.clicked.connect(self.export_all)
         self.btn_export_all.setEnabled(False)
+        h.addWidget(self.cmb_export)      # combo samo: v 260 px se trio nevedlo
         row = QHBoxLayout()
-        row.addWidget(self.cmb_export, 1)
-        row.addWidget(self.btn_export)
-        row.addWidget(self.btn_export_all)
+        row.addWidget(self.btn_export, 1)
+        row.addWidget(self.btn_export_all, 1)
         h.addLayout(row)
         # Okraj z filmu kolem ořezu (rozkaz 2026-09-22, implicitně odškrtnutý):
         # hrana držáku, která vadila při korekci, se do exportu vrátí až teď —
         # o px na každou stranu od ROI, ale „po kraj", kdyby jich bylo málo.
         # Hustotní archiv okraj nedostává: je to měření, ne fotka.
-        self.chk_border = QCheckBox("Export včetně okraje filmu")
+        self.chk_border = QCheckBox("Okraj filmu")
+        # Stručný label + suffix: checkbox se neumí zabalit a "px/stranu"
+        # navyšoval spin podél sizeHintu — duo táhlo box na 333 px, což byl
+        # přesně ořez, na který si operátor stěžoval (2026-09-22).
         self.chk_border.setToolTip(
             "Přidá ke každému renderu kraj z filmu kolem ořezu (ROI) — ten, "
-            "který při korekci vadí. Nemá-li snímek v daném směru tolik "
-            "pixelů, jde až po kraj.")
+            "který při korekci vadí, o px na každou stranu. Nemá-li snímek "
+            "v daném směru tolik pixelů, jde až po kraj.")
         self.spin_border = QSpinBox()
         self.spin_border.setRange(1, 4000)
         self.spin_border.setValue(100)
-        self.spin_border.setSuffix(" px/stranu")
+        self.spin_border.setSuffix(" px")
         self.spin_border.setEnabled(False)
         self.chk_border.toggled.connect(self.spin_border.setEnabled)
         border_row = QHBoxLayout()
@@ -1016,8 +1220,12 @@ class MainWindow(QMainWindow):
     def set_project(self, project: DevelopProject) -> None:
         self.project = project
         self.frame_list.clear()
+        self.frame_list.setIconSize(THUMB_ICON)
         for name in project.frame_names:
             QListWidgetItem(name, self.frame_list)
+        # Miniatury se generují až po prvním vykreslení seznamu: roll má
+        # desítky snímků a jejich render by otevření okna protáhl o vteřiny.
+        QTimer.singleShot(0, self._populate_thumbnails)
         self._dmin_auto = project.dmin_auto()
         if self._dmin_auto is not None:
             self.spin_dmin.setValue(round(self._dmin_auto, 3))
@@ -1038,6 +1246,41 @@ class MainWindow(QMainWindow):
             ("zrcadlo V", p.mirrored_vertical),
             ("rot 180°", p.rotated_180)) if on]
         return " · ".join(parts) if parts else "1:1"
+
+    # ---------------------------------------------------------- miniatury
+
+    def _populate_thumbnails(self) -> None:
+        """Levné miniatury do seznamu (rozkaz 2026-09-22).
+
+        Surová data už jsou v RAM; miniatura je lineární normalace nad
+        podvzorkem, žádná hustota ani křivka — z seznamu se orientuješ,
+        negadoctor je až náhled. Negativ se invertuje (divák myslí
+        pozitivem), orientace filmu i rotace snímku se promítnou, aby
+        miniatura odpovídala tomu, co uvidíš v náhledu."""
+        p = self.project
+        if p is None:
+            return
+        for i in range(self.frame_list.count()):
+            item = self.frame_list.item(i)
+            try:
+                item.setIcon(QIcon(self._thumbnail(p.entry(item.text()))))
+            except Exception:  # noqa: BLE001 - seznam musí přežít i vadný snímek
+                log.warning("miniatura %s selhala", item.text(),
+                            exc_info=True)
+
+    def _thumbnail(self, entry) -> QIcon:
+        # Podvzorek FIRST: full-frame float64 by byl 4× bigger than the
+        # uint16 original, and for what — an 88 px icon.
+        a = _subsample(entry.frame.data, THUMB_MAX_DIM)
+        a = self.project.rotate_frame(
+            self.project.orientation_apply(a), entry.name)
+        a = a.astype(np.float64)
+        lo, hi = np.nanmin(a), np.nanmax(a)
+        a = (a - lo) / (hi - lo) if hi > lo else np.zeros_like(a)
+        q = density_to_qimage(np.clip(1.0 - a, 0.0, 1.0))
+        return QIcon(QPixmap.fromImage(q).scaled(
+            THUMB_ICON, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
 
     def _frame_selected(self, item: QListWidgetItem | None,
                         _prev=None) -> None:
@@ -1215,7 +1458,11 @@ class MainWindow(QMainWindow):
         # archiv zůstává surový.
         view_d = self.project.rotate_frame(
             self.project.orientation_apply(d), prov.source)
-        sub = _subsample(view_d, PREVIEW_MAX_DIM)
+        # Režim 1:1 (záhlaví): bez podvzorku — sharpen je v podvzorku
+        # neviditelný (náhled kreslí každý N-tý senzorový pixel, ostření
+        # sousedů zahodí). Plný snímek je pomalejší, ale vidí skutečný pixel.
+        sub = (view_d if self.chk_fullres.isChecked()
+               else _subsample(view_d, PREVIEW_MAX_DIM))
         display = rnd.render_for_display(sub, params)
         # Exposure warning: co render ořízl na konce stupnice. Měří se na
         # čisté ose x před ořezem -- NaN (bez světla) do neither koše.
@@ -1299,23 +1546,40 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- status
 
+    def _zoom_shown(self, zoom: float) -> None:
+        """Záhlaví nad náhledem: kolik procent a jestli je to výhled na fit."""
+        pct = round(zoom * 100.0)
+        mode = "" if self.view.at_fit else " · ruční"
+        if self.chk_fullres.isChecked():
+            mode += " · 1:1 plné rozlišení"
+        self.lbl_zoom.setText(f"Zoom {pct} %{mode}")
+
+    def _fullres_toggled(self) -> None:
+        if self._loading:
+            return
+        self.rerender()          # přepne podvzorek × plný snímek v náhledu
+
     def _pixel_hovered(self, payload) -> None:
-        """Kurzor v náhledu: oranžová čára v obou histogramech.
+        """Kurzor v náhledu: čáry v histogramech + čísla v záhlaví.
 
         ``payload`` je (D, out) z :class:`DensityView`, nebo None mimo snímek
-        -- pak se čáry smažou. Žádný text: numerický status řádek v pravém
-        panelu byl odstraněn (uživatel 2026-09-21 večer — duplikoval stats
-        a při hoveru přeskakoval nastavovátka pod sebou).
+        -- pak se čáry smažou a záhlaví se vrátí na pomlčky. Textová reportáž
+        je od roku 2026-09-22 v záhlaví středního panelu (v pravém panelu
+        status řádek duplikoval stats a při hoveru přeskakoval nastavovátka).
         """
         if payload is None:
             self.histogram.set_cursor_density(None)
             self.out_histogram.set_cursor_output(None)
+            self.lbl_pixel.setText("D: —  out: —")
             return
         d_val, out_val = payload
         self.histogram.set_cursor_density(
             None if not np.isfinite(d_val) else d_val)
         self.out_histogram.set_cursor_output(
             None if not np.isfinite(out_val) else out_val)
+        d_txt = "—" if not np.isfinite(d_val) else f"{d_val:.3f} D"
+        o_txt = "—" if not np.isfinite(out_val) else f"{out_val:.3f}"
+        self.lbl_pixel.setText(f"D: {d_txt}  out: {o_txt}")
 
     def _dmin_toggled(self) -> None:
         if self._loading:
