@@ -1,0 +1,238 @@
+"""
+FreeCAD Macro: M39x1 Objective Thread Bellows Mount
+Purpose: Generate three SLA-fit variants of an M39x1 internally threaded bellows mounting ring
+Author: Auto-generated for 3D_lab_models project
+Date: 2026-09-16
+License: MIT
+
+Specifications:
+- Outer diameter: 57.0 mm
+- Ring height and thread length: 5.0 mm
+- Internal thread: M39x1 Leica enlarger objective thread
+- Three non-uniform 2.0 mm mounting holes on a 51.38 mm pitch circle
+- SLA radial clearance variants: 0.05 mm, 0.10 mm, and 0.15 mm
+"""
+
+import math
+
+import FreeCAD
+import Part
+from FreeCAD import Base
+
+# ============================================================================
+# PARAMETERS - Modify these values to change dimensions
+# ============================================================================
+# All measurements in millimeters (mm)
+
+OUTER_DIAMETER = 57.0          # mm - outside diameter of the flat ring
+RING_HEIGHT = 5.0              # mm - ring height and threaded length
+
+THREAD_NOMINAL_DIAMETER = 39.0 # mm - M39 nominal major diameter
+THREAD_PITCH = 1.0             # mm - M39x1 metric thread pitch
+THREAD_FLANK_ANGLE = 60.0      # degrees - ISO metric thread flank angle
+THREAD_DEPTH = 0.6134          # mm - basic ISO metric radial thread depth
+THREAD_SEGMENTS_PER_TURN = 48  # - helical loft resolution for SLA printing
+
+HOLE_DIAMETER = 2.0            # mm - through-hole diameter for mounting screws
+COUNTERBORE_DIAMETER = 4.0     # mm - recessed screw-head diameter
+COUNTERBORE_DEPTH = 1.5        # mm - recess depth from the top face
+HOLE_PCD = 51.38               # mm - bolt-hole pitch-circle diameter
+HOLE_A_ANGLE = 105.0           # degrees - approximately the 12:30 position
+HOLE_AB_DISTANCE = 39.23       # mm - center-to-center chord distance
+HOLE_AC_DISTANCE = 46.70       # mm - center-to-center chord distance
+HOLE_BC_DISTANCE = 46.53       # mm - center-to-center chord distance
+
+FIT_VARIANTS = [
+    ("Tight", 0.05),          # mm radial SLA allowance
+    ("Standard", 0.10),       # mm radial SLA allowance
+    ("Loose", 0.15),          # mm radial SLA allowance
+]
+
+# ============================================================================
+# CALCULATED VALUES - Do not modify
+# ============================================================================
+
+outer_radius = OUTER_DIAMETER / 2.0
+hole_radius = HOLE_DIAMETER / 2.0
+counterbore_radius = COUNTERBORE_DIAMETER / 2.0
+hole_circle_radius = HOLE_PCD / 2.0
+nominal_thread_major_radius = THREAD_NOMINAL_DIAMETER / 2.0
+
+if RING_HEIGHT <= 0.0:
+    raise ValueError("RING_HEIGHT must be greater than 0")
+
+if THREAD_PITCH <= 0.0 or THREAD_DEPTH <= 0.0:
+    raise ValueError("THREAD_PITCH and THREAD_DEPTH must be greater than 0")
+
+if HOLE_DIAMETER <= 0.0 or HOLE_PCD <= 0.0:
+    raise ValueError("HOLE_DIAMETER and HOLE_PCD must be greater than 0")
+
+if COUNTERBORE_DIAMETER < HOLE_DIAMETER or COUNTERBORE_DEPTH <= 0.0:
+    raise ValueError("Counterbore must be wider than the hole and have positive depth")
+
+if COUNTERBORE_DEPTH > RING_HEIGHT:
+    raise ValueError("COUNTERBORE_DEPTH must not exceed RING_HEIGHT")
+
+if hole_circle_radius + hole_radius > outer_radius:
+    raise ValueError("Bolt holes extend beyond OUTER_DIAMETER")
+
+if nominal_thread_major_radius + max(allowance for _, allowance in FIT_VARIANTS) >= outer_radius:
+    raise ValueError("Thread major diameter must fit inside OUTER_DIAMETER")
+
+def chord_angle(chord_length, circle_radius):
+    """Return the minor central angle subtended by a chord, in degrees."""
+    if chord_length <= 0.0 or chord_length > 2.0 * circle_radius:
+        raise ValueError("Each hole chord must be greater than 0 and no larger than HOLE_PCD")
+    return math.degrees(2.0 * math.asin(chord_length / (2.0 * circle_radius)))
+
+
+angle_ab = chord_angle(HOLE_AB_DISTANCE, hole_circle_radius)
+angle_ac = chord_angle(HOLE_AC_DISTANCE, hole_circle_radius)
+angle_bc = chord_angle(HOLE_BC_DISTANCE, hole_circle_radius)
+
+# The three minor arcs must close to one full circle for this hole arrangement.
+if abs((angle_ab + angle_ac + angle_bc) - 360.0) > 0.1:
+    raise ValueError("Hole chord distances are incompatible with the specified HOLE_PCD")
+
+hole_angles = [
+    HOLE_A_ANGLE,
+    HOLE_A_ANGLE - angle_ab,
+    HOLE_A_ANGLE + angle_ac,
+]
+
+# ============================================================================
+# GEOMETRY CREATION
+# ============================================================================
+
+base_point = Base.Vector(0, 0, 0)
+z_direction = Base.Vector(0, 0, 1)
+
+
+def create_internal_thread(radial_allowance):
+    """Create the major-diameter bore and inward-facing helical M39x1 ridge."""
+    thread_major_radius = nominal_thread_major_radius + radial_allowance
+    thread_minor_radius = thread_major_radius - THREAD_DEPTH
+
+    if thread_minor_radius <= 0.0:
+        raise ValueError("Thread minor radius must be greater than 0")
+
+    if THREAD_SEGMENTS_PER_TURN < 12:
+        raise ValueError("THREAD_SEGMENTS_PER_TURN must be at least 12")
+
+    bore_overlap = 0.02
+    major_bore = Part.makeCylinder(
+        thread_major_radius + bore_overlap,
+        RING_HEIGHT + 2.0,
+        Base.Vector(0, 0, -1.0),
+        z_direction,
+    )
+
+    # Loft successive triangular radial sections to form the inward-facing thread crest.
+    root_radius = thread_major_radius + 2.0 * bore_overlap
+    start_z = -THREAD_PITCH
+    loft_length = RING_HEIGHT + 2.0 * THREAD_PITCH
+    section_count = int((loft_length / THREAD_PITCH) * THREAD_SEGMENTS_PER_TURN) + 1
+    profiles = []
+
+    for section_index in range(section_count):
+        fraction = float(section_index) / float(section_count - 1)
+        angle = 2.0 * math.pi * (loft_length / THREAD_PITCH) * fraction
+        center_z = start_z + loft_length * fraction
+        radial_direction = Base.Vector(math.cos(angle), math.sin(angle), 0)
+
+        profile = Part.makePolygon([
+            radial_direction * root_radius + Base.Vector(0, 0, center_z - THREAD_PITCH / 2.0),
+            radial_direction * thread_minor_radius + Base.Vector(0, 0, center_z),
+            radial_direction * root_radius + Base.Vector(0, 0, center_z + THREAD_PITCH / 2.0),
+            radial_direction * root_radius + Base.Vector(0, 0, center_z - THREAD_PITCH / 2.0),
+        ])
+        profiles.append(profile)
+
+    thread_ridge = Part.makeLoft(profiles, True, False)
+    thread_height_bounds = Part.makeCylinder(
+        root_radius + bore_overlap,
+        RING_HEIGHT,
+        base_point,
+        z_direction,
+    )
+    thread_ridge = thread_ridge.common(thread_height_bounds)
+
+    if thread_ridge.isNull():
+        raise RuntimeError("FreeCAD could not construct the M39x1 helical thread ridge")
+
+    return major_bore, thread_ridge
+
+
+def create_bolt_hole_cutter():
+    """Create the combined cutter for the three chord-defined mounting holes."""
+    cutter_height = RING_HEIGHT + 2.0
+    bolt_holes = None
+
+    for angle in hole_angles:
+        angle_radians = math.radians(angle)
+        center = Base.Vector(
+            hole_circle_radius * math.cos(angle_radians),
+            hole_circle_radius * math.sin(angle_radians),
+            -1.0,
+        )
+        hole = Part.makeCylinder(hole_radius, cutter_height, center, z_direction)
+        counterbore = Part.makeCylinder(
+            counterbore_radius,
+            COUNTERBORE_DEPTH,
+            Base.Vector(center.x, center.y, RING_HEIGHT - COUNTERBORE_DEPTH),
+            z_direction,
+        )
+        hole_cutter = hole.fuse(counterbore)
+        bolt_holes = hole_cutter if bolt_holes is None else bolt_holes.fuse(hole_cutter)
+
+    return bolt_holes
+
+
+bolt_hole_cutter = create_bolt_hole_cutter()
+
+# ============================================================================
+# ADD TO FREECAD DOCUMENT
+# ============================================================================
+
+doc = FreeCAD.ActiveDocument
+if doc is None:
+    doc = FreeCAD.newDocument("M39x1ObjectiveThreadBellowsMount")
+
+for variant_name, radial_allowance in FIT_VARIANTS:
+    ring_blank = Part.makeCylinder(outer_radius, RING_HEIGHT, base_point, z_direction)
+    major_bore_cutter, thread_ridge = create_internal_thread(radial_allowance)
+    threaded_ring = ring_blank.cut(major_bore_cutter).fuse(thread_ridge).removeSplitter()
+    final_shape = threaded_ring.cut(bolt_hole_cutter)
+
+    if final_shape.isNull() or final_shape.Volume <= 0.0:
+        raise RuntimeError("Thread construction produced an empty {} variant".format(variant_name))
+
+    object_name = "M39x1_BellowsMount_{}".format(variant_name)
+    obj = doc.addObject("Part::Feature", object_name)
+    obj.Shape = final_shape
+    obj.Label = "M39x1 Bellows Mount - {} ({} mm radial clearance)".format(
+        variant_name,
+        radial_allowance,
+    )
+
+doc.recompute()
+
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+except:
+    pass  # Running in console mode
+
+# ============================================================================
+# OUTPUT CONFIRMATION
+# ============================================================================
+
+print("=" * 60)
+print("M39x1 Objective Thread Bellows Mount Generated Successfully")
+print("=" * 60)
+print("Outer Diameter: {} mm".format(OUTER_DIAMETER))
+print("Ring Height: {} mm".format(RING_HEIGHT))
+print("Thread: M{}x{}".format(THREAD_NOMINAL_DIAMETER, THREAD_PITCH))
+print("Bolt Holes: 3 x {} mm on {} mm PCD".format(HOLE_DIAMETER, HOLE_PCD))
+print("Fit Variants: {}".format(", ".join(name for name, _ in FIT_VARIANTS)))
+print("=" * 60)

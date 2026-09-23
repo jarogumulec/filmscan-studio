@@ -1,0 +1,186 @@
+"""
+FreeCAD Macro: Reflector Shade 151x113 to 45x35mm Short
+Purpose: Generate a short hollow, offset rectangular truncated-pyramid reflector shade
+Author: Auto-generated for 3D_lab_models project
+Date: 2026-09-16
+License: MIT
+
+Specifications:
+- Inner base opening: 151 x 113 mm
+- Inner top opening: 45 x 35 mm
+- Main height: 70 mm
+- Top opening center offset: 16 mm along the short axis
+- Wall thickness: 2 mm
+- Wide-side extension: 4 mm
+- Small-side extension: 5 mm
+- Base flange: 2 mm overhang and 2 mm height
+"""
+
+import FreeCAD
+import Part
+from FreeCAD import Base
+
+# ============================================================================
+# PARAMETERS - Modify these values to change dimensions
+# ============================================================================
+# All measurements in millimeters (mm)
+
+INNER_BASE_LENGTH = 151.0       # mm - long axis at the light/base opening
+INNER_BASE_WIDTH = 113.0        # mm - short axis at the light/base opening
+INNER_TOP_LENGTH = 45.0         # mm - long axis at the narrow opening
+INNER_TOP_WIDTH = 35.0          # mm - short axis at the narrow opening
+HEIGHT = 70.0                   # mm - distance between opening planes
+WALL_THICKNESS = 2.0            # mm - nominal wall thickness
+TOP_OFFSET_SHORT_AXIS = 16.0    # mm - top center offset toward +Y
+BASE_EXTENSION_LENGTH = 4.0     # mm - hollow extension beyond the wide opening
+TOP_EXTENSION_LENGTH = 5.0      # mm - hollow extension beyond the narrow opening
+BASE_FLANGE_WIDTH = 2.0         # mm - flange overhang beyond the outer base size
+BASE_FLANGE_HEIGHT = 2.0        # mm - height of the bottom perimeter flange
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+
+if INNER_BASE_LENGTH <= INNER_TOP_LENGTH or INNER_BASE_WIDTH <= INNER_TOP_WIDTH:
+    raise ValueError("Base opening must be larger than top opening on both axes")
+if HEIGHT <= 0:
+    raise ValueError("HEIGHT must be greater than 0")
+if WALL_THICKNESS <= 0:
+    raise ValueError("WALL_THICKNESS must be greater than 0")
+if INNER_TOP_LENGTH <= 2.0 * WALL_THICKNESS or INNER_TOP_WIDTH <= 2.0 * WALL_THICKNESS:
+    raise ValueError("WALL_THICKNESS is too large for the top opening")
+if BASE_EXTENSION_LENGTH < 0 or TOP_EXTENSION_LENGTH < 0:
+    raise ValueError("Extension lengths must be greater than or equal to 0")
+if BASE_FLANGE_WIDTH < 0 or BASE_FLANGE_HEIGHT < 0:
+    raise ValueError("Base flange dimensions must be greater than or equal to 0")
+
+# ============================================================================
+# CALCULATED VALUES - Do not modify
+# ============================================================================
+
+OUTER_BASE_LENGTH = INNER_BASE_LENGTH + 2.0 * WALL_THICKNESS
+OUTER_BASE_WIDTH = INNER_BASE_WIDTH + 2.0 * WALL_THICKNESS
+OUTER_TOP_LENGTH = INNER_TOP_LENGTH + 2.0 * WALL_THICKNESS
+OUTER_TOP_WIDTH = INNER_TOP_WIDTH + 2.0 * WALL_THICKNESS
+
+# ============================================================================
+# GEOMETRY CREATION
+# ============================================================================
+
+def rectangular_wire(length, width, z, center_y):
+    """Create a closed rectangular profile centered on (0, center_y, z)."""
+    half_length = length / 2.0
+    half_width = width / 2.0
+    points = [
+        Base.Vector(-half_length, center_y - half_width, z),
+        Base.Vector(half_length, center_y - half_width, z),
+        Base.Vector(half_length, center_y + half_width, z),
+        Base.Vector(-half_length, center_y + half_width, z),
+        Base.Vector(-half_length, center_y - half_width, z),
+    ]
+    return Part.makePolygon(points)
+
+# The long dimension is X; the short dimension is Y. The narrow opening shifts
+# in Y while remaining parallel to the base opening.
+base_outer_wire = rectangular_wire(OUTER_BASE_LENGTH, OUTER_BASE_WIDTH, 0.0, 0.0)
+top_outer_wire = rectangular_wire(
+    OUTER_TOP_LENGTH, OUTER_TOP_WIDTH, HEIGHT, TOP_OFFSET_SHORT_AXIS
+)
+base_outer_extension_wire = rectangular_wire(
+    OUTER_BASE_LENGTH, OUTER_BASE_WIDTH, -BASE_EXTENSION_LENGTH, 0.0
+)
+top_outer_extension_wire = rectangular_wire(
+    OUTER_TOP_LENGTH,
+    OUTER_TOP_WIDTH,
+    HEIGHT + TOP_EXTENSION_LENGTH,
+    TOP_OFFSET_SHORT_AXIS,
+)
+base_inner_wire = rectangular_wire(INNER_BASE_LENGTH, INNER_BASE_WIDTH, 0.0, 0.0)
+top_inner_wire = rectangular_wire(
+    INNER_TOP_LENGTH, INNER_TOP_WIDTH, HEIGHT, TOP_OFFSET_SHORT_AXIS
+)
+base_inner_extension_wire = rectangular_wire(
+    INNER_BASE_LENGTH, INNER_BASE_WIDTH, -BASE_EXTENSION_LENGTH, 0.0
+)
+top_inner_extension_wire = rectangular_wire(
+    INNER_TOP_LENGTH,
+    INNER_TOP_WIDTH,
+    HEIGHT + TOP_EXTENSION_LENGTH,
+    TOP_OFFSET_SHORT_AXIS,
+)
+
+outer_solid = Part.makeLoft(
+    [base_outer_extension_wire, base_outer_wire, top_outer_wire, top_outer_extension_wire],
+    True,
+    False,
+)
+inner_solid = Part.makeLoft(
+    [base_inner_extension_wire, base_inner_wire, top_inner_wire, top_inner_extension_wire],
+    True,
+    False,
+)
+reflector_shape = outer_solid.cut(inner_solid)
+
+# Add a square-edged perimeter flange below the wide-side extension.
+flange_outer = Part.makeBox(
+    OUTER_BASE_LENGTH + 2.0 * BASE_FLANGE_WIDTH,
+    OUTER_BASE_WIDTH + 2.0 * BASE_FLANGE_WIDTH,
+    BASE_FLANGE_HEIGHT,
+    Base.Vector(
+        -(OUTER_BASE_LENGTH / 2.0 + BASE_FLANGE_WIDTH),
+        -(OUTER_BASE_WIDTH / 2.0 + BASE_FLANGE_WIDTH),
+        -BASE_EXTENSION_LENGTH - BASE_FLANGE_HEIGHT,
+    ),
+)
+flange_inner = Part.makeBox(
+    INNER_BASE_LENGTH,
+    INNER_BASE_WIDTH,
+    BASE_FLANGE_HEIGHT,
+    Base.Vector(
+        -INNER_BASE_LENGTH / 2.0,
+        -INNER_BASE_WIDTH / 2.0,
+        -BASE_EXTENSION_LENGTH - BASE_FLANGE_HEIGHT,
+    ),
+)
+base_flange = flange_outer.cut(flange_inner)
+reflector_shape = reflector_shape.fuse(base_flange)
+
+# ============================================================================
+# ADD TO FREECAD DOCUMENT
+# ============================================================================
+
+doc = FreeCAD.ActiveDocument
+if doc is None:
+    doc = FreeCAD.newDocument("ReflectorShadeShort")
+
+obj = doc.addObject("Part::Feature", "ReflectorShadeShort_151x113_to_45x35")
+obj.Shape = reflector_shape
+obj.Label = "Reflector Shade Short 151x113 to 45x35mm (Offset 16mm)"
+
+doc.recompute()
+
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+except:
+    pass  # Running in console mode
+
+# ============================================================================
+# OUTPUT CONFIRMATION
+# ============================================================================
+
+print("=" * 60)
+print("Short Reflector Shade Generated Successfully")
+print("=" * 60)
+print(f"Inner base opening: {INNER_BASE_LENGTH} x {INNER_BASE_WIDTH} mm")
+print(f"Inner top opening: {INNER_TOP_LENGTH} x {INNER_TOP_WIDTH} mm")
+print(f"Height: {HEIGHT} mm")
+print(f"Wall thickness: {WALL_THICKNESS} mm")
+print(f"Top center offset in short axis: {TOP_OFFSET_SHORT_AXIS} mm")
+print(f"Wide-side hollow extension: {BASE_EXTENSION_LENGTH} mm")
+print(f"Small-side hollow extension: {TOP_EXTENSION_LENGTH} mm")
+print(f"Base flange overhang: {BASE_FLANGE_WIDTH} mm")
+print(f"Base flange height: {BASE_FLANGE_HEIGHT} mm")
+print(f"Valid solid: {reflector_shape.isValid()}")
+print(f"Approximate material volume: {reflector_shape.Volume:.2f} mm^3")
+print("=" * 60)

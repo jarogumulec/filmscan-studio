@@ -1,0 +1,236 @@
+"""
+FreeCAD Macro: M42x0.75 Camera Thread Bellows Mount
+Purpose: Generate three SLA-fit variants of an M42x0.75 male-thread camera-side bellows mount
+Author: Auto-generated for 3D_lab_models project
+Date: 2026-09-16
+License: MIT
+
+Specifications:
+- Base ring: 58.0 mm outer diameter, 2.5 mm high
+- Male camera thread: M42x0.75, 9.4 mm long above a 0.5 mm centering collar
+- Four 2.0 mm mounting holes on a 51.54 mm pitch circle
+- Top-side counterbores: 3.0 mm diameter, 1.3 mm deep
+- SLA radial fit variants: -0.05 mm, -0.10 mm, and -0.15 mm
+"""
+
+import math
+
+import FreeCAD
+import Part
+from FreeCAD import Base
+
+# ============================================================================
+# PARAMETERS - Modify these values to change dimensions
+# ============================================================================
+# All measurements in millimeters (mm)
+
+OUTER_DIAMETER = 58.0          # mm - outside diameter of the base ring
+RING_HEIGHT = 2.5              # mm - thickness of the base ring
+COLLAR_HEIGHT = 0.5            # mm - unthreaded centering collar above base ring
+
+THREAD_NOMINAL_DIAMETER = 42.0 # mm - M42 nominal major diameter
+THREAD_PITCH = 0.75            # mm - M42x0.75 thread pitch
+THREAD_DEPTH = 0.4600          # mm - basic ISO metric radial thread depth
+THREAD_LENGTH = 9.4            # mm - threaded length above centering collar
+THREAD_WALL_THICKNESS = 1.5    # mm - wall below the thread for SLA strength
+THREAD_TRIM_TOLERANCE = 0.01   # mm - avoids coplanar thread-trim artifacts
+THREAD_RIDGE_OVERLAP = 0.05    # mm - solid overlap between thread ridge and tube
+
+HOLE_DIAMETER = 2.0            # mm - through-hole diameter for mounting screws
+COUNTERBORE_DIAMETER = 3.0     # mm - recessed screw-head diameter
+COUNTERBORE_DEPTH = 1.3        # mm - recess depth from the top face
+HOLE_PCD = 51.54               # mm - four-hole pitch-circle diameter
+HOLE_START_ANGLE = 45.0        # degrees - square bolt pattern orientation
+
+FIT_VARIANTS = [
+    ("Tight", -0.05),         # mm radial offset; largest male thread
+    ("Standard", -0.10),      # mm radial offset; recommended first SLA fit
+    ("Loose", -0.15),         # mm radial offset; smallest male thread
+]
+
+# ============================================================================
+# CALCULATED VALUES - Do not modify
+# ============================================================================
+
+outer_radius = OUTER_DIAMETER / 2.0
+hole_radius = HOLE_DIAMETER / 2.0
+counterbore_radius = COUNTERBORE_DIAMETER / 2.0
+hole_circle_radius = HOLE_PCD / 2.0
+nominal_thread_major_radius = THREAD_NOMINAL_DIAMETER / 2.0
+total_height = RING_HEIGHT + COLLAR_HEIGHT + THREAD_LENGTH
+
+if RING_HEIGHT <= 0.0 or COLLAR_HEIGHT <= 0.0 or THREAD_LENGTH <= 0.0:
+    raise ValueError("RING_HEIGHT, COLLAR_HEIGHT, and THREAD_LENGTH must be greater than 0")
+
+if THREAD_PITCH <= 0.0 or THREAD_DEPTH <= 0.0:
+    raise ValueError("THREAD_PITCH and THREAD_DEPTH must be greater than 0")
+
+if THREAD_WALL_THICKNESS <= 0.0:
+    raise ValueError("THREAD_WALL_THICKNESS must be greater than 0")
+
+if THREAD_TRIM_TOLERANCE <= 0.0 or 2.0 * THREAD_TRIM_TOLERANCE >= THREAD_LENGTH:
+    raise ValueError("THREAD_TRIM_TOLERANCE must be positive and smaller than half THREAD_LENGTH")
+
+if THREAD_RIDGE_OVERLAP <= 0.0 or THREAD_RIDGE_OVERLAP >= THREAD_DEPTH:
+    raise ValueError("THREAD_RIDGE_OVERLAP must be positive and smaller than THREAD_DEPTH")
+
+if HOLE_DIAMETER <= 0.0 or COUNTERBORE_DIAMETER < HOLE_DIAMETER:
+    raise ValueError("Counterbore diameter must be at least as large as hole diameter")
+
+if COUNTERBORE_DEPTH <= 0.0 or COUNTERBORE_DEPTH > RING_HEIGHT:
+    raise ValueError("COUNTERBORE_DEPTH must be greater than 0 and not exceed RING_HEIGHT")
+
+if hole_circle_radius + counterbore_radius > outer_radius:
+    raise ValueError("Counterbores extend beyond OUTER_DIAMETER")
+
+if nominal_thread_major_radius + max(offset for _, offset in FIT_VARIANTS) >= outer_radius:
+    raise ValueError("Thread major diameter must fit inside OUTER_DIAMETER")
+
+hole_angles = [HOLE_START_ANGLE + angle for angle in (0.0, 90.0, 180.0, 270.0)]
+
+# ============================================================================
+# GEOMETRY CREATION
+# ============================================================================
+
+base_point = Base.Vector(0, 0, 0)
+z_direction = Base.Vector(0, 0, 1)
+
+
+def create_male_thread(radial_offset):
+    """Create the inner thread tube, centering collar, and male M42x0.75 ridge."""
+    thread_major_radius = nominal_thread_major_radius + radial_offset
+    thread_minor_radius = thread_major_radius - THREAD_DEPTH
+    thread_start_z = RING_HEIGHT + COLLAR_HEIGHT
+    opening_radius = thread_minor_radius - THREAD_WALL_THICKNESS
+
+    if opening_radius <= 0.0:
+        raise ValueError("Thread opening radius must be greater than 0")
+
+    central_opening = Part.makeCylinder(
+        opening_radius,
+        total_height + 2.0,
+        Base.Vector(0, 0, -1.0),
+        z_direction,
+    )
+    thread_tube = Part.makeCylinder(
+        thread_minor_radius + THREAD_RIDGE_OVERLAP,
+        THREAD_LENGTH,
+        Base.Vector(0, 0, thread_start_z),
+        z_direction,
+    )
+    collar = Part.makeCylinder(
+        thread_minor_radius,
+        COLLAR_HEIGHT,
+        Base.Vector(0, 0, RING_HEIGHT),
+        z_direction,
+    )
+
+    # Sweep one triangular thread profile along the native OpenCascade helix.
+    helix = Part.makeHelix(THREAD_PITCH, THREAD_LENGTH, thread_minor_radius)
+    helix.translate(Base.Vector(0, 0, thread_start_z))
+    helix_tangent_length = math.sqrt((2.0 * math.pi * thread_minor_radius) ** 2 + THREAD_PITCH ** 2)
+    profile_normal = Base.Vector(
+        0,
+        -THREAD_PITCH / helix_tangent_length,
+        2.0 * math.pi * thread_minor_radius / helix_tangent_length,
+    )
+    profile_origin = Base.Vector(thread_minor_radius, 0, thread_start_z)
+    profile = Part.makePolygon([
+        profile_origin - profile_normal * (THREAD_PITCH / 2.0),
+        Base.Vector(thread_major_radius, 0, thread_start_z),
+        profile_origin + profile_normal * (THREAD_PITCH / 2.0),
+        profile_origin - profile_normal * (THREAD_PITCH / 2.0),
+    ])
+    profile_wire = Part.Wire(profile.Edges)
+    thread_ridge = Part.Wire(helix.Edges).makePipeShell([profile_wire], True, False).removeSplitter()
+    thread_height_bounds = Part.makeCylinder(
+        thread_major_radius + 0.02,
+        THREAD_LENGTH - 2.0 * THREAD_TRIM_TOLERANCE,
+        Base.Vector(0, 0, thread_start_z + THREAD_TRIM_TOLERANCE),
+        z_direction,
+    )
+    thread_ridge = thread_ridge.common(thread_height_bounds)
+
+    if thread_ridge.isNull():
+        raise RuntimeError("FreeCAD could not construct the M42x0.75 male thread ridge")
+
+    return central_opening, collar, thread_tube, thread_ridge
+
+
+def create_bolt_hole_cutter():
+    """Create the combined cutter for four through-holes and top-side counterbores."""
+    cutter_height = RING_HEIGHT + 2.0
+    bolt_holes = None
+
+    for angle in hole_angles:
+        angle_radians = math.radians(angle)
+        center = Base.Vector(
+            hole_circle_radius * math.cos(angle_radians),
+            hole_circle_radius * math.sin(angle_radians),
+            -1.0,
+        )
+        hole = Part.makeCylinder(hole_radius, cutter_height, center, z_direction)
+        counterbore = Part.makeCylinder(
+            counterbore_radius,
+            COUNTERBORE_DEPTH,
+            Base.Vector(center.x, center.y, RING_HEIGHT - COUNTERBORE_DEPTH),
+            z_direction,
+        )
+        hole_cutter = hole.fuse(counterbore)
+        bolt_holes = hole_cutter if bolt_holes is None else bolt_holes.fuse(hole_cutter)
+
+    return bolt_holes
+
+
+bolt_hole_cutter = create_bolt_hole_cutter()
+
+# ============================================================================
+# ADD TO FREECAD DOCUMENT
+# ============================================================================
+
+doc = FreeCAD.ActiveDocument
+if doc is None:
+    doc = FreeCAD.newDocument("M42x075CameraThreadBellowsMount")
+
+for variant_name, radial_offset in FIT_VARIANTS:
+    ring_blank = Part.makeCylinder(outer_radius, RING_HEIGHT, base_point, z_direction)
+    central_opening, collar, thread_tube, thread_ridge = create_male_thread(radial_offset)
+    base_ring = ring_blank.cut(central_opening)
+    collar = collar.cut(central_opening)
+    thread_tube = thread_tube.cut(central_opening)
+    final_shape = base_ring.fuse(collar).fuse(thread_tube).fuse(thread_ridge).cut(bolt_hole_cutter).removeSplitter()
+
+    if final_shape.isNull() or final_shape.Volume <= 0.0:
+        raise RuntimeError("Thread construction produced an empty {} variant".format(variant_name))
+
+    object_name = "M42x075_BellowsMount_{}".format(variant_name)
+    obj = doc.addObject("Part::Feature", object_name)
+    obj.Shape = final_shape
+    obj.Label = "M42x0.75 Camera Bellows Mount - {} ({} mm radial offset)".format(
+        variant_name,
+        radial_offset,
+    )
+
+doc.recompute()
+
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+except:
+    pass  # Running in console mode
+
+# ============================================================================
+# OUTPUT CONFIRMATION
+# ============================================================================
+
+print("=" * 60)
+print("M42x0.75 Camera Thread Bellows Mount Generated Successfully")
+print("=" * 60)
+print("Ring Outer Diameter: {} mm".format(OUTER_DIAMETER))
+print("Ring Height: {} mm".format(RING_HEIGHT))
+print("Thread: M{}x{}, {} mm long".format(THREAD_NOMINAL_DIAMETER, THREAD_PITCH, THREAD_LENGTH))
+print("Total Height: {} mm".format(total_height))
+print("Bolt Holes: 4 x {} mm on {} mm PCD".format(HOLE_DIAMETER, HOLE_PCD))
+print("Counterbores: {} mm diameter x {} mm deep".format(COUNTERBORE_DIAMETER, COUNTERBORE_DEPTH))
+print("Fit Variants: {}".format(", ".join(name for name, _ in FIT_VARIANTS)))
+print("=" * 60)
