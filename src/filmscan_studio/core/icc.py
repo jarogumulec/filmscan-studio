@@ -300,7 +300,7 @@ def write_gray_tiff(path, data, icc_profile: bytes | None,
 
 
 def write_gray_jpeg(path, data, icc_profile: bytes | None,
-                    quality: int = 95,
+                    quality: int = 85,
                     exif: bytes | None = None,
                     xmp: bytes | None = None) -> Path:
     """8b single-channel gray JPEG s ICC profilem.
@@ -361,7 +361,7 @@ def write_srgb_jpeg(path, rgb_data, icc_profile: bytes,
 #: snímku: q95 = 9,1 MB (z blízka bezeztrátové), ale už q75 drží 99,6 %
 #: filmového zrna a PSNR 54 dB (max chyba ~2 % z 1023 úrovní) při 5,7 MB.
 #: 72 ≈ 5 MB — kompromis velikosti a zrna, který chce uživatel.
-HEIC_QUALITY = 72
+HEIC_QUALITY = 65
 
 
 def write_srgb_heic(path, rgb16, icc_profile: bytes,

@@ -55,6 +55,7 @@ implicitně) — přidá kraj z filmu kolem ROI (v výměněch, kam to sahá; ji
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import sys
@@ -1005,7 +1006,8 @@ class MainWindow(QMainWindow):
 
     def _bind_row(self, form: QFormLayout, name: str, slider: QSlider,
                   spin: QDoubleSpinBox, scale: float = 100.0,
-                  remember: bool = True) -> None:
+                  remember: bool = True,
+                  project_slot=None) -> None:
         """Řádek «jezdec | editovatelné pole» — hodnota je napravo, ne pod.
 
         Obousměrné spojení v celých číslech: obě páčky mají rozlišení 1/scale,
@@ -1036,6 +1038,8 @@ class MainWindow(QMainWindow):
         spin.valueChanged.connect(p2s)
         if remember:
             spin.valueChanged.connect(self._setting_changed)
+        elif project_slot is not None:
+            spin.valueChanged.connect(project_slot)
         else:
             # Ostření: project-level, ne per-frame (rozkaz 2026-09-22).
             spin.valueChanged.connect(self._global_sharpen_changed)
@@ -1320,12 +1324,44 @@ class MainWindow(QMainWindow):
                                  "ve Photoshopu. Malý poloměr (0,5–1,5 px) "
                                  "opatrně zvedne detail; nad ~3 px rostou "
                                  "bílá lemování kolem hran.")
+        # Kvalita komprese JPEG/HEIC (rozkaz 2026-10-04) — projektově globální
+        # jako ostření; TIFF cesty nemají kvalitu. Defaulty = core.icc.
+        self.sl_qj = self._slider(1, 100, 85)
+        self.spin_qj = self._spin(1.0, 100.0, 85.0, 1.0, decimals=0)
+        self.sl_qh = self._slider(1, 100, 65)
+        self.spin_qh = self._spin(1.0, 100.0, 65.0, 1.0, decimals=0)
+        self._bind_row(form, "JPEG kvalita", self.sl_qj, self.spin_qj,
+                       scale=1.0, remember=False,
+                       project_slot=self._export_quality_changed)
+        self._bind_row(form, "HEIC kvalita", self.sl_qh, self.spin_qh,
+                       scale=1.0, remember=False,
+                       project_slot=self._export_quality_changed)
+        self.spin_qj.setToolTip(
+            "Kvalita JPEG komprese (1–100) pro obě JPEG cesty — stejné pro "
+            "celý projekt. 85 = filmové zrno bez viditelných bloků; 95+ roste "
+            "velikost výrazněji než viditelný detail.")
+        self.spin_qh.setToolTip(
+            "Kvalita HEVC komprese (1–100) pro obě HEIC cesty — stejné pro "
+            "celý projekt. Měřeno 2026-09-21 na 20 MP: q75 drží 99,6 % zrna "
+            "při 5,7 MB; q95 = 9,1 MB.")
         return box
 
     def _border_px(self) -> int:
         """Okraj exportu [px]: zaškrtnuto → hodnota, odškrtnuto → 0."""
         return int(self.spin_border.value()) if self.chk_border.isChecked() \
             else 0
+
+    def _jpeg_quality(self) -> int:
+        """Kvalita JPEG z Export boxu; bez projektu default icc (85)."""
+        if self.project is None:
+            return 85
+        return self.project.export_jpeg_quality
+
+    def _heic_quality(self) -> int:
+        """Kvalita HEIC z Export boxu; bez projektu default icc (65)."""
+        if self.project is None:
+            return 65
+        return self.project.export_heic_quality
 
     def export_current(self) -> None:
         """Volba ze seznamu → příslušná exportová metoda."""
@@ -1390,6 +1426,8 @@ class MainWindow(QMainWindow):
             self.chk_sharpen.setChecked(project.global_sharpen_on)
             self.spin_sh.setValue(project.global_sharpen)
             self.spin_shr.setValue(project.global_sharpen_radius)
+            self.spin_qj.setValue(project.export_jpeg_quality)
+            self.spin_qh.setValue(project.export_heic_quality)
         finally:
             self._loading = False
         self._sync_sharpen_enabled()
@@ -1634,6 +1672,16 @@ class MainWindow(QMainWindow):
         self.project.global_sharpen_radius = self.spin_shr.value()
         self.project.save_settings()
         self.rerender()
+
+    def _export_quality_changed(self, *_a) -> None:
+        """Kvalita JPEG/HEIC — vlastnost celého exportu jako ostření;
+        nechá se uložit do projektu, přepočet náhledu netřeba (nepatří do
+        pixelů)."""
+        if self._loading or self.project is None:
+            return
+        self.project.export_jpeg_quality = int(self.spin_qj.value())
+        self.project.export_heic_quality = int(self.spin_qh.value())
+        self.project.save_settings()
 
     def _sharpen_toggled(self, *_a) -> None:
         """Fajfka ano/ne pro ostření (rozkaz 2026-09-22 noc III): vypnutím
@@ -1911,12 +1959,43 @@ class MainWindow(QMainWindow):
                       if Path(f.name).stem == stem), None)
         if entry is None:
             return None, None
+        record = self._sequential_datetime(entry)
         try:
-            return (exportmeta.build_exif_bytes(entry.record),
-                    exportmeta.build_xmp_bytes(entry.record))
+            return (exportmeta.build_exif_bytes(record),
+                    exportmeta.build_xmp_bytes(record))
         except Exception:                       # nepolevit z exportu kvůli EXIFu
             log.exception("EXIF metadata selhala, exportuji bez nich")
             return None, None
+
+    def _sequential_datetime(self, entry) -> dict:
+        """Kopie recordu s capture_datetime posunutým o (n-1) sekund.
+
+        Anotovaný čas bývá pro celý film společný; pořadí snímků při importu
+        do čteček udrží +(n-1) s podle frame_number (fallback: pozice v
+        seznamu). Posun je deterministický — opakovaný develop vydá totéž.
+        Mění se jen DateTimeOriginal (anotace); acquisition.capture_date
+        (rigg) i sidecar na disku zůstávají nedotčené. Snímek #1 = přesně
+        anotovaný čas.
+        """
+        ann = entry.record.get("annotation") or {}
+        raw = str(ann.get("capture_datetime") or "").strip()
+        if not raw:
+            return entry.record
+        number = (entry.record.get("acquisition") or {}).get("frame_number")
+        if not isinstance(number, int) or number < 1:
+            number = self.project.frames.index(entry) + 1
+        if number == 1:
+            return entry.record
+        record = copy.deepcopy(entry.record)
+        try:
+            from datetime import datetime, timedelta
+            dt = datetime.strptime(raw, "%Y:%m:%d %H:%M:%S") \
+                + timedelta(seconds=number - 1)
+            record.setdefault("annotation", {})["capture_datetime"] = \
+                dt.strftime("%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            return entry.record             # nečitelný čas → beze změny
+        return record
 
     def save_jpeg(self) -> None:
         """8b gray JPEG = totéž co náhled (vč. gammy 2,2) + ICC profil.
@@ -1935,7 +2014,8 @@ class MainWindow(QMainWindow):
         out = self._derived_dir() / self._out_name(stem, "jpg")
         profile = icc.profile_for(params.gamma_display)
         exif, xmp = self._export_metadata(stem)
-        icc.write_gray_jpeg(out, data, profile, exif=exif, xmp=xmp)
+        icc.write_gray_jpeg(out, data, profile,
+                            quality=self._jpeg_quality(), exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
             f" · {icc.PROFILE_NAME}"
@@ -1959,7 +2039,8 @@ class MainWindow(QMainWindow):
         out = self._derived_dir() / self._out_name(stem, "srgb.jpg")
         profile = icc.build_srgb_profile()
         exif, xmp = self._export_metadata(stem)
-        icc.write_srgb_jpeg(out, rgb, profile, exif=exif, xmp=xmp)
+        icc.write_srgb_jpeg(out, rgb, profile,
+                            quality=self._jpeg_quality(), exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
             f" · {icc.SRGB_PROFILE_NAME}"
@@ -1987,7 +2068,8 @@ class MainWindow(QMainWindow):
         out = self._derived_dir() / self._out_name(stem, "srgb10.heic")
         profile = icc.build_srgb_profile()
         exif, xmp = self._export_metadata(stem)
-        icc.write_srgb_heic(out, rgb, profile, exif=exif, xmp=xmp)
+        icc.write_srgb_heic(out, rgb, profile,
+                            quality=self._heic_quality(), exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
             f" · {icc.SRGB_PROFILE_NAME} 10b"
@@ -2009,7 +2091,8 @@ class MainWindow(QMainWindow):
         out = self._derived_dir() / self._out_name(stem, "mono10.heic")
         profile = icc.profile_for(params.gamma_display)
         exif, xmp = self._export_metadata(stem)
-        icc.write_mono_heic(out, q16, profile, exif=exif, xmp=xmp)
+        icc.write_mono_heic(out, q16, profile,
+                            quality=self._heic_quality(), exif=exif, xmp=xmp)
         self.statusBar().showMessage(
             f"Exportováno: {out.name} · fingerprint {params.fingerprint()}"
             f" · {icc.PROFILE_NAME} 10b"

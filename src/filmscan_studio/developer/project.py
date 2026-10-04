@@ -112,6 +112,10 @@ class DevelopProject:
     #: jde do každého renderu, bez ohledu na per-frame dict.
     global_sharpen: float = 20.0
     global_sharpen_radius: float = 1.0
+    #: Export compression quality (Export box sliders) — project-wide like
+    #: sharpening, not per-frame. Defaults mirror core.icc (JPEG 85, HEIC 65).
+    export_jpeg_quality: int = 85
+    export_heic_quality: int = 65
     #: Film orientation as recorded by the capture app (``project.json`` ->
     #: ``film``). The density archive stays raw sensor orientation; only
     #: renders (preview + exports) flip by these flags.
@@ -366,6 +370,12 @@ class DevelopProject:
                     if r is not None:
                         self.global_sharpen_radius = float(r)
                     break
+        q = data.get("export_quality")
+        if isinstance(q, dict):
+            if isinstance(q.get("jpeg"), int):
+                self.export_jpeg_quality = q["jpeg"]
+            if isinstance(q.get("heic"), int):
+                self.export_heic_quality = q["heic"]
 
     def save_settings(self) -> None:
         """Write rects + all known per-frame settings (atomic-ish replace)."""
@@ -377,6 +387,8 @@ class DevelopProject:
             "sharpen": {"on": self.global_sharpen_on,
                         "amount": self.global_sharpen,
                         "radius": self.global_sharpen_radius},
+            "export_quality": {"jpeg": self.export_jpeg_quality,
+                               "heic": self.export_heic_quality},
         }
         tmp = self.settings_path().with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
