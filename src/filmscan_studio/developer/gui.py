@@ -155,6 +155,7 @@ class DensityView(QWidget):
         self._user_zoomed = False
         self._origin = QPoint(0, 0)
         self._drag_from: QPoint | None = None
+        self._drag_from_widget: QPoint | None = None
         self._drag_pan_from: QPoint | None = None
         self._pan_origin = QPoint(0, 0)
         self._rect_px: QRect | None = None    # v pixelech náhledové mapy
@@ -380,11 +381,21 @@ class DensityView(QWidget):
             return True
         return super().event(ev)
 
+    def _map_point(self, pos: QPoint) -> QPoint:
+        """Widgetové souřadnice → pixely náhledové mapy (inverze paint
+        transformu translate(origin)+scale(zoom)). Rámček se kreslí i
+        měří v mapových pixelech — jinak byl při tažení odskočený a ROI
+        po puštění blízko rohu."""
+        return QPoint(
+            int(round((pos.x() - self._origin.x()) / max(self._zoom, 1e-6))),
+            int(round((pos.y() - self._origin.y()) / max(self._zoom, 1e-6))))
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
             return
         if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            self._drag_from = event.position().toPoint()
+            self._drag_from = self._map_point(event.position().toPoint())
+            self._drag_from_widget = event.position().toPoint()
         else:
             self._drag_pan_from = event.position().toPoint()
             self._pan_origin = QPoint(self._origin)
@@ -392,7 +403,8 @@ class DensityView(QWidget):
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         pos = event.position().toPoint()
         if self._drag_from is not None:
-            self._rect_px = QRect(self._drag_from, pos).normalized()
+            self._rect_px = QRect(self._drag_from,
+                                  self._map_point(pos)).normalized()
             self.update()
         elif self._drag_pan_from is not None:
             self._origin = self._pan_origin + (pos - self._drag_pan_from)
@@ -419,15 +431,20 @@ class DensityView(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if self._drag_from is not None:
-            r = QRect(self._drag_from, event.position().toPoint()).normalized()
-            self._drag_from = None
-            # Úplně malý tah = omylem; rámček ponecháme, nic Neděláme.
-            if r.width() >= 12 and r.height() >= 12:
+            widget = QRect(self._drag_from_widget,
+                           event.position().toPoint()).normalized()
+            # Malý tah = omylem; test ve widgetových px (co vidí ruka),
+            # ne v mapových — při 16x zoomu by 12 mapových px nešlo namířit.
+            if widget.width() >= 12 and widget.height() >= 12:
+                r = QRect(self._drag_from, self._map_point(
+                    event.position().toPoint())).normalized()
                 src = self._map_rect_to_src(r)
                 if src is not None:
                     self._rect_src = src
                     self._recompute_rect_px()
                     self.rect_chosen.emit(src)
+            self._drag_from = None
+            self._drag_from_widget = None
             self.update()
         self._drag_pan_from = None
 
